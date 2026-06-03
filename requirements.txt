@@ -1,0 +1,14 @@
+# FLIM Phasors — pip install -r requirements.txt
+# Editable install: pip install -e .
+
+numpy>=1.24
+matplotlib>=3.7
+PySide6>=6.5
+phasorpy>=0.10,<0.11
+scikit-learn>=1.3
+
+# Optional: pawFLIM spatial filter
+pawflim
+
+# Optional: Excel export (CSV works without this)
+openpyxl>=3.1
