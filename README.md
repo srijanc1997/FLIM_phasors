@@ -83,15 +83,30 @@ flim-phasor-batch path/to/samples/ -o path/to/output -r reference.ptu --harmonic
 
 ### Keyboard shortcuts
 
+See **Help → Keyboard shortcuts…** in the app for the full list.
+
 | Key | Action |
 |-----|--------|
 | Ctrl+O | Sample… |
 | Ctrl+R | Reference… |
-| Ctrl+E | Export all… |
+| F6 | Calibrate |
+| Ctrl+Shift+B | Save calibration… |
+| Ctrl+Shift+K | Load calibration… |
 | Ctrl+Shift+O | Open session… |
 | Ctrl+Shift+S | Save session… |
+| Ctrl+E | Export all… |
+| Ctrl+Q | Quit |
 | F5 | Apply |
-| Delete | Remove cursor |
+| F7 | Paint |
+| Ctrl+Shift+N | Add cursor |
+| Delete / Backspace | Remove cursor |
+| Ctrl+Z | Undo cursor |
+| Ctrl+Shift+X | Clear all cursors |
+| Ctrl+G | Fit GMM |
+| Ctrl+M | Toggle Cursors / GMM |
+| Ctrl+Shift+U | Save cursors… |
+| Ctrl+Shift+Y | Load cursors… |
+| Ctrl+1 / 2 / 3 | Setup / Multi-phasor / Analyze tab |
 
 ## Export folder layout
 

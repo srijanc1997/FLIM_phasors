@@ -104,8 +104,6 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._filling_table = False
         self._build_ui()
         self._init_enhancements()
-        QtGui.QShortcut(QtGui.QKeySequence(Qt.Key.Key_Delete), self, self.remove_cursor)
-        QtGui.QShortcut(QtGui.QKeySequence(Qt.Key.Key_Backspace), self, self.remove_cursor)
 
     # ---- UI ----------------------------------------------------------------
     def _build_ui(self):

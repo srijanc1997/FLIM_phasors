@@ -277,7 +277,7 @@ class EnhancementsMixin:
 
         file_m.addAction("Reference…", self.choose_ref, "Ctrl+R")
 
-        file_m.addAction("Calibrate", self.calibrate_reference)
+        file_m.addAction("Calibrate", self.calibrate_reference, "F6")
 
         file_m.addSeparator()
 
@@ -291,9 +291,9 @@ class EnhancementsMixin:
 
         file_m.addAction("Save session…", self.save_session, "Ctrl+Shift+S")
 
-        file_m.addAction("Save calibration…", self.save_calibration_file)
+        file_m.addAction("Save calibration…", self.save_calibration_file, "Ctrl+Shift+B")
 
-        file_m.addAction("Load calibration…", self.load_calibration_file)
+        file_m.addAction("Load calibration…", self.load_calibration_file, "Ctrl+Shift+K")
 
         file_m.addSeparator()
 
@@ -338,6 +338,8 @@ class EnhancementsMixin:
 
         help_m = mb.addMenu("&Help")
 
+        help_m.addAction("Keyboard shortcuts…", self.show_shortcuts)
+
         help_m.addAction("About…", self.show_about)
 
 
@@ -348,9 +350,112 @@ class EnhancementsMixin:
 
     def _setup_shortcuts(self):
 
-        """Bind keyboard shortcuts for optional enhancement actions."""
+        """Bind keyboard shortcuts for common workflow actions."""
 
-        QtGui.QShortcut(QtGui.QKeySequence("F5"), self, self.apply_processing)
+        bind = QtGui.QShortcut
+
+        seq = QtGui.QKeySequence
+
+        shortcuts = (
+            (seq("F5"), lambda: self.apply_processing()),
+            (seq("F6"), self.calibrate_reference),
+            (seq("F7"), self.compute_and_paint),
+            (seq("Ctrl+Shift+N"), self.add_cursor),
+            (seq("Ctrl+Z"), self.undo_cursor),
+            (seq("Ctrl+Shift+X"), self.clear_cursors),
+            (seq(Qt.Key.Key_Delete), self.remove_cursor),
+            (seq(Qt.Key.Key_Backspace), self.remove_cursor),
+            (seq("Ctrl+G"), self.fit_gmm),
+            (seq("Ctrl+M"), self._shortcut_toggle_segmentation_mode),
+            (seq("Ctrl+1"), lambda: self._shortcut_goto_tab("setup")),
+            (seq("Ctrl+2"), lambda: self._shortcut_goto_tab("compare")),
+            (seq("Ctrl+3"), lambda: self._shortcut_goto_tab("analyze")),
+            (seq("Ctrl+Shift+U"), self.save_cursors_file),
+            (seq("Ctrl+Shift+Y"), self.load_cursors_file),
+            (seq("Ctrl+Shift+B"), self.save_calibration_file),
+            (seq("Ctrl+Shift+K"), self.load_calibration_file),
+        )
+
+        for key, handler in shortcuts:
+
+            bind(key, self, handler)
+
+
+
+    def _shortcut_goto_tab(self, which: str):
+
+        """Switch the right-hand panel to Setup, Multi-phasor, or Analyze."""
+
+        if not hasattr(self, "panel_tabs"):
+
+            return
+
+        idx = {
+
+            "setup": getattr(self, "_tab_setup_idx", 0),
+
+            "compare": getattr(self, "_tab_compare_idx", 1),
+
+            "analyze": getattr(self, "_tab_analyze_idx", 2),
+
+        }.get(which, 0)
+
+        self.panel_tabs.setCurrentIndex(idx)
+
+
+
+    def _shortcut_toggle_segmentation_mode(self):
+
+        """Toggle between cursor ROI and GMM segmentation modes."""
+
+        if not hasattr(self, "rb_cursor"):
+
+            return
+
+        if self.rb_gmm.isChecked():
+
+            self.rb_cursor.setChecked(True)
+
+        else:
+
+            self.rb_gmm.setChecked(True)
+
+
+
+    def show_shortcuts(self):
+
+        """Show a reference list of keyboard shortcuts."""
+
+        text = (
+            "<b>Files & session</b><br>"
+            "Ctrl+O — Sample…<br>"
+            "Ctrl+R — Reference…<br>"
+            "F6 — Calibrate<br>"
+            "Ctrl+Shift+B — Save calibration…<br>"
+            "Ctrl+Shift+K — Load calibration…<br>"
+            "Ctrl+Shift+O — Open session…<br>"
+            "Ctrl+Shift+S — Save session…<br>"
+            "Ctrl+E — Export all…<br>"
+            "Ctrl+Q — Quit<br><br>"
+            "<b>Processing</b><br>"
+            "F5 — Apply<br>"
+            "F7 — Paint<br><br>"
+            "<b>Segmentation</b><br>"
+            "Ctrl+Shift+N — Add cursor<br>"
+            "Delete / Backspace — Remove cursor<br>"
+            "Ctrl+Z — Undo cursor<br>"
+            "Ctrl+Shift+X — Clear all cursors<br>"
+            "Ctrl+G — Fit GMM<br>"
+            "Ctrl+M — Toggle Cursors / GMM<br>"
+            "Ctrl+Shift+U — Save cursors…<br>"
+            "Ctrl+Shift+Y — Load cursors…<br><br>"
+            "<b>Navigation</b><br>"
+            "Ctrl+1 — Setup tab<br>"
+            "Ctrl+2 — Multi-phasor tab<br>"
+            "Ctrl+3 — Analyze tab"
+        )
+
+        QtWidgets.QMessageBox.information(self, "Keyboard shortcuts", text)
 
 
 
