@@ -1,4 +1,8 @@
-"""Save and load reference calibration to JSON (no full histogram)."""
+"""Save and load reference calibration to JSON (no full histogram).
+
+Persists reference phasor G/S components and manual overrides used to calibrate
+sample lifetime maps against a known fluorophore standard.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +13,16 @@ from flim_phasors.calibration import ReferenceCalibration
 
 
 def calibration_to_dict(cal: ReferenceCalibration, *, ui_extra: dict | None = None) -> dict:
+    """Convert a :class:`~flim_phasors.calibration.ReferenceCalibration` to JSON.
+
+    Args:
+        cal: Reference calibration with mean G/S phasor and optional manual
+            override values.
+        ui_extra: Optional GUI state (widget values) stored under ``"ui"``.
+
+    Returns:
+        Versioned dict suitable for :func:`json.dumps`.
+    """
     d = {
         "version": 1,
         "source_path": cal.source_path,
@@ -30,6 +44,15 @@ def calibration_to_dict(cal: ReferenceCalibration, *, ui_extra: dict | None = No
 
 
 def calibration_from_dict(data: dict) -> ReferenceCalibration:
+    """Reconstruct a :class:`~flim_phasors.calibration.ReferenceCalibration` from JSON.
+
+    Args:
+        data: Dict from :func:`calibration_to_dict` or a saved calibration file.
+
+    Returns:
+        Populated :class:`~flim_phasors.calibration.ReferenceCalibration` without
+        loaded phasor maps (histogram not restored from JSON).
+    """
     cal = ReferenceCalibration(
         source_path=str(data.get("source_path", "")),
         channel=int(data.get("channel", 0)),
@@ -50,6 +73,13 @@ def calibration_from_dict(data: dict) -> ReferenceCalibration:
 
 
 def save_calibration(path: str | Path, cal: ReferenceCalibration, *, ui_extra: dict | None = None):
+    """Write reference calibration parameters to a JSON file.
+
+    Args:
+        path: Output ``.json`` path.
+        cal: Reference phasor calibration to persist.
+        ui_extra: Optional GUI state merged into the saved document.
+    """
     Path(path).write_text(
         json.dumps(calibration_to_dict(cal, ui_extra=ui_extra), indent=2),
         encoding="utf-8",
@@ -57,6 +87,18 @@ def save_calibration(path: str | Path, cal: ReferenceCalibration, *, ui_extra: d
 
 
 def load_calibration(path: str | Path) -> tuple[ReferenceCalibration, dict]:
+    """Load reference calibration from a JSON file.
+
+    Args:
+        path: Calibration JSON file produced by :func:`save_calibration`.
+
+    Returns:
+        A ``(calibration, ui_extra)`` tuple where *ui_extra* holds any stored
+        GUI fields (empty dict if absent).
+
+    Raises:
+        json.JSONDecodeError: If the file is not valid JSON.
+    """
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     ui = data.get("ui") or {}
     return calibration_from_dict(data), ui

@@ -1,4 +1,10 @@
-"""Export a complete analysis folder (plots, tables, per-sample maps, session)."""
+"""Export a complete FLIM phasor analysis folder for sharing and archiving.
+
+Writes phasor plots, per-sample lifetime and photon maps, GMM cluster masks,
+CSV/Excel tables (g, s, τ_φ, τ_m, τ_n, cluster areas), and ``session.json``
+with calibration settings, cursor geometry, and sample metadata. Expects a
+GUI ``MainWindow`` instance for live plot state and processing labels.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +22,15 @@ from flim_phasors.utils import dataset_display_label, dataset_short_label
 
 
 def _filter_for_export(win, d) -> str:
+    """Resolve the human-readable filter label for one dataset in the export.
+
+    Args:
+        win: Main window with processing UI state.
+        d: ``PhasorData`` instance for the sample.
+
+    Returns:
+        Filter name string (e.g. ``"median"``); falls back to combo box text.
+    """
     try:
         from flim_phasors.gui.processing import filter_label_for_dataset
         return filter_label_for_dataset(win, d)
@@ -24,6 +39,15 @@ def _filter_for_export(win, d) -> str:
 
 
 def _safe_name(text: str, max_len: int = 80) -> str:
+    """Sanitize a string for use as a filesystem folder or file name.
+
+    Args:
+        text: Raw label or path fragment.
+        max_len: Maximum returned length.
+
+    Returns:
+        Underscore-separated name safe for Windows paths.
+    """
     text = (text or "sample").strip()
     text = re.sub(r'[<>:"/\\|?*]', "_", text)
     text = re.sub(r"\s+", "_", text)
@@ -31,6 +55,15 @@ def _safe_name(text: str, max_len: int = 80) -> str:
 
 
 def _sample_folder_name(d, index: int) -> str:
+    """Build a unique subfolder name for one exported sample.
+
+    Args:
+        d: ``PhasorData`` with optional ``group_name`` and path metadata.
+        index: Zero-based sample index in the session.
+
+    Returns:
+        Sanitized folder name, optionally prefixed with group name.
+    """
     base = dataset_short_label(d, index)
     group = (getattr(d, "group_name", "") or "").strip()
     if group:
@@ -39,6 +72,18 @@ def _sample_folder_name(d, index: int) -> str:
 
 
 def _write_map_png(path: Path, arr, *, cmap="viridis", vmin=None, vmax=None):
+    """Write a false-color map PNG with robust percentile scaling.
+
+    Args:
+        path: Output ``.png`` path.
+        arr: 2-D numeric array (NaN masked).
+        cmap: Matplotlib colormap name.
+        vmin: Optional lower display bound; 2nd percentile if None.
+        vmax: Optional upper display bound; 98th percentile if None.
+
+    Returns:
+        False when no finite values exist; True after successful write.
+    """
     import matplotlib.pyplot as plt
 
     data = np.asarray(arr, dtype=float)
@@ -57,6 +102,15 @@ def _write_map_png(path: Path, arr, *, cmap="viridis", vmin=None, vmax=None):
 
 
 def _write_photon_png(path: Path, arr):
+    """Write a grayscale photon-count map PNG with percentile contrast.
+
+    Args:
+        path: Output ``.png`` path.
+        arr: 2-D photon or intensity array.
+
+    Returns:
+        False when no finite values exist; True after successful write.
+    """
     import matplotlib.pyplot as plt
 
     data = np.asarray(arr, dtype=float)
@@ -72,7 +126,20 @@ def _write_photon_png(path: Path, arr):
 
 
 def cluster_rows_for_dataset(win, d, stats):
-    """CSV rows for one sample's cluster table."""
+    """Build CSV row dicts for GMM or cursor cluster statistics on one sample.
+
+    Each row records phasor center (g, s), apparent lifetimes, pixel count,
+    area fraction, harmonic, reference path, and active filter settings.
+
+    Args:
+        win: Main window for reference path and filter resolution.
+        d: ``PhasorData`` for the clustered sample.
+        stats: Iterable of cluster stat dicts (``idx``, ``label``, ``g``, ``s``,
+            ``tp``, ``tm``, ``tn``, ``n``, ``area``).
+
+    Returns:
+        List of row dictionaries keyed for ``clusters.csv`` columns.
+    """
     rows = []
     ref = win._effective_ref_path(d) if hasattr(win, "_effective_ref_path") else d.ref_path
     ref_base = os.path.basename(ref) if ref else ""
@@ -102,12 +169,23 @@ def cluster_rows_for_dataset(win, d, stats):
 
 
 def sample_metadata_row(win, d, index: int) -> dict:
+    """Build one row of sample-level metadata for summary CSV and session JSON.
+
+    Args:
+        win: Main window for shared reference and filter state.
+        d: ``PhasorData`` instance.
+        index: Zero-based sample index.
+
+    Returns:
+        Dict with paths, channels, frequencies, threshold stats, and flags.
+    """
     ref = win._effective_ref_path(d) if hasattr(win, "_effective_ref_path") else d.ref_path
     st = getattr(d, "_intensity_stats", {}) or {}
     return {
         "index": index + 1,
         "label": dataset_display_label(d, index),
         "sample_path": d.sample_path,
+        "display_name": (getattr(d, "display_name", "") or "").strip(),
         "group": (getattr(d, "group_name", "") or "").strip(),
         "channel": d.channel,
         "frequency_MHz": d.frequency,
@@ -124,6 +202,18 @@ def sample_metadata_row(win, d, index: int) -> dict:
 
 
 def build_session_dict(win) -> dict:
+    """Serialize GUI session state for ``session.json`` in the export bundle.
+
+    Captures app and phasorpy versions, segmentation mode, shared reference
+    settings, manual/scalar calibration g/s, per-sample metadata, active index,
+    and phasor cursor geometry (circles and ellipses).
+
+    Args:
+        win: Main window instance (``MainWindow``).
+
+    Returns:
+        JSON-serializable dictionary describing the exported session.
+    """
     datasets = win._all_datasets() if hasattr(win, "_all_datasets") else [win.data]
     cursors = []
     if hasattr(win, "phasor"):
@@ -171,6 +261,12 @@ def build_session_dict(win) -> dict:
 
 
 def write_clusters_csv(path: Path, rows: list[dict]):
+    """Write cluster statistics rows to a UTF-8 CSV file.
+
+    Args:
+        path: Destination ``.csv`` path.
+        rows: Non-empty list of homogeneous row dicts from ``cluster_rows_for_dataset``.
+    """
     if not rows:
         return
     fields = list(rows[0].keys())
@@ -181,6 +277,12 @@ def write_clusters_csv(path: Path, rows: list[dict]):
 
 
 def write_samples_summary(path: Path, rows: list[dict]):
+    """Write per-sample metadata rows to a UTF-8 CSV summary file.
+
+    Args:
+        path: Destination ``samples_summary.csv`` path.
+        rows: Non-empty list of dicts from ``sample_metadata_row``.
+    """
     if not rows:
         return
     fields = list(rows[0].keys())
@@ -191,6 +293,17 @@ def write_samples_summary(path: Path, rows: list[dict]):
 
 
 def write_excel_bundle(path: Path, win, all_cluster_rows: list[dict], sample_rows: list[dict]):
+    """Write a multi-sheet Excel workbook with summary, samples, and clusters.
+
+    Cluster label cells are filled with GUI cluster colors when available.
+    Requires ``openpyxl``; callers should catch ``ImportError``.
+
+    Args:
+        path: Destination ``.xlsx`` path.
+        win: Main window for export metadata and color lookup.
+        all_cluster_rows: Combined cluster CSV rows (may be empty).
+        sample_rows: Per-sample metadata rows for the Samples sheet.
+    """
     import openpyxl
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
@@ -247,14 +360,22 @@ def write_excel_bundle(path: Path, win, all_cluster_rows: list[dict], sample_row
 
 
 def export_sample_maps(sample_dir: Path, d):
-    """Write common lifetime / photon maps for one dataset."""
+    """Write standard lifetime and photon PNG maps for one ``PhasorData`` sample.
+
+    Exports thresholded photons, τ_φ, τ_m, and τ_n when arrays are present.
+
+    Args:
+        sample_dir: Directory created under ``samples/`` in the bundle.
+        d: Processed ``PhasorData`` with lifetime maps.
+
+    Returns:
+        List of basenames of maps successfully written.
+    """
     maps = [
         ("photons.png", d.mean_thr if d.mean_thr is not None else d.mean_raw, "photon"),
         ("tau_phi_ns.png", d.tau_phi, "viridis"),
         ("tau_mod_ns.png", d.tau_mod, "viridis"),
         ("tau_normal_ns.png", d.tau_normal, "viridis"),
-        ("tau_search_phase_ns.png", d.tau_search_phi, "turbo"),
-        ("tau_search_mod_ns.png", d.tau_search_mod, "turbo"),
     ]
     written = []
     for name, arr, style in maps:
@@ -268,7 +389,17 @@ def export_sample_maps(sample_dir: Path, d):
 
 
 def _export_gmm_masks(sample_dir: Path, d, gmm_fit, written: list[str]):
-    """Write per-cluster boolean masks as TIFF-friendly uint8 PNGs."""
+    """Write per-cluster GMM ellipse masks as grayscale PNG files.
+
+    Uses elliptic regions from the active GMM fit intersected with the sample
+    valid phasor mask.
+
+    Args:
+        sample_dir: Per-sample export subdirectory.
+        d: ``PhasorData`` with calibrated g/s maps.
+        gmm_fit: GMM parameter tuple from the GUI fit.
+        written: Mutable list of output paths appended in place.
+    """
     from flim_phasors.analysis import masks_from_gmm_ellipses
 
     if d.real_cal is None:
@@ -284,10 +415,22 @@ def _export_gmm_masks(sample_dir: Path, d, gmm_fit, written: list[str]):
 
 
 def export_analysis_bundle(win, out_dir: str | Path) -> dict:
-    """
-    Write a complete export folder. Returns a log dict with paths written.
+    """Write a complete FLIM phasor analysis export folder.
 
-    Expects *win* to be MainWindow (uses its public state and helpers).
+    Creates phasor figure exports (PNG/PDF/SVG), active segmentation overlay,
+    per-sample map subfolders, CSV tables, optional Excel workbook, session
+    JSON, and a README describing contents. Lazy-loads samples that have paths
+    but no decoded histogram yet.
+
+    Args:
+        win: ``MainWindow`` with phasor canvas, cluster stats, and datasets.
+        out_dir: Destination directory (created if missing).
+
+    Returns:
+        Log dict with ``directory``, ``files`` (paths written), and ``n_samples``.
+
+    Raises:
+        ValueError: When no loaded sample is available to export.
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)

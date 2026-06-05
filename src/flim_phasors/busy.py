@@ -1,4 +1,9 @@
-"""Background work with cancel support for the Qt GUI."""
+"""Background work with cancel support for the Qt GUI.
+
+Long-running FLIM loads and phasor computations run off the main thread so the
+UI stays responsive. Workers poll a :class:`CancelToken` to exit early when the
+user dismisses the progress dialog.
+"""
 
 from __future__ import annotations
 
@@ -17,16 +22,24 @@ class CancelToken:
     """Thread-safe cancellation flag checked by worker loops."""
 
     def __init__(self):
+        """Create a token that starts in the non-cancelled state."""
         self._event = threading.Event()
 
     def cancel(self):
+        """Signal cooperative cancellation to any worker polling this token."""
         self._event.set()
 
     @property
     def cancelled(self) -> bool:
+        """Whether :meth:`cancel` has been called."""
         return self._event.is_set()
 
     def check(self):
+        """Raise :class:`CancelledError` if cancellation was requested.
+
+        Raises:
+            CancelledError: When :attr:`cancelled` is true.
+        """
         if self.cancelled:
             raise CancelledError("Cancelled by user")
 
@@ -75,9 +88,26 @@ def run_busy_qt(
     progress_hook: Callable[[], None] | None = None,
     cancel_out: list[CancelToken] | None = None,
 ) -> tuple[T, float]:
-    """
-    Run fn off the GUI thread with a modal progress dialog.
-    Returns (result, elapsed_seconds).
+    """Run *fn* off the GUI thread behind a modal progress dialog.
+
+    Args:
+        parent: Qt parent widget for the progress dialog.
+        message: Status text shown while *fn* runs.
+        fn: Callable executed in a background thread (e.g. load FLIM file).
+        log_fn: Optional callback invoked with *message* before work starts.
+        cancellable: When false, hide the Cancel button.
+        progress_hook: Optional callback polled on the GUI thread while waiting.
+        cancel_out: If given, cleared and filled with the :class:`CancelToken`
+            so callers can wire additional cancel paths.
+
+    Returns:
+        A ``(result, elapsed_seconds)`` tuple where *result* is the return
+        value of *fn*.
+
+    Raises:
+        CancelledError: If the user cancels before *fn* completes.
+        Exception: Any exception raised by *fn* is re-raised after the dialog
+            closes.
     """
     from PySide6 import QtCore, QtWidgets
 
@@ -88,6 +118,7 @@ def run_busy_qt(
         cancel_out.clear()
         cancel_out.append(cancel)
     dlg = QtWidgets.QProgressDialog(message, "Cancel", 0, 0, parent)
+    dlg.setWindowTitle("Loading file")
     dlg.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
     dlg.setMinimumDuration(0)
     dlg.setAutoClose(False)
@@ -104,6 +135,7 @@ def run_busy_qt(
     completed = False
 
     def target():
+        """Worker thread entry: run ``fn`` and capture result or exception."""
         nonlocal completed
         try:
             result.append(fn())

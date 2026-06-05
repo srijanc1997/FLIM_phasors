@@ -1,4 +1,8 @@
-"""Small reference phasor preview plot."""
+"""Small reference phasor preview plot.
+
+Shows the universal semicircle and the calibrated reference phasor position
+(g, s) used for lifetime calibration.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +13,14 @@ from phasorpy.lifetime import phasor_semicircle
 
 
 class RefPreviewCanvas(FigureCanvas):
+    """Compact phasor semicircle preview for reference calibration status."""
+
     def __init__(self, parent=None):
+        """Create the preview widget with a placeholder empty state.
+
+        Args:
+            parent: Optional Qt parent widget.
+        """
         self.fig = Figure(figsize=(2.4, 2.1), tight_layout=True)
         super().__init__(self.fig)
         self.setParent(parent)
@@ -18,6 +29,7 @@ class RefPreviewCanvas(FigureCanvas):
         self._draw_empty()
 
     def _draw_empty(self):
+        """Render the semicircle and a prompt to load and calibrate reference."""
         self.ax.clear()
         g, s = phasor_semicircle(101)
         self.ax.plot(g, s, "k-", lw=0.8, alpha=0.5)
@@ -31,11 +43,26 @@ class RefPreviewCanvas(FigureCanvas):
         self.draw()
 
     def _effective_gs(self, cal) -> tuple[float, float]:
+        """Return the (g, s) pair used for display from a calibration object.
+
+        Args:
+            cal: :class:`~flim_phasors.calibration.ReferenceCalibration` instance.
+
+        Returns:
+            Tuple ``(g, s)`` from manual override or computed means.
+        """
         if cal.use_manual:
             return float(cal.manual_g), float(cal.manual_s)
         return float(cal.mean_g), float(cal.mean_s)
 
     def show_calibration(self, cal, *, ref_lifetime_ns: float = 4.0, frequency_mhz: float = 80.0):
+        """Draw reference phasor cloud and mean position on the semicircle.
+
+        Args:
+            cal: Calibration object, or ``None`` when inactive.
+            ref_lifetime_ns: Reserved for future τ marker on semicircle.
+            frequency_mhz: Reserved for future τ marker on semicircle.
+        """
         del ref_lifetime_ns, frequency_mhz  # reserved for future τ marker on semicircle
         self.ax.clear()
         g, s = phasor_semicircle(101)
@@ -70,6 +97,12 @@ class RefPreviewCanvas(FigureCanvas):
         self.draw()
 
     def _style_axes(self, rg: float = 0.0, rs: float = 0.0):
+        """Apply consistent limits, aspect, and title to the preview axes.
+
+        Args:
+            rg: Reference g coordinate; expands x-limit when positive.
+            rs: Reference s coordinate; expands y-limit when positive.
+        """
         xmax = max(1.05, float(rg) + 0.08) if rg > 0 else 1.05
         ymax = max(0.55, float(rs) + 0.1) if rs > 0 else 0.75
         self.ax.set_xlim(0, xmax)

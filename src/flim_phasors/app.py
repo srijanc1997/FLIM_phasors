@@ -1,4 +1,8 @@
-"""Application entry point and Qt/matplotlib bootstrap."""
+"""Application entry point and Qt/matplotlib bootstrap.
+
+Configures PySide6 and the QtAgg matplotlib backend, then launches the main
+FLIM phasor analysis window.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +11,10 @@ import sys
 
 
 def _configure_backends():
+    """Select PySide6 for Qt and QtAgg for matplotlib before GUI imports.
+
+    Exits the process with an install hint if PySide6 is not available.
+    """
     os.environ.setdefault("QT_API", "pyside6")
     try:
         from PySide6 import QtWidgets  # noqa: F401
@@ -18,6 +26,7 @@ def _configure_backends():
 
 
 def main():
+    """Create the Qt application and show the main FLIM phasor window."""
     _configure_backends()
     from PySide6 import QtWidgets
 

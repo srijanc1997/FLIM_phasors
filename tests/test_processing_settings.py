@@ -1,11 +1,14 @@
-"""Per-sample processing settings helpers."""
+"""Tests for per-sample processing settings capture and restore."""
 
 from flim_phasors.data import PhasorData
 from flim_phasors.gui.processing import PROC_SETTING_KEYS, processing_params_for_dataset
 
 
 class _WinStub:
+    """Minimal main-window stub exposing processing widgets."""
+
     def __init__(self, *, multi: bool, stash: dict | None):
+        """Build stub with optional multi-dataset list and stored settings."""
         self.data = PhasorData()
         self.datasets = [self.data, PhasorData()] if multi else [self.data]
         self.ref_calibration = type("C", (), {"is_active": False})()
@@ -20,37 +23,52 @@ class _WinStub:
         self._stash = stash
 
     def _effective_ref_path(self, d):
+        """Return no per-sample reference path in tests."""
         return ""
 
     def _active_calibration(self):
+        """Disable reference calibration for stub runs."""
         return None
 
 
 class _Chk:
+    """Stub checkbox returning a fixed checked state."""
+
     def __init__(self, v):
+        """Store the boolean checked state for ``isChecked()``."""
         self._v = v
 
     def isChecked(self):
+        """Return the configured checked flag."""
         return self._v
 
 
 class _Combo:
+    """Stub combo box returning fixed text."""
+
     def __init__(self, text):
+        """Store the combo text returned by ``currentText()``."""
         self._text = text
 
     def currentText(self):
+        """Return the configured filter mode string."""
         return self._text
 
 
 class _Val:
+    """Stub spinbox returning a fixed numeric value."""
+
     def __init__(self, v):
+        """Store the numeric value returned by ``value()``."""
         self._v = v
 
     def value(self):
+        """Return the configured widget value."""
         return self._v
 
 
 def test_per_sample_uses_stash():
+    """processing_params_for_dataset reads stored settings, not live UI widgets."""
     d = PhasorData()
     d.processing_settings = {
         "filter_mode": "gaussian",
@@ -71,5 +89,6 @@ def test_per_sample_uses_stash():
 
 
 def test_proc_setting_keys_complete():
+    """PROC_SETTING_KEYS includes filter and threshold fields used by the GUI."""
     assert "filter_mode" in PROC_SETTING_KEYS
     assert "harmonic" in PROC_SETTING_KEYS

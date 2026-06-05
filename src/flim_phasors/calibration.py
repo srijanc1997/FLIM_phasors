@@ -1,4 +1,11 @@
-"""Reference phasor calibration — compute once, store maps (not raw TCSPC)."""
+"""Reference phasor calibration for instrument response correction.
+
+Computes reference (g, s) maps from a calibration measurement (e.g. uniform
+fluorophore of known lifetime) and stores spatial mean/intensity maps rather
+than raw TCSPC histograms. Sample phasor maps are corrected via
+``phasorpy.lifetime.phasor_calibrate`` using either full spatial reference
+maps or uniform scalar g/s values from manual entry or saved session metadata.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +20,27 @@ from flim_phasors.utils import reduce_signal, to_2d
 
 @dataclass
 class ReferenceCalibration:
-    """Calibration derived from a reference measurement or entered manually."""
+    """Instrument reference state used to calibrate sample phasor maps.
+
+    Holds either spatial reference maps (mean intensity, g, s per pixel) from
+    a decoded reference file, or scalar manual g/s values. Calibration is
+    considered active when ``use_manual`` is set or ``values_ready`` after
+    loading or setting maps.
+
+    Attributes:
+        source_path: Path to the reference measurement file, if any.
+        channel: Emission channel index used when building reference maps.
+        n_channels: Number of channels in the reference file.
+        harmonic: Harmonic index used for phasor transform (1 = fundamental).
+        mean_g: Spatial mean of reference g after ``set_maps``.
+        mean_s: Spatial mean of reference s after ``set_maps``.
+        mean_intensity: Spatial mean of reference photon counts.
+        use_manual: When True, ``manual_g`` / ``manual_s`` override file maps.
+        manual_g: User-entered reference g for uniform calibration.
+        manual_s: User-entered reference s for uniform calibration.
+        manual_mean: Reference intensity scale for manual mode.
+        values_ready: True after maps or means have been populated.
+    """
 
     source_path: str = ""
     channel: int = 0
@@ -32,14 +59,30 @@ class ReferenceCalibration:
 
     @property
     def is_active(self) -> bool:
-        """True when g/s values are available for sample preprocessing."""
+        """Return whether calibration values are available for sample preprocessing.
+
+        Returns:
+            True when manual g/s are enabled or reference maps/means are ready.
+        """
         return self.use_manual or self.values_ready
 
     @property
     def has_spatial_maps(self) -> bool:
+        """Return whether per-pixel reference maps are stored (not scalar-only).
+
+        Returns:
+            True if ``set_maps`` populated ``_maps``; False for manual or JSON-only g/s.
+        """
         return self._maps is not None
 
     def set_maps(self, rmean, rreal, rimag):
+        """Store reference intensity and phasor maps and update scalar means.
+
+        Args:
+            rmean: Reference mean photon count or intensity map.
+            rreal: Reference real (g) phasor map.
+            rimag: Reference imaginary (s) phasor map.
+        """
         rmean = to_2d(np.asarray(rmean, dtype=float))
         rreal = to_2d(np.asarray(rreal, dtype=float))
         rimag = to_2d(np.asarray(rimag, dtype=float))
@@ -55,7 +98,19 @@ class ReferenceCalibration:
         self.values_ready = True
 
     def maps_for_shape(self, shape: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Return (mean, real, imag) reference maps for phasor_calibrate."""
+        """Return reference maps sized for ``phasor_calibrate`` on a sample.
+
+        Manual mode fills ``shape`` with uniform manual g/s and intensity.
+        When only scalar means exist (e.g. loaded calibration JSON), uniform
+        fields are built from ``mean_g``, ``mean_s``, and ``mean_intensity``.
+        Stored spatial maps are returned unchanged when their shape matches.
+
+        Args:
+            shape: Target spatial shape ``(height, width)`` of the sample maps.
+
+        Returns:
+            Tuple ``(rmean, rreal, rimag)`` of float arrays with shape ``shape``.
+        """
         if self.use_manual:
             g = float(self.manual_g)
             s = float(self.manual_s)
@@ -83,6 +138,7 @@ class ReferenceCalibration:
         )
 
     def clear(self):
+        """Reset all calibration fields to defaults and drop stored maps."""
         self.source_path = ""
         self.channel = 0
         self._maps = None
@@ -97,8 +153,21 @@ def compute_reference_phasor(
     channel: int = 0,
     harmonic: int | list = 1,
 ) -> ReferenceCalibration:
-    """
-    Decode reference file, build phasor maps, discard histogram (not kept in RAM).
+    """Build reference phasor maps from a FLIM file and discard the histogram.
+
+    Loads the reference TCSPC stack, reduces to one channel, transforms along
+    the time axis (``axis="H"``) with ``phasor_from_signal``, and stores 2-D
+    mean/g/s maps in a ``ReferenceCalibration``. The raw signal is released
+    after transform to limit memory use.
+
+    Args:
+        ref_path: Path to the reference FLIM container (e.g. .lif, .ptu).
+        channel: Emission channel index to use after multi-channel reduction.
+        harmonic: Single harmonic index or list (e.g. ``[1, 2]`` for dual-harmonic);
+            only the first harmonic's g/s maps are stored when a list is given.
+
+    Returns:
+        Populated ``ReferenceCalibration`` with ``values_ready`` True.
     """
     harm = harmonic
     if isinstance(harmonic, int):
@@ -140,4 +209,5 @@ _CAL_CACHE: dict[tuple, ReferenceCalibration] = {}
 
 
 def clear_calibration_cache():
+    """Clear the in-memory cache of computed ``ReferenceCalibration`` objects."""
     _CAL_CACHE.clear()

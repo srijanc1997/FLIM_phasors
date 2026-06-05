@@ -1,4 +1,8 @@
-"""Save/load a self-contained imaging session (processed maps, no PTU histograms)."""
+"""Save and load self-contained imaging session bundles.
+
+A ``.flimsession`` zip stores processed phasor maps, calibration, cursors, UI
+state, and optional overlay data without raw PTU histograms.
+"""
 
 from __future__ import annotations
 
@@ -30,17 +34,34 @@ MAP_KEYS = (
     "tau_phi",
     "tau_mod",
     "tau_normal",
-    "tau_search_phi",
-    "tau_search_mod",
 )
 
 
 def is_session_bundle(path: str | Path) -> bool:
+    """Return whether a path looks like a session bundle file.
+
+    Args:
+        path: File path to inspect.
+
+    Returns:
+        ``True`` when the suffix is ``.flimsession``.
+    """
     p = Path(path)
     return p.suffix.lower() == BUNDLE_EXTENSION or p.name.lower().endswith(BUNDLE_EXTENSION)
 
 
 def _json_default(obj):
+    """JSON serializer hook for NumPy scalars and arrays.
+
+    Args:
+        obj: Value to serialize.
+
+    Returns:
+        JSON-compatible Python scalar or nested list.
+
+    Raises:
+        TypeError: If ``obj`` is not a supported NumPy type.
+    """
     if isinstance(obj, np.ndarray):
         return obj.tolist()
     if isinstance(obj, np.generic):
@@ -49,6 +70,14 @@ def _json_default(obj):
 
 
 def _maps_from_dataset(d: PhasorData) -> dict[str, np.ndarray]:
+    """Collect computed map arrays present on a dataset.
+
+    Args:
+        d: Processed :class:`~flim_phasors.data.PhasorData` instance.
+
+    Returns:
+        Dict mapping :data:`MAP_KEYS` names to float64 arrays.
+    """
     out: dict[str, np.ndarray] = {}
     for key in MAP_KEYS:
         arr = getattr(d, key, None)
@@ -58,6 +87,12 @@ def _maps_from_dataset(d: PhasorData) -> dict[str, np.ndarray]:
 
 
 def _apply_maps_to_dataset(d: PhasorData, maps: dict[str, np.ndarray]) -> None:
+    """Attach bundled map arrays onto a :class:`PhasorData` instance.
+
+    Args:
+        d: Dataset updated in place.
+        maps: Dict of array names to NumPy arrays from an ``maps.npz`` archive.
+    """
     for key in MAP_KEYS:
         if key in maps:
             setattr(d, key, np.asarray(maps[key], dtype=np.float64))
@@ -66,6 +101,17 @@ def _apply_maps_to_dataset(d: PhasorData, maps: dict[str, np.ndarray]) -> None:
 
 
 def _sample_meta_row(win, d: PhasorData, index: int, maps_file: str) -> dict:
+    """Build one manifest ``samples`` entry for a dataset.
+
+    Args:
+        win: Main window used to resolve effective reference paths.
+        d: Dataset being serialized.
+        index: Zero-based sample index in the bundle.
+        maps_file: Relative zip path to the sample's ``maps.npz``.
+
+    Returns:
+        JSON-serializable metadata dict for the manifest.
+    """
     ref = win._effective_ref_path(d) if hasattr(win, "_effective_ref_path") else d.ref_path
     st = getattr(d, "_intensity_stats", {}) or {}
     stash = getattr(d, "processing_settings", None) or {}
@@ -73,6 +119,7 @@ def _sample_meta_row(win, d: PhasorData, index: int, maps_file: str) -> dict:
         "index": index,
         "label": dataset_display_label(d, index),
         "original_sample_path": d.sample_path or "",
+        "display_name": (getattr(d, "display_name", "") or "").strip(),
         "group": (getattr(d, "group_name", "") or "").strip(),
         "channel": int(d.channel),
         "n_channels": max(1, int(getattr(d, "n_channels", 1))),
@@ -92,6 +139,14 @@ def _sample_meta_row(win, d: PhasorData, index: int, maps_file: str) -> dict:
 
 
 def _serialize_gmm_fit(fit) -> dict | None:
+    """Convert a GMM ellipse fit tuple to a JSON-friendly dict.
+
+    Args:
+        fit: Tuple of center, radii, and angle arrays, or ``None``.
+
+    Returns:
+        Serialized fit dict, or ``None`` when ``fit`` is ``None``.
+    """
     if fit is None:
         return None
     cr, ci, rm, ri, ang = fit
@@ -105,6 +160,15 @@ def _serialize_gmm_fit(fit) -> dict | None:
 
 
 def _deserialize_gmm_fit(block: dict | None):
+    """Restore a GMM ellipse fit tuple from manifest JSON.
+
+    Args:
+        block: Serialized GMM dict from the manifest, or ``None``.
+
+    Returns:
+        Tuple of NumPy arrays ``(center_real, center_imag, radius_major,
+        radius_minor, angle)``, or ``None``.
+    """
     if not block:
         return None
     return (
@@ -117,6 +181,14 @@ def _deserialize_gmm_fit(block: dict | None):
 
 
 def _serialize_cluster_stats(stats: list[dict]) -> list[dict]:
+    """Prepare cluster statistics rows for JSON export.
+
+    Args:
+        stats: List of cluster stat dicts from the main window.
+
+    Returns:
+        Copy of each row with RGB ``color`` tuples converted to float lists.
+    """
     rows = []
     for st in stats or []:
         row = dict(st)
@@ -128,6 +200,14 @@ def _serialize_cluster_stats(stats: list[dict]) -> list[dict]:
 
 
 def _deserialize_cluster_stats(rows: list[dict]) -> list[dict]:
+    """Restore cluster statistics rows after loading a bundle.
+
+    Args:
+        rows: Serialized cluster stat list from the manifest.
+
+    Returns:
+        Rows with ``color`` fields converted back to RGB tuples when present.
+    """
     out = []
     for st in rows or []:
         row = dict(st)
@@ -139,6 +219,17 @@ def _deserialize_cluster_stats(rows: list[dict]) -> list[dict]:
 
 
 def build_bundle_manifest(win) -> dict:
+    """Assemble the full manifest dict for the current window state.
+
+    Includes calibration, cursors, per-sample metadata, GMM/UI settings, and
+    version stamps. Only samples with computed maps are listed.
+
+    Args:
+        win: Main window whose state is serialized.
+
+    Returns:
+        Manifest dictionary written to ``manifest.json`` inside the bundle.
+    """
     datasets = [
         d for d in (win._all_datasets() if hasattr(win, "_all_datasets") else [win.data])
         if d.real_cal is not None
@@ -174,6 +265,18 @@ def build_bundle_manifest(win) -> dict:
         "compare_group_filter": (
             win.cb_compare_group.currentText()
             if hasattr(win, "cb_compare_group") else ""
+        ),
+        "legend_format": (
+            win.cb_legend_format.currentText()
+            if hasattr(win, "cb_legend_format") else ""
+        ),
+        "legend_loc": (
+            win.cb_legend_loc.currentText()
+            if hasattr(win, "cb_legend_loc") else ""
+        ),
+        "legend_size": (
+            int(win.sp_legend_size.value())
+            if hasattr(win, "sp_legend_size") else 11
         ),
         "gmm_covariance": win.cb_cov.currentText() if hasattr(win, "cb_cov") else "",
         "gmm_sigma": float(win._gmm_sigma()) if hasattr(win, "_gmm_sigma") else 2.0,
@@ -225,6 +328,14 @@ def build_bundle_manifest(win) -> dict:
 
 
 def _compare_checked_indices(win) -> list[int]:
+    """Read checked compare-table row indices from the main window.
+
+    Args:
+        win: Main window with an optional ``table_compare`` widget.
+
+    Returns:
+        List of dataset indices currently checked for overlay comparison.
+    """
     from PySide6.QtCore import Qt
 
     if not hasattr(win, "table_compare"):
@@ -241,8 +352,18 @@ def _compare_checked_indices(win) -> list[int]:
 
 
 def dataset_from_bundle_sample(meta: dict, maps: dict[str, np.ndarray]) -> PhasorData:
+    """Reconstruct a :class:`PhasorData` from manifest metadata and map arrays.
+
+    Args:
+        meta: One ``samples`` row from the bundle manifest.
+        maps: Decompressed map arrays from the sample's ``maps.npz``.
+
+    Returns:
+        Fully populated dataset with maps attached (no raw histogram reload).
+    """
     d = PhasorData()
     d.sample_path = str(meta.get("original_sample_path", "") or "")
+    d.display_name = str(meta.get("display_name", "") or "").strip()
     d.group_name = str(meta.get("group", "") or "")
     d.channel = int(meta.get("channel", 0))
     d.n_channels = max(1, int(meta.get("n_channels", 1)))
@@ -257,11 +378,23 @@ def dataset_from_bundle_sample(meta: dict, maps: dict[str, np.ndarray]) -> Phaso
     d.processing_settings = dict(meta.get("processing_settings") or {})
     d._intensity_stats = dict(meta.get("intensity_stats") or {})
     _apply_maps_to_dataset(d, maps)
+    d.maps_calibrated = bool(meta.get("maps_calibrated", True))
     return d
 
 
 def save_session_bundle(win, path: str | Path) -> dict:
-    """Write one .flimsession zip with manifest + per-sample map arrays."""
+    """Write one ``.flimsession`` zip with manifest and per-sample map arrays.
+
+    Args:
+        win: Main window whose computed datasets and UI state are saved.
+        path: Destination path; ``.flimsession`` suffix is enforced.
+
+    Returns:
+        Summary dict with ``path``, ``n_samples``, and ``size_mb``.
+
+    Raises:
+        ValueError: When no computed samples are available to save.
+    """
     path = Path(path)
     if path.suffix.lower() != BUNDLE_EXTENSION:
         path = path.with_suffix(BUNDLE_EXTENSION)
@@ -300,7 +433,19 @@ def save_session_bundle(win, path: str | Path) -> dict:
 
 
 def load_session_bundle(path: str | Path) -> dict:
-    """Read a .flimsession zip; returns manifest and restored PhasorData list."""
+    """Read a ``.flimsession`` zip archive.
+
+    Args:
+        path: Path to an existing bundle file.
+
+    Returns:
+        Dict with keys ``manifest``, ``datasets``, ``overlay``, ``gmm_fit``, and
+        ``cluster_stats``.
+
+    Raises:
+        ValueError: When the file is missing a manifest, has an unknown format,
+            or references missing map archives.
+    """
     path = Path(path)
     with zipfile.ZipFile(path, "r") as zf:
         if MANIFEST_NAME not in zf.namelist():
@@ -341,7 +486,18 @@ def load_session_bundle(path: str | Path) -> dict:
 
 
 def apply_session_bundle_to_window(win, loaded: dict) -> None:
-    """Restore GUI state from load_session_bundle() output."""
+    """Restore GUI state from :func:`load_session_bundle` output.
+
+    Rebuilds datasets, calibration, cursors, GMM overlays, compare UI, and
+    refreshes all dependent views on the main window.
+
+    Args:
+        win: Main window updated in place.
+        loaded: Dict returned by :func:`load_session_bundle`.
+
+    Raises:
+        ValueError: When the bundle contains no samples.
+    """
     from flim_phasors.session_io import apply_calibration_from_session, restore_cursors_to_phasor
     from flim_phasors.utils import categorical_rgb
 
@@ -422,6 +578,12 @@ def apply_session_bundle_to_window(win, loaded: dict) -> None:
         win.cb_compare_style.setCurrentText(str(ui["compare_style"]))
     if hasattr(win, "cb_compare_group") and ui.get("compare_group_filter"):
         win.cb_compare_group.setCurrentText(str(ui["compare_group_filter"]))
+    if hasattr(win, "cb_legend_format") and ui.get("legend_format"):
+        win.cb_legend_format.setCurrentText(str(ui["legend_format"]))
+    if hasattr(win, "cb_legend_loc") and ui.get("legend_loc"):
+        win.cb_legend_loc.setCurrentText(str(ui["legend_loc"]))
+    if hasattr(win, "sp_legend_size") and ui.get("legend_size") is not None:
+        win.sp_legend_size.setValue(int(ui["legend_size"]))
 
     win._restore_ui_for_active()
     if hasattr(win, "_refresh_image_combo"):
@@ -456,6 +618,12 @@ def apply_session_bundle_to_window(win, loaded: dict) -> None:
 
 
 def _restore_compare_checks(win, indices: list[int]) -> None:
+    """Restore compare-table checkbox states from saved indices.
+
+    Args:
+        win: Main window with a ``table_compare`` widget.
+        indices: Dataset indices that should be checked.
+    """
     from PySide6.QtCore import Qt
 
     if not hasattr(win, "table_compare"):

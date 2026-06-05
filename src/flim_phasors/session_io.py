@@ -1,4 +1,8 @@
-"""Restore analysis sessions from exported session.json."""
+"""Restore analysis sessions from exported session.json.
+
+Loads lightweight session metadata (paths, calibration, cursors) without
+embedded map arrays. Used when reopening a previously exported JSON session.
+"""
 
 from __future__ import annotations
 
@@ -13,10 +17,28 @@ from flim_phasors.data import PhasorData
 
 
 def load_session_json(path: str | Path) -> dict:
+    """Read and parse a session JSON file.
+
+    Args:
+        path: Path to ``session.json`` or compatible export.
+
+    Returns:
+        Parsed session dictionary.
+    """
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def apply_calibration_from_session(win, session: dict):
+    """Restore reference calibration and related UI controls from session data.
+
+    Updates ``win.ref_calibration``, shared reference paths, frequency/harmonic
+    spin boxes, filter settings, and manual-calibration widgets when present.
+
+    Args:
+        win: Main window instance whose widgets and state are updated in place.
+        session: Session dict containing a ``calibration`` block (and optionally
+            ``shared_reference_path``).
+    """
     cal_block = session.get("calibration") or {}
     cal = ReferenceCalibration(
         source_path=str(cal_block.get("reference_path", "")),
@@ -59,30 +81,54 @@ def apply_calibration_from_session(win, session: dict):
 
 
 def restore_cursors_to_phasor(win, cursors: list[dict]):
-    win.phasor.clear_cursors()
-    for c in cursors:
-        kind = c.get("kind", "circle")
-        rm = c.get("radius_minor")
-        win.phasor.add_cursor(
-            radius=float(c["radius"]),
-            kind=kind,
-            radius_minor=float(rm) if rm is not None else None,
-            angle=float(c.get("angle", 0.0)),
-        )
-        win.phasor.cursors[-1]["center_real"] = float(c["center_real"])
-        win.phasor.cursors[-1]["center_imag"] = float(c["center_imag"])
-        win.phasor.cursors[-1]["label"] = c.get("label", "")
-        if "color" in c:
-            win.phasor.cursors[-1]["color"] = tuple(c["color"][:3])
-    win.phasor.redraw_hist()
-    if hasattr(win, "_refresh_active_cursor_combo"):
-        win._refresh_active_cursor_combo()
+    """Recreate phasor segmentation cursors from serialized session records.
+
+    Args:
+        win: Main window with a ``phasor`` :class:`~flim_phasors.canvas.phasor.PhasorCanvas`.
+        cursors: List of cursor dicts with center, radius, kind, label, and color fields.
+    """
+    win.phasor.blockSignals(True)
+    try:
+        win.phasor.clear_cursors()
+        for c in cursors:
+            kind = c.get("kind", "circle")
+            rm = c.get("radius_minor")
+            win.phasor.add_cursor(
+                radius=float(c["radius"]),
+                kind=kind,
+                radius_minor=float(rm) if rm is not None else None,
+                angle=float(c.get("angle", 0.0)),
+                emit_changed=False,
+            )
+            win.phasor.cursors[-1]["center_real"] = float(c["center_real"])
+            win.phasor.cursors[-1]["center_imag"] = float(c["center_imag"])
+            win.phasor.cursors[-1]["label"] = c.get("label", "")
+            if "color" in c:
+                win.phasor.cursors[-1]["color"] = tuple(c["color"][:3])
+        win.phasor.redraw_hist()
+        if hasattr(win, "_refresh_active_cursor_combo"):
+            win._refresh_active_cursor_combo()
+    finally:
+        win.phasor.blockSignals(False)
+    if cursors and hasattr(win, "_refresh_after_cursor_edit"):
+        win._refresh_after_cursor_edit()
 
 
 def register_sample_from_session_row(row: dict) -> PhasorData:
+    """Build a :class:`~flim_phasors.data.PhasorData` stub from a session sample row.
+
+    Only metadata and paths are restored; maps must be recomputed via Apply.
+
+    Args:
+        row: One entry from the session ``samples`` list.
+
+    Returns:
+        Unprocessed :class:`PhasorData` with paths and acquisition parameters set.
+    """
     d = PhasorData()
     path = row.get("sample_path", "")
     d.sample_path = path
+    d.display_name = (row.get("display_name") or "").strip()
     d.group_name = (row.get("group") or "").strip()
     d.channel = int(row.get("channel", 0))
     d.harmonic = int(row.get("harmonic", 1))
@@ -94,6 +140,14 @@ def register_sample_from_session_row(row: dict) -> PhasorData:
 
 
 def missing_paths_message(session: dict) -> list[str]:
+    """Collect sample and reference file paths that no longer exist on disk.
+
+    Args:
+        session: Parsed session dictionary.
+
+    Returns:
+        List of missing absolute or relative paths (may be empty).
+    """
     missing = []
     for row in session.get("samples", []):
         p = row.get("sample_path", "")

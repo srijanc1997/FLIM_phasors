@@ -1,4 +1,8 @@
-"""Load FLIM data from PicoQuant PTU and Imspector TIFF."""
+"""Load FLIM data from PicoQuant PTU, Imspector TIFF, and Leica LIF phasor maps.
+
+Entry points for reading TCSPC histogram stacks used in phasor lifetime analysis.
+LIF phasor-map loading is handled separately in :mod:`flim_phasors.lif_io`.
+"""
 
 from __future__ import annotations
 
@@ -30,15 +34,49 @@ from phasorpy.io import signal_from_imspector_tiff, signal_from_ptu
 
 
 def file_extension(path: str) -> str:
+    """Return the lower-case file extension including the leading dot.
+
+    Args:
+        path: File path or name.
+
+    Returns:
+        Extension string, e.g. ``".ptu"`` or ``".tif"``.
+    """
     return os.path.splitext(path)[1].lower()
 
 
 def is_supported_flim_path(path: str) -> bool:
-    return file_extension(path) in (".ptu", ".tif", ".tiff")
+    """Return whether *path* is a supported histogram or LIF phasor file.
+
+    Args:
+        path: File path to inspect.
+
+    Returns:
+        True for PicoQuant ``.ptu``, Imspector ``.tif``/``.tiff``, or Leica
+        ``.lif``/``.xlef`` paths.
+    """
+    from flim_phasors.lif_io import is_lif_path
+
+    return file_extension(path) in (".ptu", ".tif", ".tiff") or is_lif_path(path)
 
 
 def load_flim_signal(path: str, *, channel=None, frame=-1, dtype=np.uint32):
-    """Load a TCSPC histogram stack from PicoQuant .ptu or Imspector .tif(f)."""
+    """Load a TCSPC histogram stack from PicoQuant or Imspector files.
+
+    Args:
+        path: Path to a ``.ptu`` or ``.tif``/``.tiff`` file.
+        channel: Emission channel for PTU files (``None`` keeps all channels).
+        frame: Frame index for multi-frame stacks; ``-1`` sums all frames.
+        dtype: Target integer dtype for histogram counts.
+
+    Returns:
+        xarray DataArray with dimensions including ``H`` (time bins) and
+        spatial axes ``Y``, ``X`` (and optionally ``C``, ``T``).
+
+    Raises:
+        ValueError: If the file extension is not ``.ptu``, ``.tif``, or
+            ``.tiff``.
+    """
     ext = file_extension(path)
     if ext == ".ptu":
         return signal_from_ptu(path, channel=channel, frame=frame, dtype=dtype)

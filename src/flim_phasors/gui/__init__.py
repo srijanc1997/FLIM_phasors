@@ -7,6 +7,17 @@ __all__ = ["MainWindow"]
 
 
 def __getattr__(name: str):
+    """Lazy-load heavy GUI modules on first attribute access.
+
+    Args:
+        name: Attribute name requested on this package.
+
+    Returns:
+        The requested attribute (currently only ``MainWindow``).
+
+    Raises:
+        AttributeError: If ``name`` is not a known lazy export.
+    """
     if name == "MainWindow":
         from flim_phasors.gui.main_window import MainWindow
 

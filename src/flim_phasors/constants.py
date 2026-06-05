@@ -1,4 +1,9 @@
-"""Shared UI and plot constants."""
+"""Shared UI, plot, and file-dialog constants for FLIM phasor analysis.
+
+Centralizes default choices for compare-plot colormaps, legend layout, spatial
+filter modes, lifetime image views, phasor cursor shapes, categorical cluster
+colors, and supported FLIM file-type filters used across the GUI and I/O layers.
+"""
 
 COMPARE_CMAPS = ("Blues", "Oranges", "Greens", "Purples", "Reds", "Greys")
 COMPARE_SCATTER_MAX = 8000
@@ -7,6 +12,23 @@ COMPARE_STYLE_MAP = {
     "Subsample scatter": "scatter",
     "Mean ± σ": "summary",
 }
+
+LEGEND_FORMAT_ITEMS = (
+    "Sample name",
+    "Group · sample",
+)
+
+LEGEND_LOC_ITEMS = (
+    "upper right",
+    "upper left",
+    "lower right",
+    "lower left",
+    "best",
+)
+
+LEGEND_SIZE_DEFAULT = 11
+LEGEND_SIZE_MIN = 6
+LEGEND_SIZE_MAX = 22
 
 FILTER_MODES = (
     "none",
@@ -19,11 +41,10 @@ FILTER_MODES = (
 
 IMAGE_VIEW_ITEMS = (
     "Photons (masked)",
+    "Photons (raw)",
     "τφ phase (ns)",
     "τmod (ns)",
     "τ normal (ns)",
-    "τ search phase (ns)",
-    "τ search mod (ns)",
 )
 
 CURSOR_SHAPES = ("Circle", "Ellipse")
@@ -37,8 +58,9 @@ CATEGORICAL_NAMES = (
 # SUPPORTED_EXTENSIONS = (".ptu", ".tif", ".tiff")
 
 FLIM_FILE_FILTER = (
-    "FLIM files (*.ptu *.tif *.tiff);;"
+    "FLIM files (*.ptu *.tif *.tiff *.lif *.xlef);;"
     "PicoQuant PTU (*.ptu);;"
     "Imspector TIFF (*.tif *.tiff);;"
+    "Leica LIF (*.lif *.xlef);;"
     "All files (*.*)"
 )

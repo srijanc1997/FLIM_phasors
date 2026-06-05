@@ -1,4 +1,8 @@
-"""Main application window."""
+"""Main Qt window for the FLIM phasor analyzer GUI.
+
+Hosts sample loading, reference calibration, phasor preprocessing, multi-image
+comparison, cursor/GMM segmentation, and export workflows.
+"""
 import os
 import sys
 import time
@@ -9,7 +13,11 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
 from flim_phasors import __version__
-from flim_phasors.analysis import fit_phasor_gmm, label_pixels_by_gmm, lifetimes_at_phasor
+from flim_phasors.analysis import (
+    fit_phasor_gmm,
+    label_pixels_by_gmm,
+    lifetimes_at_phasor,
+)
 from flim_phasors.export_bundle import export_analysis_bundle
 from flim_phasors.constants import (
     COMPARE_STYLE_MAP,
@@ -17,11 +25,19 @@ from flim_phasors.constants import (
     FILTER_MODES,
     FLIM_FILE_FILTER,
     IMAGE_VIEW_ITEMS,
+    LEGEND_FORMAT_ITEMS,
+    LEGEND_LOC_ITEMS,
+    LEGEND_SIZE_DEFAULT,
+    LEGEND_SIZE_MAX,
+    LEGEND_SIZE_MIN,
 )
 from flim_phasors.calibration import ReferenceCalibration, compute_reference_phasor
 from flim_phasors.calibration import clear_calibration_cache
 from flim_phasors.data import PhasorData
 from flim_phasors.io import is_supported_flim_path
+from flim_phasors.lif_io import LifPhasorSeries, is_lif_path, list_lif_phasor_series
+from flim_phasors.gui.lif_dialog import LifSeriesDialog
+from flim_phasors.utils import dataset_has_sample
 from flim_phasors.busy import CancelledError, run_busy_qt
 from flim_phasors.canvas.image import ImageCanvas
 from flim_phasors.canvas.phasor import PhasorCanvas
@@ -39,21 +55,25 @@ from flim_phasors.utils import (
     categorical_name,
     categorical_rgb,
     dataset_display_label,
+    dataset_phasor_legend_label,
     dataset_short_label,
+    _dataset_file_label,
 )
 
 try:
-    from sklearn.mixture import GaussianMixture
+    import sklearn.mixture  # noqa: F401
     HAVE_SKLEARN = True
 except ImportError:
     HAVE_SKLEARN = False
 
 from phasorpy.cursor import mask_from_circular_cursor, mask_from_elliptic_cursor, pseudo_color
-from phasorpy.lifetime import phasor_to_apparent_lifetime, phasor_to_normal_lifetime
 
 
 class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
+    """Primary FLIM phasor analysis window with plots, controls, and results table."""
+
     def __init__(self):
+        """Initialize state, build the UI, and wire enhancement features."""
         super().__init__()
         self.setWindowTitle(f"FLIM Phasor Analyzer v{__version__}")
         self.resize(1500, 980)
@@ -69,11 +89,19 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.last_overlay = None
         self.cluster_stats = []
         self.mode = "cursor"
-        self._label_signal_connected = False
-        self._paint_timer = QtCore.QTimer(self)
-        self._paint_timer.setSingleShot(True)
-        self._paint_timer.setInterval(250)   # ms after interaction stops -> full recompute
-        self._paint_timer.timeout.connect(self._deferred_full_compute)
+        self._cursor_debounce_timer = QtCore.QTimer(self)
+        self._cursor_debounce_timer.setSingleShot(True)
+        self._cursor_debounce_timer.setInterval(300)
+        self._cursor_debounce_timer.timeout.connect(self._deferred_cursor_compute)
+        self._cursor_live_timer = QtCore.QTimer(self)
+        self._cursor_live_timer.setSingleShot(True)
+        self._cursor_live_timer.setInterval(40)
+        self._cursor_live_timer.timeout.connect(self._deferred_cursor_live_overlay)
+        self._proc_debounce_timer = QtCore.QTimer(self)
+        self._proc_debounce_timer.setSingleShot(True)
+        self._proc_debounce_timer.setInterval(250)
+        self._proc_debounce_timer.timeout.connect(self._deferred_refresh_compare_list)
+        self._filling_table = False
         self._build_ui()
         self._init_enhancements()
         QtGui.QShortcut(QtGui.QKeySequence(Qt.Key.Key_Delete), self, self.remove_cursor)
@@ -81,6 +109,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
     # ---- UI ----------------------------------------------------------------
     def _build_ui(self):
+        """Construct the control panel, phasor/image plots, and results table."""
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
         main = QtWidgets.QHBoxLayout(central)
 
@@ -88,6 +117,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         _lbl_file = f"color: gray; {_small}"
 
         def _tab_page():
+            """Create a scrollable tab page with a top-aligned vertical layout."""
             scroll = QtWidgets.QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -364,7 +394,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.table_compare.setMinimumHeight(120)
         self.table_compare.setMaximumHeight(220)
         self.table_compare.setToolTip(
-            "Click a row to activate that sample. Double-click Group to rename. "
+            "Click a row to activate that sample. Double-click Sample or Group to rename. "
             "Tick Show for phasor overlay.")
         hdr = self.table_compare.horizontalHeader()
         hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
@@ -398,12 +428,26 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         multi_l.addLayout(row_apply_all)
         self._multi_strip.setVisible(False)
         mbl.addWidget(self._multi_strip)
+        row_name = QtWidgets.QHBoxLayout()
+        row_name.addWidget(QtWidgets.QLabel("Name"))
+        self.edit_display_name = QtWidgets.QLineEdit()
+        self.edit_display_name.setPlaceholderText("Display name on phasor legend")
+        self.edit_display_name.setToolTip(
+            "Rename the active sample for the phasor legend and sample table "
+            "(does not change the file on disk).")
+        self.edit_display_name.editingFinished.connect(self._apply_display_name_from_field)
+        btn_name = QtWidgets.QPushButton("Set")
+        btn_name.setFixedWidth(40)
+        btn_name.clicked.connect(self._apply_display_name_from_field)
+        row_name.addWidget(self.edit_display_name, 1)
+        row_name.addWidget(btn_name)
+        mbl.addLayout(row_name)
         row_grp = QtWidgets.QHBoxLayout()
         row_grp.addWidget(QtWidgets.QLabel("Group"))
         self.edit_group = QtWidgets.QLineEdit()
         self.edit_group.setPlaceholderText("e.g. condition A")
         self.edit_group.setToolTip(
-            "Label for the active sample (overlay legend and table).")
+            "Group label for the active sample (overlay legend and table).")
         self.edit_group.editingFinished.connect(self._apply_group_from_field)
         btn_grp = QtWidgets.QPushButton("Set")
         btn_grp.setFixedWidth(40)
@@ -439,13 +483,37 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.cb_compare_group.currentIndexChanged.connect(self._on_compare_ui_changed)
         row_grp_filt.addWidget(self.cb_compare_group, 1)
         mbl.addLayout(row_grp_filt)
+        row_legend = QtWidgets.QHBoxLayout()
+        row_legend.addWidget(QtWidgets.QLabel("Legend"))
+        self.cb_legend_format = QtWidgets.QComboBox()
+        self.cb_legend_format.addItems(list(LEGEND_FORMAT_ITEMS))
+        self.cb_legend_format.setToolTip("How sample names appear in the phasor legend.")
+        self.cb_legend_format.currentIndexChanged.connect(self._on_legend_ui_changed)
+        self.cb_legend_loc = QtWidgets.QComboBox()
+        self.cb_legend_loc.addItems(list(LEGEND_LOC_ITEMS))
+        self.cb_legend_loc.setToolTip("Legend position on the phasor plot.")
+        self.cb_legend_loc.currentIndexChanged.connect(self._on_legend_ui_changed)
+        row_legend.addWidget(self.cb_legend_format, 1)
+        row_legend.addWidget(self.cb_legend_loc, 1)
+        row_legend.addWidget(QtWidgets.QLabel("Size"))
+        self.sp_legend_size = QtWidgets.QSpinBox()
+        self.sp_legend_size.setRange(LEGEND_SIZE_MIN, LEGEND_SIZE_MAX)
+        self.sp_legend_size.setValue(LEGEND_SIZE_DEFAULT)
+        self.sp_legend_size.setToolTip(
+            "Legend text and colour-marker size on the phasor plot.")
+        self.sp_legend_size.valueChanged.connect(self._on_legend_ui_changed)
+        row_legend.addWidget(self.sp_legend_size)
+        mbl.addLayout(row_legend)
         self._compare_sel_buttons = (btn_cmp_all, btn_cmp_none)
+        self._sample_label_widgets = (
+            self.edit_display_name, btn_name, self.edit_group, btn_grp,
+        )
         self._multi_detail_widgets = (
             self._proc_active_row, self.cb_sample,
             self._multi_strip, self.table_compare, self.btn_rmimg,
             self.lbl_editing, self.btn_apply_settings_all,
-            self.edit_group, btn_grp,
             self.chk_compare, self.cb_compare_style, self.cb_compare_group,
+            self.cb_legend_format, self.cb_legend_loc, self.sp_legend_size,
             btn_cmp_all, btn_cmp_none,
         )
         self._set_multi_detail_enabled(False)
@@ -497,10 +565,28 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         row_shape.addWidget(self.sld_aspect, 1)
         row_shape.addWidget(self.lbl_aspect)
         cbl.addLayout(row_shape, 2, 0, 1, 3)
-        self.sld_radius = QtWidgets.QSlider(Qt.Orientation.Horizontal); self.sld_radius.setRange(5, 400); self.sld_radius.setValue(50)
+        self.sld_radius = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+        self.sld_radius.setRange(5, 400)
+        self.sld_radius.setValue(50)
         self.sld_radius.valueChanged.connect(self.on_radius_slider)
-        self.lbl_radius = QtWidgets.QLabel("r=0.05")
-        cbl.addWidget(self.sld_radius, 3, 0, 1, 2); cbl.addWidget(self.lbl_radius, 3, 2)
+        self.sld_radius.sliderReleased.connect(self._on_radius_slider_released)
+        self.sp_radius = QtWidgets.QDoubleSpinBox()
+        self.sp_radius.setRange(0.005, 0.400)
+        self.sp_radius.setDecimals(3)
+        self.sp_radius.setSingleStep(0.005)
+        self.sp_radius.setValue(0.050)
+        self.sp_radius.setToolTip("Exact circle radius on the phasor plot (g, s units).")
+        self._spin_for_typing(self.sp_radius, min_width=56)
+        self.sp_radius.valueChanged.connect(self.on_radius_spin)
+        self.sp_radius.editingFinished.connect(self._on_radius_spin_committed)
+        radius_entry = QtWidgets.QHBoxLayout()
+        radius_entry.setContentsMargins(0, 0, 0, 0)
+        radius_entry.addWidget(QtWidgets.QLabel("r"))
+        radius_entry.addWidget(self.sp_radius)
+        radius_entry_w = QtWidgets.QWidget()
+        radius_entry_w.setLayout(radius_entry)
+        cbl.addWidget(self.sld_radius, 3, 0, 1, 2)
+        cbl.addWidget(radius_entry_w, 3, 2)
         ml.addWidget(self.cursor_box)
 
         self.gmm_box = QtWidgets.QWidget()
@@ -509,12 +595,15 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.edit_ncomp = QtWidgets.QLineEdit("3")
         self.edit_ncomp.setValidator(QtGui.QIntValidator(1, 12, self))
         self.edit_ncomp.setFixedWidth(32)
-        self.edit_ncomp.setToolTip("Number of GMM components (1–12).")
+        self.edit_ncomp.setToolTip("Number of GMM components (1–12), or max k when BIC auto-k is on.")
         gbl.addWidget(self.edit_ncomp, 0, 1)
         gbl.addWidget(QtWidgets.QLabel("Cov"), 0, 2)
         self.cb_cov = QtWidgets.QComboBox(); self.cb_cov.addItems(["full", "tied", "diag", "spherical"])
         gbl.addWidget(self.cb_cov, 0, 3)
-        self.chk_bic = QtWidgets.QCheckBox("BIC auto-k"); gbl.addWidget(self.chk_bic, 1, 0, 1, 2)
+        self.chk_bic = QtWidgets.QCheckBox("BIC auto-k")
+        self.chk_bic.setToolTip("Search k = 1 … max k using BIC on valid phasor pixels.")
+        self.chk_bic.toggled.connect(self._on_bic_toggled)
+        gbl.addWidget(self.chk_bic, 1, 0, 1, 2)
         gbl.addWidget(QtWidgets.QLabel("σ"), 2, 0)
         self.edit_gmm_sigma = QtWidgets.QLineEdit("2.0")
         self.edit_gmm_sigma.setValidator(QtGui.QDoubleValidator(0.5, 6.0, 2, self))
@@ -587,7 +676,8 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.cb_image_view = QtWidgets.QComboBox()
         self.cb_image_view.addItems(list(IMAGE_VIEW_ITEMS))
         self.cb_image_view.setToolTip(
-            "Pixel maps from the current Apply settings (same mask as the phasor plot).")
+            "Pixel maps from Apply settings. Use Photons (masked/raw) for intensity; "
+            "τ maps need Apply. LIF files use LAS X photon counts when available.")
         self.cb_image_view.currentIndexChanged.connect(self.refresh_image)
         row_img_view.addWidget(self.cb_image_view, 1)
         rv.addLayout(row_img_view)
@@ -602,6 +692,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
              "Pixels", "Area %"])
         self.table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.table.setMaximumHeight(220)
+        self.table.itemChanged.connect(self._label_edited)
 
         rightside = QtWidgets.QSplitter(Qt.Orientation.Vertical)
         rightside.addWidget(plots); rightside.addWidget(self.table); rightside.setSizes([720, 220])
@@ -651,12 +742,25 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
     @staticmethod
     def _fmt_elapsed(seconds: float) -> str:
+        """Format a duration for log messages (milliseconds or seconds)."""
         if seconds < 1.0:
             return f"{seconds * 1000:.0f} ms"
         return f"{seconds:.2f} s"
 
     # ---- show/hide filter params ------------------------------------------
     def on_filter_change(self, mode):
+        """Show kernel or pawflim controls and block unsupported LIF filter modes."""
+        if (
+            dataset_has_sample(self.data)
+            and self.data.load_source == "lif_phasor"
+            and mode in ("pawflim", "signal median", "signal gaussian")
+        ):
+            self.cb_filter.blockSignals(True)
+            self.cb_filter.setCurrentText("median")
+            self.cb_filter.blockSignals(False)
+            mode = "median"
+            self._log(
+                "LIF phasor maps: use phasor median/gaussian filters (no TCSPC histogram).")
         is_kernel = mode in ("median", "gaussian", "signal median", "signal gaussian")
         is_paw = mode == "pawflim"
         for w in self.row_msize:
@@ -665,6 +769,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             w.setVisible(is_paw)
 
     def _connect_per_sample_proc_autosave(self):
+        """Autosave processing spinboxes to the active dataset in multi-image mode."""
         for w in (
             self.sp_harm, self.sp_freq, self.sp_reflt, self.sp_msize, self.sp_mrep,
             self.sp_psigma, self.sp_plevels, self.sp_thr,
@@ -675,22 +780,38 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.cb_channel.currentIndexChanged.connect(self._on_per_sample_proc_changed)
 
     def _on_per_sample_proc_changed(self, *_args):
+        """Persist UI processing settings and debounce compare-table refresh."""
         if self._loading_proc_ui or not per_sample_processing(self):
             return
         self._save_proc_from_ui(self.data)
-        self._refresh_compare_list()
+        self._proc_debounce_timer.start()
+
+    def _deferred_refresh_compare_list(self):
+        """Refresh the multi-image table after per-sample settings change."""
+        if per_sample_processing(self):
+            self._refresh_compare_list()
+
+    def _on_bic_toggled(self, checked: bool):
+        """Update GMM component spinbox tooltip for fixed-k vs BIC auto-k mode."""
+        if checked:
+            self.edit_ncomp.setToolTip("Maximum k for BIC search (1–12).")
+        else:
+            self.edit_ncomp.setToolTip("Number of GMM components (1–12).")
 
     def _init_dataset_proc_settings(self, d: PhasorData):
+        """Seed per-sample processing settings from the current UI if unset."""
         if d.processing_settings is None:
             d.processing_settings = capture_processing_from_ui(self)
 
     def _save_proc_from_ui(self, d: PhasorData):
+        """Copy Setup-tab processing controls into a dataset's stored settings."""
         if d is None:
             return
         if per_sample_processing(self):
             d.processing_settings = capture_processing_from_ui(self)
 
     def _load_proc_to_ui(self, d: PhasorData):
+        """Populate Setup-tab controls from a dataset's stored processing settings."""
         if not per_sample_processing(self):
             return
         stash = getattr(d, "processing_settings", None)
@@ -704,6 +825,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self._loading_proc_ui = False
 
     def _update_multi_strip(self):
+        """Show or hide multi-image table and active-sample labels."""
         multi_on = hasattr(self, "chk_multi") and self.chk_multi.isChecked()
         show_strip = multi_on and len(self.datasets) > 1
         show_active = multi_on and len(self.datasets) >= 1
@@ -724,6 +846,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._update_proc_active_label()
 
     def _refresh_sample_combo(self):
+        """Rebuild the active-sample dropdown from loaded datasets."""
         if not hasattr(self, "cb_sample"):
             return
         cb = self.cb_sample
@@ -737,9 +860,11 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._update_multi_strip()
 
     def _on_sample_combo_change(self, idx: int):
+        """Handle active-sample selection from the Setup-tab combo box."""
         self._on_sample_picker_change(idx)
 
     def _on_sample_picker_change(self, idx: int):
+        """Switch the active dataset when the user picks a sample index."""
         if self._table_sel_lock or not (0 <= idx < len(self.datasets)):
             return
         if idx == self.active_idx:
@@ -747,6 +872,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._activate_dataset(idx)
 
     def _sync_sample_table_selection(self):
+        """Keep compare table row and sample combo aligned with active_idx."""
         if not hasattr(self, "table_compare"):
             return
         self._table_sel_lock = True
@@ -767,6 +893,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._update_multi_strip()
 
     def _update_apply_buttons(self):
+        """Relabel Apply buttons and show Apply all when multiple samples are loaded."""
         if not hasattr(self, "chk_multi"):
             return
         multi = len(self.datasets) > 1
@@ -784,6 +911,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
     # ---- mode switching ----------------------------------------------------
     def on_mode_change(self):
+        """Toggle between cursor ROI and GMM segmentation modes."""
         self.mode = "cursor" if self.rb_cursor.isChecked() else "gmm"
         self.cursor_box.setVisible(self.mode == "cursor")
         self.gmm_box.setVisible(self.mode == "gmm")
@@ -797,9 +925,11 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
     # ---- file actions ------------------------------------------------------
     def _dialog_dir(self, key: str, fallback: str = "") -> str:
+        """Return the last-used directory for a QFileDialog category."""
         return self._settings.value(key, fallback) or ""
 
     def choose_sample(self):
+        """Open a file dialog and load one or more FLIM sample files."""
         start = self._dialog_dir("sample_dir")
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self, "Choose sample FLIM file(s)", start, FLIM_FILE_FILTER)
@@ -821,26 +951,75 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         if not supported:
             QtWidgets.QMessageBox.warning(
                 self, "Unsupported file",
-                "Use PicoQuant .ptu or Imspector .tif / .tiff FLIM stacks.",
+                "Use PicoQuant .ptu, Imspector .tif / .tiff, or Leica .lif / .xlef files.",
             )
             return
         if skipped:
             self._log(f"Skipped {skipped} unsupported file(s).")
-        if not self._prepare_sample_load(supported):
+        try:
+            jobs = self._expand_sample_load_jobs(supported)
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(self, "LIF file", str(e))
             return
-        self._load_sample_paths(supported)
+        if not jobs:
+            return
+        if not self._prepare_sample_load(jobs):
+            return
+        self._load_sample_paths(jobs)
 
-    def _prepare_sample_load(self, paths):
-        """Confirm how new paths merge with the current session. Returns False if cancelled."""
-        has_current = self.data.signal_full is not None
-        batch = len(paths) > 1
+    def _expand_sample_load_jobs(self, paths):
+        """Turn file paths into load jobs; prompt when a LIF holds multiple FLIM series."""
+        histogram_paths = []
+        lif_pending: dict[str, list[LifPhasorSeries]] = {}
+
+        for path in paths:
+            if is_lif_path(path):
+                try:
+                    series = list_lif_phasor_series(path)
+                except Exception as e:
+                    raise ValueError(
+                        f"{os.path.basename(path)}: cannot read LIF ({e})") from e
+                if not series:
+                    raise ValueError(
+                        f"{os.path.basename(path)}: no phasor images found "
+                        "(export phasor maps from LAS X or use .ptu).")
+                lif_pending[path] = series
+            else:
+                histogram_paths.append(path)
+
+        lif_jobs: list[tuple[str, str | None]] = []
+        need_dialog: dict[str, list[LifPhasorSeries]] = {}
+        for path, series in lif_pending.items():
+            if len(series) == 1:
+                lif_jobs.append((path, series[0].image_key))
+            else:
+                need_dialog[path] = series
+
+        if need_dialog:
+            dlg = LifSeriesDialog(need_dialog, self)
+            if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                return []
+            picked = dlg.selected_series()
+            if not picked:
+                return []
+            lif_jobs.extend((s.lif_path, s.image_key) for s in picked)
+
+        jobs = [(p, None) for p in histogram_paths] + lif_jobs
+        if len(jobs) > 1:
+            self.chk_multi.setChecked(True)
+        return jobs
+
+    def _prepare_sample_load(self, jobs):
+        """Confirm how new load jobs merge with the current session. Returns False if cancelled."""
+        has_current = dataset_has_sample(self.data)
+        batch = len(jobs) > 1
 
         if batch:
             self.chk_multi.setChecked(True)
             if has_current:
                 mbox = QtWidgets.QMessageBox(self)
                 mbox.setWindowTitle("Load multiple samples")
-                mbox.setText(f"Load {len(paths)} file(s).")
+                mbox.setText(f"Load {len(jobs)} sample(s).")
                 mbox.setInformativeText(
                     "Replace all currently loaded samples, or add the new files to the list?")
                 btn_replace = mbox.addButton(
@@ -883,55 +1062,96 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self.datasets.append(self.data)
         return True
 
-    def _load_sample_paths(self, paths):
-        """Decode FLIM files into memory (no phasor preprocessing until Apply)."""
-        n = len(paths)
+    def _load_sample_paths(self, jobs):
+        """Decode FLIM files and show uncalibrated phasor / image preview."""
+        n = len(jobs)
         loaded = []
         t_decode = 0.0
         frame = int(self.sp_frame.value()) if hasattr(self, "sp_frame") else -1
-        for i, path in enumerate(paths):
+        for i, (path, lif_key) in enumerate(jobs):
             d = PhasorData()
+            label = os.path.basename(path)
+            if lif_key:
+                series = lif_key.split("/")[-1] if "/" in lif_key else lif_key
+                label = f"{label} · {series}"
             try:
-                (shape, nch), elapsed = self._run_busy(
-                    f"Decoding {i + 1}/{n}: {os.path.basename(path)}…",
-                    lambda p=path, ds=d, fr=frame: ds.load_sample(p, frame=fr),
-                )
+                if lif_key is not None:
+                    (shape, nch), elapsed = self._run_busy(
+                        f"Reading LIF {i + 1}/{n}: {label}…",
+                        lambda p=path, k=lif_key, ds=d: ds.load_lif_phasor(p, k),
+                    )
+                else:
+                    (shape, nch), elapsed = self._run_busy(
+                        f"Decoding {i + 1}/{n}: {label}…",
+                        lambda p=path, ds=d, fr=frame: ds.load_sample(p, frame=fr),
+                    )
                 t_decode += elapsed
-                loaded.append((d, path, shape, nch))
+                loaded.append((d, path, shape, nch, lif_key))
             except CancelledError:
                 if not loaded:
                     return
                 break
             except Exception as e:
-                self._log(f"Load error ({os.path.basename(path)}): {e}")
-                QtWidgets.QMessageBox.critical(
-                    self, "Load error", f"{os.path.basename(path)}:\n{e}")
+                self._log(f"Load error ({label}): {e}")
+                QtWidgets.QMessageBox.critical(self, "Load error", f"{label}:\n{e}")
                 if not loaded:
                     return
                 break
 
-        for d, path, shape, nch in loaded:
-            self._activate_new_dataset(d)
+        for d, path, shape, nch, lif_key in loaded:
+            self._activate_new_dataset(d, refresh_table=False)
+            name = os.path.basename(path)
+            if lif_key:
+                series = lif_key.split("/")[-1] if "/" in lif_key else lif_key
+                name = f"{name} · {series}"
+            lasx_note = ""
+            if d.lif_lasx_calibrated:
+                lasx_note = " · LAS X phasor calibration"
+            photon_note = ""
+            if getattr(d, "lif_uses_photon_intensity", False):
+                photon_note = " · photon Intensity image"
             self._log(
-                f"Loaded {os.path.basename(path)} — {shape[1]}×{shape[0]}, {nch} ch, "
-                f"{d.frequency:.2f} MHz · {format_memory_line(d)}")
+                f"Loaded {name} — {shape[1]}×{shape[0]}, {nch} ch, "
+                f"{d.frequency:.2f} MHz{lasx_note}{photon_note} · {format_memory_line(d)}")
+
+        preview_targets = [d for d, _, _, _, _ in loaded]
+        t_preview = 0.0
+        try:
+            _, t_preview = self._run_busy(
+                "Uncalibrated preview…",
+                lambda: self._process_uncalibrated_preview(preview_targets),
+            )
+        except CancelledError:
+            pass
+        except Exception as e:
+            self._log(f"Preview error: {e}")
+            QtWidgets.QMessageBox.warning(self, "Preview", str(e))
 
         self._restore_ui_for_active()
         self._refresh_image_combo()
         self._update_apply_buttons()
-        self._update_phasor_display()
+        self._ensure_compare_overlay_off()
         self.refresh_image()
-        self._log(
-            f"{len(loaded)} sample(s) decoded ({self._fmt_elapsed(t_decode)}) — "
-            "choose Reference, Calibrate, then Apply.")
+        if preview_targets and preview_targets[0].real_cal is not None:
+            n_valid = int(self.data.valid_mask().sum())
+            self._log(
+                f"{len(loaded)} sample(s) loaded ({self._fmt_elapsed(t_decode + t_preview)}) — "
+                f"uncalibrated preview ({n_valid} valid px). "
+                "Calibrate + Apply for reference-corrected maps.")
+        else:
+            self._log(
+                f"{len(loaded)} sample(s) decoded ({self._fmt_elapsed(t_decode)}) — "
+                "choose Reference, Calibrate, then Apply.")
 
     def _effective_ref_path(self, d=None):
+        """Return the reference file path for a dataset (shared or per-sample)."""
         d = d or self.data
         if self.chk_shared_ref.isChecked() and self.shared_ref_path:
             return self.shared_ref_path
         return d.ref_path or None
 
     def _ref_channel_for_dataset(self, d):
+        """Return the reference channel index used when calibrating a dataset."""
         if self.chk_shared_ref.isChecked() and self.shared_ref_path:
             return min(self.shared_ref_channel, max(0, self.shared_ref_n_channels - 1))
         return min(d.ref_channel, max(0, d.ref_n_channels - 1)) if d.ref_path else 0
@@ -949,6 +1169,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             d.ref_channel = min(self.shared_ref_channel, d.ref_n_channels - 1)
 
     def on_shared_ref_toggle(self, checked):
+        """Enable or disable one reference file for all loaded samples."""
         if checked and self.shared_ref_path:
             self._propagate_shared_reference()
         self._restore_ui_for_active()
@@ -958,6 +1179,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             "Shared reference off — each sample can use its own reference (active sample).")
 
     def _all_datasets(self):
+        """Return active and listed datasets without duplicates."""
         seen = []
         for d in [self.data] + list(self.datasets):
             if d is not None and d not in seen:
@@ -965,12 +1187,14 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         return seen
 
     def _reference_harmonic_for_cal(self):
+        """Return harmonic index (or list for pawflim) for reference calibration."""
         h = int(self.sp_harm.value())
         if self.cb_filter.currentText() == "pawflim":
             return [h, 2 * h]
         return h
 
     def _effective_ref_file_path(self):
+        """Return the reference file path selected for Calibrate/Apply."""
         if self.chk_shared_ref.isChecked() and self.shared_ref_path:
             return self.shared_ref_path
         if self.data.ref_path:
@@ -995,6 +1219,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         harm = self._reference_harmonic_for_cal()
 
         def work():
+            """Decode reference file and compute mean g/s (runs off GUI thread)."""
             return compute_reference_phasor(path, ch, harm)
 
         try:
@@ -1022,6 +1247,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         return True
 
     def _sync_manual_fields_from_calibration(self):
+        """Copy stored calibration g/s into the manual entry fields."""
         self.edit_ref_g.blockSignals(True)
         self.edit_ref_s.blockSignals(True)
         self.edit_ref_g.setText(f"{self.ref_calibration.mean_g:.5f}")
@@ -1030,6 +1256,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.edit_ref_s.blockSignals(False)
 
     def _apply_manual_calibration_fields(self):
+        """Read manual g/s fields and update the in-memory calibration object."""
         try:
             self.ref_calibration.manual_g = float(self.edit_ref_g.text().strip())
             self.ref_calibration.manual_s = float(self.edit_ref_s.text().strip())
@@ -1040,6 +1267,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.ref_calibration.mean_s = self.ref_calibration.manual_s
 
     def _update_calibration_display(self):
+        """Refresh calibration summary label and panel status line."""
         if hasattr(self, "_update_panel_status"):
             self._update_panel_status()
         cal = self.ref_calibration
@@ -1052,6 +1280,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             f"τ_ref={self.sp_reflt.value():.2f} ns  |  ch {cal.channel}")
 
     def _on_manual_cal_toggled(self, checked):
+        """Enable manual g/s entry and recompute file-based calibration when off."""
         self.edit_ref_g.setEnabled(checked)
         self.edit_ref_s.setEnabled(checked)
         self.btn_set_manual_gs.setEnabled(checked)
@@ -1104,6 +1333,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self._update_calibration_stale_style()
 
     def _clear_calibration(self):
+        """Reset reference calibration, paths, and per-sample ref assignments."""
         self.ref_calibration.clear()
         clear_calibration_cache()
         self.shared_ref_path = ""
@@ -1132,6 +1362,13 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(
                 self, "Unsupported file",
                 "Use a PicoQuant .ptu or Imspector .tif / .tiff FLIM stack.",
+            )
+            return
+        if is_lif_path(path):
+            QtWidgets.QMessageBox.warning(
+                self, "Reference file",
+                "Leica LIF phasor maps cannot be used as a TCSPC reference.\n"
+                "Use a .ptu or .tif reference measurement instead.",
             )
             return
         self._set_reference_path(path)
@@ -1187,7 +1424,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         ref_nch = max(1, int(self.ref_calibration.n_channels))
         self.shared_ref_n_channels = ref_nch
         self.shared_ref_channel = min(self.shared_ref_channel, ref_nch - 1)
-        if self.data.signal_full is not None:
+        if dataset_has_sample(self.data) and self.data.signal_full is not None:
             self.shared_ref_channel = min(self.data.channel, ref_nch - 1)
         self.data.ref_n_channels = ref_nch
         self._propagate_shared_reference()
@@ -1200,7 +1437,18 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             f"s={self.ref_calibration.mean_s:.4f}) — click Apply to preprocess samples.")
 
     # ---- multi-image management -------------------------------------------
-    def _activate_new_dataset(self, d):
+    def _apply_lif_dataset_defaults(self, d: PhasorData):
+        """Seed per-sample settings from LAS X metadata after LIF load."""
+        if d.load_source != "lif_phasor":
+            return
+        if d.processing_settings is None:
+            d.processing_settings = capture_processing_from_ui(self)
+        d.processing_settings["frequency"] = float(d.frequency)
+        thr = float(getattr(d, "lif_lasx_intensity_threshold", 0) or 0)
+        if thr > 0:
+            d.processing_settings["intensity_min"] = thr
+
+    def _activate_new_dataset(self, d, *, refresh_table: bool = True):
         """Make d the active dataset; append to the set if multi-image mode is on."""
         if self.chk_shared_ref.isChecked() and self.shared_ref_path:
             d.ref_path = self.shared_ref_path
@@ -1214,40 +1462,48 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self.datasets.append(d)
             self.active_idx = len(self.datasets) - 1
         self._init_dataset_proc_settings(d)
+        self._apply_lif_dataset_defaults(d)
         self.data = d
         self._restore_ui_for_active()
-        if self.chk_multi.isChecked():
+        if self.chk_multi.isChecked() and refresh_table:
             self._refresh_compare_list()
 
     @staticmethod
     def _compact_filename(path, fallback="(none)", max_len=30):
+        """Truncate a basename for compact panel and status labels."""
         name = os.path.basename(path) if path else fallback
         if len(name) > max_len:
             return name[: max_len - 1] + "…"
         return name
 
     def _update_proc_active_label(self):
+        """Show the active sample filename beside the sample combo when solo."""
         if not hasattr(self, "lbl_proc_active"):
             return
         multi = hasattr(self, "chk_multi") and self.chk_multi.isChecked() and len(self.datasets) > 1
         if multi:
             self.lbl_proc_active.setText("")
             return
-        if self.data.signal_full is not None:
+        if dataset_has_sample(self.data):
             self.lbl_proc_active.setText(
-                self._compact_filename(self.data.sample_path, "(no sample)"))
+                self._compact_filename(dataset_short_label(self.data), "(no sample)"))
         else:
             self.lbl_proc_active.setText("(no sample)")
 
     def _update_panel_status(self):
+        """Update the top panel status with active sample and calibration state."""
         if not hasattr(self, "lbl_panel_status"):
             return
-        if self.data.signal_full is None:
+        if not dataset_has_sample(self.data):
             self.lbl_panel_status.setText("No sample loaded")
             return
-        name = self._compact_filename(self.data.sample_path, "(no sample)")
-        if self.ref_calibration.is_active:
+        name = self._compact_filename(dataset_short_label(self.data), "(no sample)")
+        if getattr(self.data, "maps_calibrated", False):
             cal = f"g={self.ref_calibration.mean_g:.3f} s={self.ref_calibration.mean_s:.3f}"
+        elif self.data.real_cal is not None:
+            cal = "preview (uncalibrated)"
+        elif self.ref_calibration.is_active:
+            cal = f"ref g={self.ref_calibration.mean_g:.3f} s (not applied)"
         else:
             cal = "uncalibrated"
         n = len(self.datasets)
@@ -1258,6 +1514,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self.lbl_panel_status.setText(f"Active: {name}  ·  {cal}")
 
     def _restore_ui_for_active(self):
+        """Sync all file, channel, processing, and label controls to the active dataset."""
         d = self.data
         self.lbl_sample.setText(self._compact_filename(d.sample_path, "(no sample)"))
         self._update_proc_active_label()
@@ -1276,15 +1533,31 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._update_ref_channel_combo()
         self.sp_freq.setValue(d.frequency)
         self.sp_harm.setValue(d.harmonic)
+        if d.load_source == "lif_phasor":
+            thr = float(getattr(d, "lif_lasx_intensity_threshold", 0) or 0)
+            if thr > 0 and hasattr(self, "sp_thr"):
+                self.sp_thr.setValue(int(thr))
+            if hasattr(self, "cb_image_view"):
+                self.cb_image_view.blockSignals(True)
+                self.cb_image_view.setCurrentIndex(0)
+                self.cb_image_view.blockSignals(False)
         self._load_proc_to_ui(d)
         self._update_frame_control()
+        if hasattr(self, "edit_display_name"):
+            self.edit_display_name.blockSignals(True)
+            self.edit_display_name.setText((d.display_name or "").strip())
+            file_hint = _dataset_file_label(d, self.active_idx)
+            self.edit_display_name.setPlaceholderText(file_hint)
+            self.edit_display_name.blockSignals(False)
         if hasattr(self, "edit_group"):
             self.edit_group.blockSignals(True)
             self.edit_group.setText((d.group_name or "").strip())
             self.edit_group.blockSignals(False)
+        self._update_sample_label_controls()
         self._sync_sample_table_selection()
 
     def _update_ref_channel_combo(self):
+        """Populate reference channel combo from shared or per-sample ref metadata."""
         ref_path = self._effective_ref_path(self.data)
         has_ref = bool(ref_path)
         if self.chk_shared_ref.isChecked() and self.shared_ref_path:
@@ -1302,8 +1575,16 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.cb_ref_channel.blockSignals(False)
 
     def _set_multi_detail_enabled(self, enabled):
+        """Enable or disable multi-image tab widgets as a group."""
         for w in self._multi_detail_widgets:
             w.setEnabled(enabled)
+        self._update_sample_label_controls()
+
+    def _update_sample_label_controls(self):
+        """Enable display-name and group fields only when a sample is loaded."""
+        has_sample = dataset_has_sample(self.data)
+        for w in getattr(self, "_sample_label_widgets", ()):
+            w.setEnabled(has_sample)
 
     def _process_all_loaded_datasets(self, *, use_ui_settings=True):
         """Re-run phasor pipeline on every loaded sample (caller may wrap in _run_busy)."""
@@ -1314,7 +1595,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         saved = self.data
         saved_idx = self.active_idx
         for d in targets:
-            if d.signal_full is None:
+            if not dataset_has_sample(d):
                 continue
             self._run_processing_on_dataset(d, use_ui_settings=use_ui_settings)
         if 0 <= saved_idx < len(self.datasets):
@@ -1324,6 +1605,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self.data = saved
 
     def _refresh_views_after_processing(self):
+        """Update UI, phasor plot, and image view after Apply completes."""
         self._restore_ui_for_active()
         self._refresh_compare_list()
         self._refresh_compare_group_filter()
@@ -1335,19 +1617,6 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         if hasattr(self, "_update_metadata_panel"):
             self._update_metadata_panel()
 
-    def _recompute_all_datasets(self):
-        """Re-run phasor pipeline on every loaded sample (e.g. after shared reference change)."""
-        try:
-            self._run_busy(
-                "Recomputing phasor maps…",
-                lambda: self._process_all_loaded_datasets(use_ui_settings=True),
-            )
-        except Exception as e:
-            self._log(f"Processing error: {e}")
-            QtWidgets.QMessageBox.critical(self, "Processing error", str(e))
-            return
-        self._refresh_views_after_processing()
-
     def _refresh_image_combo(self):
         """Refresh sample table, dropdown, and overlay filters."""
         self._refresh_compare_list()
@@ -1356,6 +1625,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._sync_sample_table_selection()
 
     def _refresh_compare_group_filter(self):
+        """Rebuild overlay group filter combo from dataset group names."""
         if not hasattr(self, "cb_compare_group"):
             return
         current = self.cb_compare_group.currentText()
@@ -1374,6 +1644,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.cb_compare_group.blockSignals(False)
 
     def _apply_group_from_field(self):
+        """Save the active sample's group name and refresh overlay legend."""
         text = self.edit_group.text().strip() if hasattr(self, "edit_group") else ""
         if self.chk_multi.isChecked() and 0 <= self.active_idx < len(self.datasets):
             self.datasets[self.active_idx].group_name = text
@@ -1382,11 +1653,77 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._refresh_compare_list()
         self._refresh_compare_group_filter()
         if self.data.real_cal is not None:
-            self._update_phasor_display()
+            self._update_phasor_legend_only()
         if text:
             self._log(f"Group set to “{text}” for active sample.")
 
+    def _apply_display_name_from_field(self):
+        """Save the active sample's legend display name and update the compare table."""
+        text = self.edit_display_name.text().strip() if hasattr(self, "edit_display_name") else ""
+        d = self.data
+        row = self.active_idx
+        if self.chk_multi.isChecked() and 0 <= self.active_idx < len(self.datasets):
+            d = self.datasets[self.active_idx]
+            row = self.active_idx
+        d.display_name = text
+        self._patch_sample_table_name(row)
+        self._refresh_sample_combo()
+        self._update_active_sample_label()
+        self._update_phasor_legend_only()
+        if text:
+            self._log(f"Display name set to “{text}”.")
+        elif hasattr(self, "edit_display_name"):
+            file_hint = _dataset_file_label(d, row)
+            self.edit_display_name.setPlaceholderText(file_hint)
+
+    def _patch_sample_table_name(self, row: int):
+        """Update one compare-table Sample cell after a display-name change."""
+        if not (0 <= row < len(self.datasets) and row < self.table_compare.rowCount()):
+            return
+        d = self.datasets[row]
+        self.table_compare.blockSignals(True)
+        item = self.table_compare.item(row, 2)
+        if item is None:
+            item = self._editable_sample(dataset_short_label(d, row))
+            self.table_compare.setItem(row, 2, item)
+        else:
+            item.setText(dataset_short_label(d, row))
+        file_hint = _dataset_file_label(d, row)
+        if (d.display_name or "").strip():
+            item.setToolTip(f"File: {file_hint}")
+        else:
+            item.setToolTip("Double-click to rename for the phasor legend")
+        self.table_compare.blockSignals(False)
+
+    def _update_active_sample_label(self):
+        """Refresh the Active label on the Multi-phasor tab."""
+        if not hasattr(self, "lbl_editing"):
+            return
+        if self.chk_multi.isChecked() and len(self.datasets) > 1 and 0 <= self.active_idx < len(self.datasets):
+            self.lbl_editing.setText(
+                f"Active: {dataset_display_label(self.data, self.active_idx)}")
+
+    def _legend_include_group(self) -> bool:
+        """Return whether phasor legend labels should include group names."""
+        if not hasattr(self, "cb_legend_format"):
+            return True
+        return self.cb_legend_format.currentText() != "Sample name"
+
+    def _legend_loc(self) -> str:
+        """Return the matplotlib legend location key for the phasor plot."""
+        if not hasattr(self, "cb_legend_loc"):
+            return "upper right"
+        loc = self.cb_legend_loc.currentText().strip()
+        return loc if loc in LEGEND_LOC_ITEMS else "upper right"
+
+    def _legend_fontsize(self) -> float:
+        """Return legend font size for multi-image phasor overlay."""
+        if not hasattr(self, "sp_legend_size"):
+            return float(LEGEND_SIZE_DEFAULT)
+        return float(self.sp_legend_size.value())
+
     def _update_frame_control(self):
+        """Enable frame spinbox when the active sample has a time stack."""
         d = self.data
         self.sp_frame.blockSignals(True)
         if d.signal_full is None:
@@ -1404,6 +1741,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.sp_frame.blockSignals(False)
 
     def on_frame_change(self, value):
+        """Reload and reprocess the active sample for a new time-frame index."""
         if self.data.sample_path:
             if int(value) == int(getattr(self.data, "frame_index", -1)):
                 return
@@ -1411,6 +1749,9 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self._reload_active_sample()
 
     def _reload_active_sample(self):
+        """Decode the active sample at the current frame and rerun Apply."""
+        if self.data.load_source == "lif_phasor":
+            return
         path = self.data.sample_path
         if not path or not os.path.isfile(path):
             return
@@ -1429,15 +1770,18 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.apply_processing()
 
     def _compare_show_item(self, row):
+        """Return the Show checkbox item for a compare-table row."""
         return self.table_compare.item(row, 0)
 
     def _compare_dataset_index(self, row):
+        """Return dataset index stored in a compare-table row's Show item."""
         it = self._compare_show_item(row)
         if it is None:
             return -1
         return int(it.data(Qt.ItemDataRole.UserRole))
 
     def _refresh_compare_list(self):
+        """Rebuild the multi-image compare table from loaded datasets."""
         checked = {}
         was_ready = {}
         for row in range(self.table_compare.rowCount()):
@@ -1447,7 +1791,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
                 checked[idx] = it.checkState() == Qt.CheckState.Checked
             status_it = self.table_compare.item(row, 7)
             if idx >= 0:
-                was_ready[idx] = status_it is not None and status_it.text() == "ready"
+                was_ready[idx] = status_it is not None and status_it.text() != "pending"
 
         self.table_compare.blockSignals(True)
         self.table_compare.setRowCount(len(self.datasets))
@@ -1471,11 +1815,17 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
             num = self._ro(str(i + 1))
             num.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            sample = self._ro(dataset_short_label(d, i))
+            sample = self._editable_sample(dataset_short_label(d, i))
             if i == self.active_idx:
                 sample.setFont(QtGui.QFont(sample.font().family(), sample.font().pointSize(),
                                            QtGui.QFont.Weight.Bold))
                 sample.setToolTip("Selected — settings below apply to this sample")
+            else:
+                file_hint = _dataset_file_label(d, i)
+                if (d.display_name or "").strip():
+                    sample.setToolTip(f"File: {file_hint}")
+                else:
+                    sample.setToolTip("Double-click to rename for the phasor legend")
             group = self._editable_group((d.group_name or "").strip())
             stash = getattr(d, "processing_settings", None) or {}
             filt = self._ro(
@@ -1484,9 +1834,14 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             ref_lbl = self._ro(
                 self._effective_ref_label(d) if hasattr(self, "_effective_ref_label")
                 else "—")
-            status = self._ro("ready" if ready else "pending")
             if not ready:
+                status = self._ro("pending")
                 status.setForeground(QtGui.QBrush(Qt.GlobalColor.gray))
+            elif getattr(d, "maps_calibrated", False):
+                status = self._ro("calibrated")
+            else:
+                status = self._ro("preview")
+                status.setToolTip("Uncalibrated preview — Calibrate + Apply to correct")
 
             self.table_compare.setItem(i, 0, show)
             self.table_compare.setItem(i, 1, num)
@@ -1516,9 +1871,16 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self._update_phasor_display()
 
     def _set_compare_controls_enabled(self, compare_available):
+        """Enable overlay style, legend, and table controls when compare is available."""
         cmp_on = compare_available and self.chk_compare.isChecked()
         self.chk_compare.setEnabled(compare_available)
         self.cb_compare_style.setEnabled(cmp_on)
+        if hasattr(self, "cb_legend_format"):
+            self.cb_legend_format.setEnabled(cmp_on)
+        if hasattr(self, "cb_legend_loc"):
+            self.cb_legend_loc.setEnabled(cmp_on)
+        if hasattr(self, "sp_legend_size"):
+            self.sp_legend_size.setEnabled(cmp_on)
         if hasattr(self, "table_compare"):
             self.table_compare.setEnabled(len(self.datasets) > 1)
         for btn in getattr(self, "_compare_sel_buttons", ()):
@@ -1526,6 +1888,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._update_multi_strip()
 
     def _compare_set_all_checks(self, checked):
+        """Check or uncheck all Show boxes in the compare table."""
         state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         self.table_compare.blockSignals(True)
         for row in range(self.table_compare.rowCount()):
@@ -1537,12 +1900,30 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._update_phasor_display()
 
     def _compare_select_all(self):
+        """Show every preprocessed sample on the phasor overlay."""
         self._compare_set_all_checks(True)
 
     def _compare_select_none(self):
+        """Hide all samples from the phasor overlay."""
         self._compare_set_all_checks(False)
 
     def _on_compare_table_changed(self, row, column):
+        """Handle inline edits to sample name, group, or Show checkbox."""
+        if column == 2:
+            if 0 <= row < len(self.datasets):
+                item = self.table_compare.item(row, 2)
+                text = item.text().strip() if item else ""
+                self.datasets[row].display_name = text
+                if row == self.active_idx and hasattr(self, "edit_display_name"):
+                    self.edit_display_name.blockSignals(True)
+                    self.edit_display_name.setText(text)
+                    self.edit_display_name.setPlaceholderText(
+                        _dataset_file_label(self.datasets[row], row))
+                    self.edit_display_name.blockSignals(False)
+                self._refresh_sample_combo()
+                self._update_active_sample_label()
+                self._update_phasor_legend_only()
+            return
         if column == 3:
             if 0 <= row < len(self.datasets):
                 item = self.table_compare.item(row, 3)
@@ -1553,13 +1934,14 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
                     self.edit_group.setText(text)
                     self.edit_group.blockSignals(False)
                 self._refresh_compare_group_filter()
-                self._update_phasor_display()
+                self._update_phasor_legend_only()
             return
         if column != 0:
             return
         self._on_compare_ui_changed()
 
     def _on_sample_table_selection(self):
+        """Activate the dataset for the selected compare-table row."""
         if self._table_sel_lock or len(self.datasets) <= 1:
             return
         sel = self.table_compare.selectionModel().selectedRows()
@@ -1571,6 +1953,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._activate_dataset(row)
 
     def _build_compare_layers(self):
+        """Build phasor overlay layer descriptors from checked compare-table rows."""
         group_sel = (
             self.cb_compare_group.currentText()
             if hasattr(self, "cb_compare_group") else "All groups"
@@ -1587,7 +1970,8 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
                 continue
             layers.append({
                 "data": d,
-                "label": dataset_display_label(d, idx),
+                "label": dataset_phasor_legend_label(
+                    d, idx, include_group=self._legend_include_group()),
                 "color": categorical_rgb(idx),
                 "visible": show is not None and show.checkState() == Qt.CheckState.Checked,
                 "index": idx,
@@ -1595,9 +1979,11 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         return layers
 
     def _compare_style_key(self):
+        """Return the phasor canvas style key for the selected overlay mode."""
         return COMPARE_STYLE_MAP.get(self.cb_compare_style.currentText(), "cloud")
 
-    def _update_phasor_display(self, status_note=""):
+    def _compare_overlay_active(self):
+        """Return whether multi-image overlay is on and its layer list."""
         layers = self._build_compare_layers()
         visible = [L for L in layers if L.get("visible") and L["data"].real_cal is not None]
         compare_on = (
@@ -1605,11 +1991,18 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             and self.chk_compare.isChecked()
             and len(visible) >= 1
         )
+        return compare_on, layers, visible
+
+    def _update_phasor_display(self, status_note=""):
+        """Redraw phasor plot with optional multi-image overlay and legend."""
+        compare_on, layers, visible = self._compare_overlay_active()
         self.phasor.update_display(
             self.data,
             compare_enabled=compare_on,
             compare_style=self._compare_style_key(),
             compare_layers=layers if compare_on else None,
+            legend_loc=self._legend_loc(),
+            legend_fontsize=self._legend_fontsize(),
         )
         if compare_on and len(visible) >= 2:
             freqs = {round(L["data"].work_frequency, 4) for L in visible}
@@ -1621,17 +2014,37 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             elif status_note:
                 self._log(status_note)
 
+    def _update_phasor_legend_only(self):
+        """Refresh overlay legend without redrawing phasor point clouds."""
+        compare_on, layers, visible = self._compare_overlay_active()
+        if not compare_on or len(visible) < 2:
+            return
+        self.phasor.update_compare_legend(
+            layers,
+            compare_style=self._compare_style_key(),
+            legend_loc=self._legend_loc(),
+            legend_fontsize=self._legend_fontsize(),
+        )
+
+    def _on_legend_ui_changed(self, *_args):
+        """React to legend format, position, or size changes on the overlay."""
+        self._set_compare_controls_enabled(
+            self.chk_multi.isChecked() and len(self.datasets) >= 2)
+        self._update_phasor_legend_only()
+
     def _on_compare_ui_changed(self, *_args):
+        """React to overlay toggle, style, or group-filter changes."""
         self._set_compare_controls_enabled(
             self.chk_multi.isChecked() and len(self.datasets) >= 2)
         if self.data.real_cal is not None or self.chk_compare.isChecked():
             self._update_phasor_display()
 
     def on_multi_toggle(self, checked):
+        """Enter or leave multi-image mode and refresh compare UI."""
         self._set_multi_detail_enabled(checked)
         if checked:
             # adopt the currently loaded image as the first slot (non-destructive)
-            has_image = self.data.signal_full is not None
+            has_image = dataset_has_sample(self.data)
             if has_image and self.data not in self.datasets:
                 self.datasets.append(self.data)
                 self.active_idx = len(self.datasets) - 1
@@ -1655,6 +2068,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._update_apply_buttons()
 
     def _activate_dataset(self, idx: int):
+        """Switch active sample, restore its UI settings, and refresh plots."""
         if not (0 <= idx < len(self.datasets)):
             return
         if per_sample_processing(self):
@@ -1676,12 +2090,12 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self.chk_overlay.setChecked(False)
             self.chk_overlay.blockSignals(False)
             self.refresh_image()
-        self._sync_sample_table_selection()
         self._log(f"Selected sample {idx + 1}: {dataset_display_label(self.data, idx)}")
         self.activateWindow()
         self.raise_()
 
     def apply_settings_to_all(self):
+        """Copy active sample's processing settings to all datasets and Apply all."""
         if len(self.datasets) <= 1:
             QtWidgets.QMessageBox.information(
                 self, "Need multiple samples",
@@ -1698,6 +2112,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.apply_processing(scope="all")
 
     def remove_image(self):
+        """Remove the active sample from the multi-image list."""
         if not (0 <= self.active_idx < len(self.datasets)):
             return
         name = dataset_short_label(self.data, self.active_idx)
@@ -1712,6 +2127,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._activate_dataset(self.active_idx)
 
     def on_channel_change(self, idx):
+        """Switch sample channel and reprocess if maps already exist."""
         if self.data.signal_full is None:
             return
         self.data.channel = max(0, idx)
@@ -1721,6 +2137,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self._log(f"Sample channel {self.data.channel} — click Apply to preprocess.")
 
     def on_ref_channel_change(self, idx):
+        """Change reference channel and invalidate stored g/s until Calibrate."""
         if not self._effective_ref_path(self.data):
             return
         if self.chk_shared_ref.isChecked() and self.shared_ref_path:
@@ -1739,15 +2156,28 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
     # ---- processing --------------------------------------------------------
     def _active_calibration(self):
+        """Return the calibration object to apply, syncing manual fields first."""
         if self.chk_manual_cal.isChecked():
             self._apply_manual_calibration_fields()
         return self.ref_calibration if self.ref_calibration.is_active else None
 
-    def _run_processing_on_dataset(self, d, *, use_ui_settings=False):
-        run_processing_on_dataset(self, d, use_ui_settings=use_ui_settings)
+    def _process_uncalibrated_preview(self, datasets):
+        """Compute quick uncalibrated phasor maps after sample load."""
+        for d in datasets:
+            if not dataset_has_sample(d):
+                continue
+            if d.load_source == "lif_phasor":
+                continue
+            run_processing_on_dataset(self, d, use_ui_settings=True, calibrate=False)
+
+    def _run_processing_on_dataset(self, d, *, use_ui_settings=False, calibrate=True):
+        """Delegate phasor preprocessing for one dataset to processing module."""
+        run_processing_on_dataset(
+            self, d, use_ui_settings=use_ui_settings, calibrate=calibrate)
 
     def apply_processing(self, scope: str = "auto"):
-        if self.data.signal_full is None:
+        """Preprocess active or all samples with current calibration and filters."""
+        if not dataset_has_sample(self.data):
             QtWidgets.QMessageBox.information(self, "No data", "Load a sample first.")
             return
         multi = len(self.datasets) > 1
@@ -1808,6 +2238,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
     # ---- cursor actions ----------------------------------------------------
     def _refresh_active_cursor_combo(self, select_idx=None):
+        """Rebuild Move combo from phasor cursors and select the given index."""
         if not hasattr(self, "cb_active_cursor"):
             return
         idx = self.phasor.selected if select_idx is None else select_idx
@@ -1823,19 +2254,22 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.cb_active_cursor.blockSignals(False)
 
     def _on_phasor_cursor_selected(self, idx):
+        """Sync Move combo and radius controls when a cursor is clicked."""
         self._refresh_active_cursor_combo(select_idx=idx)
         self._sync_radius_slider()
 
     def on_active_cursor_change(self, combo_idx):
+        """Select the cursor index chosen in the Move combo box."""
         if self.mode != "cursor" or combo_idx < 0:
             return
         self.phasor.select_cursor(combo_idx, emit=False)
         self._sync_radius_slider()
 
     def add_cursor(self):
+        """Add a circle or ellipse ROI at the current radius on the phasor plot."""
         if hasattr(self, "_push_cursor_undo"):
             self._push_cursor_undo()
-        r = self.sld_radius.value() * 0.001
+        r = self.sp_radius.value()
         kind = "ellipse" if self.cb_cursor_shape.currentText() == "Ellipse" else "circle"
         aspect = self.sld_aspect.value() / 100.0
         self.phasor.add_cursor(
@@ -1844,6 +2278,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._refresh_active_cursor_combo()
 
     def remove_cursor(self):
+        """Delete the selected phasor cursor and refresh segmentation."""
         if self.mode != "cursor":
             return
         if hasattr(self, "_push_cursor_undo"):
@@ -1857,6 +2292,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._log("Circle removed.")
 
     def clear_cursors(self):
+        """Remove all phasor cursors and clear segmentation results."""
         self.phasor.clear_cursors()
         self._refresh_active_cursor_combo()
         self._refresh_after_cursor_edit()
@@ -1864,7 +2300,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
     def _refresh_after_cursor_edit(self):
         """Update segmentation overlay and table whenever circles are added/removed/moved."""
-        self._paint_timer.stop()
+        self._cursor_debounce_timer.stop()
         if self.mode != "cursor" or self.data.real_cal is None:
             return
         if self.phasor.cursors:
@@ -1879,12 +2315,14 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self.refresh_image()
 
     def _on_phasor_key_press(self, event):
+        """Handle Delete/Backspace on the phasor canvas to remove cursors."""
         if self.mode != "cursor":
             return
         if event.key in ("delete", "backspace"):
             self.remove_cursor()
 
     def clear_gmm(self):
+        """Remove GMM ellipses, fit state, and painted segmentation."""
         self.phasor.clear_gmm()
         if hasattr(self, "gmm"):
             del self.gmm
@@ -1896,24 +2334,55 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.refresh_image()
         self._log("GMM fit cleared.")
 
-    def on_radius_slider(self, v):
-        r = v * 0.001
-        self.lbl_radius.setText(f"r={r:.2f}")
+    def _sync_radius_controls(self, r: float):
+        """Set slider and spinbox to the selected cursor's radius without signals."""
+        r = max(0.005, min(0.400, float(r)))
+        self.sld_radius.blockSignals(True)
+        self.sld_radius.setValue(int(round(r * 1000)))
+        self.sld_radius.blockSignals(False)
+        self.sp_radius.blockSignals(True)
+        self.sp_radius.setValue(r)
+        self.sp_radius.blockSignals(False)
+
+    def _apply_radius(self, r: float, *, from_slider: bool = False, from_spin: bool = False):
+        """Update radius UI widgets and resize the selected phasor cursor."""
+        r = max(0.005, min(0.400, float(r)))
+        if not from_slider:
+            self.sld_radius.blockSignals(True)
+            self.sld_radius.setValue(int(round(r * 1000)))
+            self.sld_radius.blockSignals(False)
+        if not from_spin:
+            self.sp_radius.blockSignals(True)
+            self.sp_radius.setValue(r)
+            self.sp_radius.blockSignals(False)
         self.phasor.set_selected_radius(r)
 
+    def on_radius_slider(self, v):
+        """Resize selected cursor while the radius slider moves."""
+        self._apply_radius(v * 0.001, from_slider=True)
+
+    def on_radius_spin(self, r):
+        """Resize selected cursor while the radius spinbox changes."""
+        self._apply_radius(r, from_spin=True)
+
     def _sync_radius_slider(self):
+        """Mirror the selected cursor radius to slider and spinbox."""
         i = self.phasor.selected
         if 0 <= i < len(self.phasor.cursors):
-            r = self.phasor.cursors[i]["radius"]
-            self.sld_radius.blockSignals(True); self.sld_radius.setValue(int(round(r * 1000))); self.sld_radius.blockSignals(False)
-            self.lbl_radius.setText(f"{r:.3f}")
+            self._sync_radius_controls(self.phasor.cursors[i]["radius"])
+
+    def _on_radius_spin_committed(self):
+        """Recompute segmentation after the user finishes typing a radius."""
+        if self.mode == "cursor" and self.phasor.cursors and self.data.real_cal is not None:
+            self._cursor_debounce_timer.stop()
+            self._refresh_after_cursor_edit()
 
     def _live_active(self):
+        """Return whether live cursor overlay updates are enabled."""
         return self.chk_live.isChecked() and self.mode == "cursor" and self.data.real_cal is not None
 
-    def on_cursor_moving(self):
-        """Interactive drag/scroll/slider: repaint overlay only (fast), defer the rest."""
-        self._sync_radius_slider()
+    def _update_cursor_live_overlay(self):
+        """Paint a throttled pseudo-color overlay while cursors move."""
         if not self._live_active() or not self.phasor.cursors:
             return
         masks, colors = self._cursor_masks_colors()
@@ -1924,21 +2393,56 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
                                intensity=intensity, colors=np.array(colors))
         self.last_overlay = np.clip(np.asarray(overlay), 0, 1)
         if not self.chk_overlay.isChecked():
-            self.chk_overlay.blockSignals(True); self.chk_overlay.setChecked(True); self.chk_overlay.blockSignals(False)
-        self.image.update_overlay(self.last_overlay, title=f"Segmentation ({self.mode})")
-        self._paint_timer.start()   # full recompute (lifetimes + table) once interaction settles
+            self.chk_overlay.blockSignals(True)
+            self.chk_overlay.setChecked(True)
+            self.chk_overlay.blockSignals(False)
+        title = f"Segmentation ({self.mode})"
+        arr = None if self.image._im is None else self.image._im.get_array()
+        if arr is not None and tuple(arr.shape) == tuple(self.last_overlay.shape):
+            self.image.update_overlay(self.last_overlay, title=title)
+        else:
+            self.image.show_overlay(self.last_overlay, title=title)
+
+    def _deferred_cursor_live_overlay(self):
+        """Timer callback for throttled live cursor overlay refresh."""
+        self._update_cursor_live_overlay()
+
+    def on_cursor_moving(self):
+        """Interactive drag/scroll: throttled overlay; table stats wait for release."""
+        self._sync_radius_slider()
+        if self._live_active() and self.phasor.cursors:
+            if not self._cursor_live_timer.isActive():
+                self._update_cursor_live_overlay()
+            self._cursor_live_timer.start()
+        # Scroll wheel: debounce stats until scrolling stops (drag uses cursorChanged on release).
+        if (
+            not self.phasor.is_dragging_cursor
+            and self.mode == "cursor"
+            and self.phasor.cursors
+            and self.data.real_cal is not None
+        ):
+            self._cursor_debounce_timer.start()
 
     def on_cursor_changed(self):
-        """Committed change: sync slider and refresh segmentation (always, not only live-paint)."""
+        """Committed change (mouseup / add / remove): full table + overlay update."""
+        self._cursor_debounce_timer.stop()
         self._refresh_active_cursor_combo()
         self._sync_radius_slider()
         self._refresh_after_cursor_edit()
 
-    def _deferred_full_compute(self):
-        if self._live_active() and self.phasor.cursors:
+    def _on_radius_slider_released(self):
+        """Recompute segmentation after the radius slider is released."""
+        if self.mode == "cursor" and self.phasor.cursors and self.data.real_cal is not None:
+            self._cursor_debounce_timer.stop()
+            self._refresh_after_cursor_edit()
+
+    def _deferred_cursor_compute(self):
+        """Debounced timer callback to recompute cursor cluster stats."""
+        if self.mode == "cursor" and self.phasor.cursors and self.data.real_cal is not None:
             self._compute_cursor()
 
     def _gmm_k_max(self) -> int:
+        """Parse fixed k or BIC max-k from the GMM component field."""
         text = self.edit_ncomp.text().strip() if hasattr(self, "edit_ncomp") else "3"
         try:
             return max(1, min(12, int(text)))
@@ -1946,6 +2450,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             return 3
 
     def _gmm_sigma(self) -> float:
+        """Parse GMM ellipse contour scale (sigma) from the UI field."""
         text = self.edit_gmm_sigma.text().strip() if hasattr(self, "edit_gmm_sigma") else "2.0"
         try:
             return max(0.5, min(6.0, float(text)))
@@ -1953,7 +2458,28 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             return 2.0
 
     # ---- GMM ---------------------------------------------------------------
+    def _fit_gmm_worker(self):
+        """Fit phasor GMM on valid pixels (optionally with BIC auto-k)."""
+        from flim_phasors.analysis import select_gmm_clusters_bic
+
+        m = self.data.valid_mask()
+        g, s = self.data.real_cal, self.data.imag_cal
+        cov = self.cb_cov.currentText()
+        sigma = self._gmm_sigma()
+        if self.chk_bic.isChecked():
+            X = np.column_stack([g[m], s[m]])
+            n_clusters, best_bic = select_gmm_clusters_bic(
+                X, k_max=self._gmm_k_max(), covariance_type=cov,
+            )
+            self._log(f"GMM auto-selected {n_clusters} components (BIC={best_bic:.0f}).")
+        else:
+            n_clusters = self._gmm_k_max()
+        fit = fit_phasor_gmm(
+            g, s, clusters=n_clusters, sigma=sigma, covariance_type=cov)
+        return fit, n_clusters, sigma
+
     def fit_gmm(self):
+        """Fit GMM on phasor pixels and draw cluster ellipses on the plot."""
         if not HAVE_SKLEARN:
             QtWidgets.QMessageBox.warning(self, "Missing dependency", "pip install scikit-learn"); return
         if not self.rb_gmm.isChecked():
@@ -1963,27 +2489,14 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         m = self.data.valid_mask()
         if m.sum() < 10:
             QtWidgets.QMessageBox.information(self, "GMM", "Not enough valid pixels."); return
-        g, s = self.data.real_cal, self.data.imag_cal
-        cov = self.cb_cov.currentText()
-        sigma = self._gmm_sigma()
         try:
-            if self.chk_bic.isChecked():
-                X = np.column_stack([g[m], s[m]])
-                best_n, best_bic = 1, np.inf
-                for n in range(1, self._gmm_k_max() + 1):
-                    gm = GaussianMixture(n, covariance_type=cov, random_state=0).fit(X)
-                    b = gm.bic(X)
-                    if b < best_bic:
-                        best_bic, best_n = b, n
-                n_clusters = best_n
-                self._log(f"GMM auto-selected {best_n} components (BIC={best_bic:.0f}).")
-            else:
-                n_clusters = self._gmm_k_max()
-            self._gmm_fit = fit_phasor_gmm(
-                g, s, clusters=n_clusters, sigma=sigma, covariance_type=cov)
-            self._log(f"phasorpy GMM: {n_clusters} cluster(s), σ={sigma:.1f}.")
+            fit, n_clusters, sigma = self._run_busy("Fitting GMM…", self._fit_gmm_worker)
+        except CancelledError:
+            return
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "GMM fit failed", str(e)); return
+        self._gmm_fit = fit
+        self._log(f"phasorpy GMM: {n_clusters} cluster(s), σ={sigma:.1f}.")
         n = len(self._gmm_fit[0])
         colors = [categorical_rgb(k) for k in range(n)]
         self.phasor.show_gmm_ellipses(*self._gmm_fit, colors)
@@ -1991,6 +2504,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         return
 
     def _on_phasor_click(self, g, s):
+        """Show lifetimes at a clicked phasor coordinate and mark nearest pixel."""
         if self.data.real_cal is None or self.data.work_frequency <= 0:
             return
         self.phasor.set_click_marker(g, s)
@@ -2028,6 +2542,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
     # ---- compute lifetimes + paint ----------------------------------------
     def compute_and_paint(self):
+        """Compute cluster lifetimes and paint pseudo-color segmentation on the image."""
         if self.data.real_cal is None:
             self._log("Paint skipped — run Apply first.")
             return
@@ -2038,11 +2553,10 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self._compute_gmm()
         self._log("Paint complete.")
 
-    def _lifetimes(self, g, s):
-        freq = self.data.work_frequency
-        tp, tm = phasor_to_apparent_lifetime(g, s, freq)
-        tn = phasor_to_normal_lifetime(g, s, freq)
-        return float(tp), float(tm), float(tn)
+    @staticmethod
+    def _fmt_table_ns(value):
+        """Format a lifetime value for the results table (dash if non-finite)."""
+        return "—" if not np.isfinite(value) else f"{value:.3f}"
 
     def _cursor_masks_colors(self):
         """Boolean masks (within valid pixels) and colors for the current circles."""
@@ -2070,6 +2584,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         return masks, [c["color"] for c in cur]
 
     def _compute_cursor(self):
+        """Aggregate lifetimes inside cursor ROIs and paint segmentation masks."""
         cur = self.phasor.cursors
         if not cur:
             QtWidgets.QMessageBox.information(self, "Cursors", "Add at least one circle."); return
@@ -2082,15 +2597,18 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             mk = masks[k]; n = int(mk.sum())
             if n > 0:
                 cg = float(np.nanmean(g[mk])); cs = float(np.nanmean(s[mk]))
-                tp, tm, tn = self._lifetimes(cg, cs)
+                tp, tm, tn = lifetimes_at_phasor(cg, cs, self.data.work_frequency)
             else:
                 cg = cs = tp = tm = tn = float("nan")
             self.cluster_stats.append(dict(idx=k + 1, color=c["color"], label=c["label"],
-                                           tp=tp, tm=tm, tn=tn, g=cg, s=cs, n=n,
+                                           tp=tp, tm=tm, tn=tn,
+                                           g=cg, s=cs, n=n,
                                            area=100.0 * n / total_valid))
-        self._paint(masks, colors); self._fill_table()
+        self._paint(masks, colors)
+        self._fill_table()
 
     def _compute_gmm(self):
+        """Label pixels by GMM components and paint cluster segmentation."""
         if not hasattr(self, "_gmm_fit"):
             QtWidgets.QMessageBox.information(self, "GMM", "Fit a GMM first."); return
         cr, ci, rm, ri, ang = self._gmm_fit
@@ -2106,14 +2624,18 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.cluster_stats = []
         for k in range(n_comp):
             cg, cs = float(cr[k]), float(ci[k])
-            tp, tm, tn = self._lifetimes(cg, cs)
-            n = int(masks[k].sum())
+            mk = masks[k]
+            tp, tm, tn = lifetimes_at_phasor(cg, cs, self.data.work_frequency)
+            n = int(mk.sum())
             self.cluster_stats.append(dict(idx=k + 1, color=colors[k], label=categorical_name(k),
-                                           tp=tp, tm=tm, tn=tn, g=cg, s=cs, n=n,
+                                           tp=tp, tm=tm, tn=tn,
+                                           g=cg, s=cs, n=n,
                                            area=100.0 * n / total_valid))
-        self._paint(masks, colors); self._fill_table()
+        self._paint(masks, colors)
+        self._fill_table()
 
     def _phasor_valid_mask(self):
+        """Return the boolean mask of pixels included in the phasor plot."""
         if self.data.real_cal is None:
             return None
         return self.data.valid_mask()
@@ -2144,6 +2666,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         return out
 
     def _paint(self, masks, colors):
+        """Build pseudo-color overlay from cluster masks and refresh the image."""
         intensity = self._segmentation_intensity()
         overlay = pseudo_color(*[masks[k] for k in range(len(masks))],
                                intensity=intensity, colors=np.array(colors))
@@ -2151,8 +2674,14 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.chk_overlay.setChecked(True); self.refresh_image()
 
     def refresh_image(self):
+        """Show segmentation overlay or the selected base image view."""
         if self.chk_overlay.isChecked() and self.last_overlay is not None:
-            self.image.show_overlay(self.last_overlay, title=f"Segmentation ({self.mode})")
+            title = f"Segmentation ({self.mode})"
+            arr = None if self.image._im is None else self.image._im.get_array()
+            if arr is not None and tuple(arr.shape) == tuple(self.last_overlay.shape):
+                self.image.update_overlay(self.last_overlay, title=title)
+            else:
+                self.image.show_overlay(self.last_overlay, title=title)
         else:
             self._show_base_image()
 
@@ -2163,22 +2692,24 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             if hasattr(self, "cb_image_view")
             else IMAGE_VIEW_ITEMS[0]
         )
-        if choice == IMAGE_VIEW_ITEMS[0]:
-            disp = self._photon_image_filtered()
+        if choice in (IMAGE_VIEW_ITEMS[0], IMAGE_VIEW_ITEMS[1]):
+            if choice == IMAGE_VIEW_ITEMS[0]:
+                disp = self._photon_image_filtered()
+                title = "Photons (masked)"
+            else:
+                disp = self.data.mean_raw
+                title = "Photons (raw)"
             if disp is not None:
                 log_scale = getattr(self, "chk_log_display", None) and self.chk_log_display.isChecked()
                 auto_c = not getattr(self, "chk_auto_contrast", None) or self.chk_auto_contrast.isChecked()
-                title = "Photons (masked)"
                 self.image.show_intensity(
                     disp, log_scale=log_scale, auto_contrast=auto_c, title=title)
                 self._draw_scale_bar()
             return
         tau_sources = {
-            IMAGE_VIEW_ITEMS[1]: (self.data.tau_phi, "τφ phase (ns)"),
-            IMAGE_VIEW_ITEMS[2]: (self.data.tau_mod, "τmod (ns)"),
-            IMAGE_VIEW_ITEMS[3]: (self.data.tau_normal, "τ normal (ns)"),
-            IMAGE_VIEW_ITEMS[4]: (self.data.tau_search_phi, "τ search phase (ns)"),
-            IMAGE_VIEW_ITEMS[5]: (self.data.tau_search_mod, "τ search mod (ns)"),
+            IMAGE_VIEW_ITEMS[2]: (self.data.tau_phi, "τφ phase (ns)"),
+            IMAGE_VIEW_ITEMS[3]: (self.data.tau_mod, "τmod (ns)"),
+            IMAGE_VIEW_ITEMS[4]: (self.data.tau_normal, "τ normal (ns)"),
         }
         src = tau_sources.get(choice)
         if src is None:
@@ -2193,6 +2724,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._draw_scale_bar()
 
     def _draw_scale_bar(self):
+        """Draw a µm scale bar on the image when pixel size is known."""
         um = self.sp_pixel_um.value() if hasattr(self, "sp_pixel_um") else 0.0
         if um <= 0 and getattr(self.data, "pixel_size_um", 0) > 0:
             um = self.data.pixel_size_um
@@ -2205,6 +2737,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
     @staticmethod
     def _robust_range(arr):
+        """Return 2nd–98th percentile range for tau map color scaling."""
         finite = np.asarray(arr)[np.isfinite(arr)]
         if finite.size == 0:
             return None, None
@@ -2212,9 +2745,8 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
     # ---- results table -----------------------------------------------------
     def _fill_table(self):
-        if getattr(self, "_label_signal_connected", False):
-            self.table.itemChanged.disconnect(self._label_edited)
-            self._label_signal_connected = False
+        """Populate the results table from current cluster_stats."""
+        self._filling_table = True
         self.table.setRowCount(len(self.cluster_stats))
         for r, st in enumerate(self.cluster_stats):
             self.table.setItem(r, 0, self._ro(str(st["idx"])))
@@ -2225,15 +2757,17 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self.table.setItem(r, 2, lab)
             self.table.setItem(r, 3, self._ro(f"{st['g']:.4f}"))
             self.table.setItem(r, 4, self._ro(f"{st['s']:.4f}"))
-            self.table.setItem(r, 5, self._ro(f"{st['tp']:.3f}"))
-            self.table.setItem(r, 6, self._ro(f"{st['tm']:.3f}"))
-            self.table.setItem(r, 7, self._ro(f"{st['tn']:.3f}"))
+            self.table.setItem(r, 5, self._ro(self._fmt_table_ns(st["tp"])))
+            self.table.setItem(r, 6, self._ro(self._fmt_table_ns(st["tm"])))
+            self.table.setItem(r, 7, self._ro(self._fmt_table_ns(st["tn"])))
             self.table.setItem(r, 8, self._ro(str(st["n"])))
             self.table.setItem(r, 9, self._ro(f"{st['area']:.2f}"))
-        self.table.itemChanged.connect(self._label_edited)
-        self._label_signal_connected = True
+        self._filling_table = False
 
     def _label_edited(self, item):
+        """Sync an edited table label back to cluster_stats and phasor cursors."""
+        if self._filling_table:
+            return
         if item.column() == 2:
             r = item.row()
             if 0 <= r < len(self.cluster_stats):
@@ -2244,10 +2778,12 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
     @staticmethod
     def _ro(text):
+        """Create a read-only table cell for numeric or status columns."""
         it = QtWidgets.QTableWidgetItem(text); it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable); return it
 
     @staticmethod
     def _editable_group(text):
+        """Create an editable compare-table cell for sample group names."""
         it = QtWidgets.QTableWidgetItem(text)
         it.setFlags(
             Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEditable)
@@ -2255,12 +2791,22 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         return it
 
     @staticmethod
+    def _editable_sample(text):
+        """Create an editable compare-table cell for sample display names."""
+        it = QtWidgets.QTableWidgetItem(text)
+        it.setFlags(
+            Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEditable)
+        return it
+
+    @staticmethod
     def _rgb_hex(c):
+        """Convert an RGB float triplet to an ARGB hex string for Excel export."""
         return "FF" + "".join(f"{int(round(255 * max(0.0, min(1.0, x)))):02X}" for x in c[:3])
 
     # ---- export ------------------------------------------------------------
     def export_all(self):
-        if self.data.signal_full is None:
+        """Export plots, maps, tables, and session data to a chosen folder."""
+        if not dataset_has_sample(self.data):
             QtWidgets.QMessageBox.information(
                 self, "Export", "Load a sample and click Apply before exporting.")
             return

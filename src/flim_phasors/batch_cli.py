@@ -1,4 +1,8 @@
-"""Batch-process FLIM samples from the command line (no GUI)."""
+"""Batch-process FLIM samples from the command line (no GUI).
+
+Loads PicoQuant and Imspector histograms, applies reference calibration and
+phasor filtering, and exports lifetime maps to an output folder.
+"""
 
 from __future__ import annotations
 
@@ -39,6 +43,14 @@ from flim_phasors.io import is_supported_flim_path
 
 
 def _collect_paths(folder: Path) -> list[str]:
+    """Gather supported FLIM file paths from a directory.
+
+    Args:
+        folder: Directory to scan for ``.ptu``, ``.tif``, and ``.tiff`` files.
+
+    Returns:
+        Sorted list of absolute paths that pass :func:`~flim_phasors.io.is_supported_flim_path`.
+    """
     out = []
     for ext in (".ptu", ".tif", ".tiff"):
         out.extend(str(p) for p in sorted(folder.glob(f"*{ext}")))
@@ -57,6 +69,23 @@ def process_one(
     min_photons: int,
     ref_cal=None,
 ):
+    """Load and process a single FLIM sample through the phasor pipeline.
+
+    Args:
+        path: Sample ``.ptu`` or ``.tif``/``.tiff`` path.
+        ref_path: Reference file for G/S calibration (empty skips binding).
+        ref_channel: Emission channel index on the reference stack.
+        ref_lifetime: Known reference fluorophore lifetime in nanoseconds.
+        harmonic: Phasor harmonic index (typically 1).
+        frequency: Laser modulation frequency in MHz.
+        filter_mode: Spatial or signal filter (``"median"``, ``"gaussian"``, etc.).
+        min_photons: Minimum photon count per pixel for valid phasor pixels.
+        ref_cal: Precomputed reference calibration, or ``None`` to derive from
+            *ref_path* inside :meth:`~flim_phasors.data.PhasorData.apply_processing`.
+
+    Returns:
+        Processed :class:`~flim_phasors.data.PhasorData` with calibrated maps.
+    """
     d = PhasorData()
     d.load_sample(path)
     d.harmonic = harmonic
@@ -76,6 +105,14 @@ def process_one(
 
 
 def main(argv=None) -> int:
+    """Run batch FLIM phasor processing from command-line arguments.
+
+    Args:
+        argv: Argument list (defaults to ``sys.argv``).
+
+    Returns:
+        ``0`` on success, ``1`` if no input files or reference path is missing.
+    """
     p = argparse.ArgumentParser(description="Batch FLIM phasor processing")
     p.add_argument("input", help="Sample file or folder of .ptu/.tif")
     p.add_argument("-o", "--output", required=True, help="Output folder")

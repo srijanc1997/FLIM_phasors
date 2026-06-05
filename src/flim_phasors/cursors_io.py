@@ -1,4 +1,8 @@
-"""Save and load phasor cursor definitions as JSON."""
+"""Save and load phasor cursor definitions as JSON.
+
+Phasor cursors are circular or elliptical regions in the G–S (real–imaginary)
+phasor plane used for lifetime segmentation and cluster statistics.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +11,15 @@ from pathlib import Path
 
 
 def cursors_to_list(cursors: list[dict]) -> list[dict]:
+    """Serialize in-memory cursor dicts to JSON-safe plain types.
+
+    Args:
+        cursors: Cursor records with phasor-plane center, radii, label, and
+            color fields.
+
+    Returns:
+        List of dicts with float centers, radii, and list-encoded RGB colors.
+    """
     out = []
     for c in cursors:
         out.append({
@@ -23,11 +36,31 @@ def cursors_to_list(cursors: list[dict]) -> list[dict]:
 
 
 def save_cursors(path: str | Path, cursors: list[dict], *, sample_path: str = ""):
+    """Write phasor cursors to a JSON file.
+
+    Args:
+        path: Output ``.json`` path.
+        cursors: Cursor definitions in phasor coordinates.
+        sample_path: Optional source FLIM path stored for session recall.
+    """
     payload = {"version": 1, "sample_path": sample_path, "cursors": cursors_to_list(cursors)}
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def load_cursors(path: str | Path) -> tuple[list[dict], str]:
+    """Load phasor cursors from a JSON file.
+
+    Args:
+        path: Cursor JSON file produced by :func:`save_cursors`.
+
+    Returns:
+        A ``(cursors, sample_path)`` tuple where *cursors* are dicts ready
+        for the phasor canvas and *sample_path* is the stored FLIM path.
+
+    Raises:
+        json.JSONDecodeError: If the file is not valid JSON.
+        KeyError: If required cursor fields are missing.
+    """
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     cursors = []
     for c in data.get("cursors", []):

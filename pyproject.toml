@@ -14,6 +14,7 @@ dependencies = [
     "matplotlib>=3.7",
     "PySide6>=6.5",
     "phasorpy>=0.10,<0.11",
+    "liffile>=2025.2.10",
     "scikit-learn>=1.3",
 ]
 
@@ -21,7 +22,8 @@ dependencies = [
 pawflim = ["pawflim"]
 excel = ["openpyxl>=3.1"]
 all = ["pawflim", "openpyxl>=3.1"]
-dev = ["pytest>=7.0"]
+docs = ["sphinx>=7.0", "sphinx-rtd-theme>=2.0", "sphinx-autobuild>=2024.0"]
+dev = ["pytest>=7.0", "sphinx>=7.0", "sphinx-rtd-theme>=2.0", "sphinx-autobuild>=2024.0"]
 
 [project.scripts]
 flim-phasor-gui = "flim_phasors.app:main"

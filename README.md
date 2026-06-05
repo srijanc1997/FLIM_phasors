@@ -10,6 +10,7 @@ Built on [phasorpy](https://github.com/phasorpy/phasorpy) with a PySide6 + matpl
 |--------|------------|--------|
 | PicoQuant TCSPC | `.ptu` | Multi-channel; optional frame index |
 | Imspector FLIM TIFF | `.tif`, `.tiff` | Multi-frame stacks can be summed or indexed |
+| Leica LAS X phasor export | `.lif`, `.xlef` | Pre-computed phasor maps (not raw TCSPC histograms). LAS X auto-reference calibration is applied on load. One file may hold several FLIM series — pick which to load. Optional `.ptu` / `.tif` reference on **Apply** is additional. |
 
 If TIFF files lack laser metadata, set **frequency (MHz)** and **harmonic** under **Calibration** before **Apply**.
 
@@ -70,7 +71,7 @@ flim-phasor-batch path/to/samples/ -o path/to/output -r reference.ptu --harmonic
 
 ## Quick workflow
 
-1. **Sample…** — select one or more `.ptu` / `.tif` files (Ctrl/Shift+click for batch). Drag-and-drop onto the window also works.
+1. **Sample…** — select one or more `.ptu` / `.tif` / `.lif` files (Ctrl/Shift+click for batch). Leica files with multiple FLIM measurements open a series picker. An **uncalibrated** phasor plot and image preview appear immediately (LIF loads LAS X phasor maps directly).
 2. **Reference…** (optional) — calibration file; **Shared ref** applies to all samples in multi-image mode.
 3. **Reference…** — choose the calibration file (decoded on **Calibrate**, not on load).
 4. **Calibrate** — compute reference g/s (check preview).
@@ -159,6 +160,22 @@ FLIM_phasors/
 ```bash
 pip install -e ".[all,dev]"
 pytest
+```
+
+## API documentation (Sphinx)
+
+Install the documentation extras, then build HTML from the `docs/` folder:
+
+```bash
+pip install -e ".[docs]"
+cd docs
+python -m sphinx.cmd.build -b html . _build/html
+```
+
+Open `docs/_build/html/index.html` in a browser. For live reload while editing docstrings:
+
+```bash
+python -m sphinx_autobuild docs docs/_build/html
 ```
 
 ## License

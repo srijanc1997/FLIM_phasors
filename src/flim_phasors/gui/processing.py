@@ -1,4 +1,8 @@
-"""Processing helpers (extracted from MainWindow for maintainability)."""
+"""Processing helpers (extracted from MainWindow for maintainability).
+
+Centralizes capture and application of per-sample filter settings, harmonic/channel
+selection, and kwargs assembly for :meth:`PhasorData.apply_processing`.
+"""
 
 from __future__ import annotations
 
@@ -21,7 +25,14 @@ PROC_SETTING_KEYS = (
 
 
 def capture_processing_from_ui(win) -> dict:
-    """Snapshot filter / threshold / harmonic controls from the main window."""
+    """Snapshot filter, threshold, and harmonic controls from the main window.
+
+    Args:
+        win: Main window with processing widgets.
+
+    Returns:
+        Dict of processing settings suitable for stashing on a :class:`PhasorData`.
+    """
     mode = win.cb_filter.currentText()
     return {
         "harmonic": int(win.sp_harm.value()),
@@ -39,12 +50,29 @@ def capture_processing_from_ui(win) -> dict:
 
 
 def per_sample_processing(win) -> bool:
-    """True when multiple samples are loaded — each keeps its own filter settings."""
+    """Return whether multiple samples are loaded with independent filter settings.
+
+    Args:
+        win: Main window instance.
+
+    Returns:
+        ``True`` when ``win.datasets`` contains more than one sample.
+    """
     return len(getattr(win, "datasets", [])) > 1
 
 
 def filter_label_for_dataset(win, d: PhasorData) -> str:
-    """Filter name for exports/logs — per-sample stash or current UI."""
+    """Return the filter name for exports and logs.
+
+    Prefers per-sample stashed settings; falls back to the current UI selection.
+
+    Args:
+        win: Main window instance.
+        d: Dataset whose stashed ``processing_settings`` may override the UI.
+
+    Returns:
+        Human-readable filter mode string (e.g. ``"median"``).
+    """
     stash = getattr(d, "processing_settings", None)
     if stash and stash.get("filter_mode"):
         return str(stash["filter_mode"])
@@ -54,7 +82,15 @@ def filter_label_for_dataset(win, d: PhasorData) -> str:
 
 
 def apply_processing_settings_to_ui(win, settings: dict) -> None:
-    """Load stored settings into widgets (signals blocked by caller)."""
+    """Load stored processing settings into main-window widgets.
+
+    Caller should block widget signals before invoking this function.
+
+    Args:
+        win: Main window whose controls are updated.
+        settings: Dict produced by :func:`capture_processing_from_ui` or loaded
+            from a session bundle.
+    """
     if not settings:
         return
     if "harmonic" in settings:
@@ -85,7 +121,15 @@ def apply_processing_settings_to_ui(win, settings: dict) -> None:
 
 
 def processing_params_from_ui(win, d: PhasorData) -> dict:
-    """Build kwargs for PhasorData.apply_processing from window widgets."""
+    """Build keyword arguments for :meth:`PhasorData.apply_processing` from the UI.
+
+    Args:
+        win: Main window with current control values.
+        d: Target dataset (used for effective reference path resolution).
+
+    Returns:
+        Dict of kwargs accepted by :meth:`PhasorData.apply_processing`.
+    """
     mode = win.cb_filter.currentText()
     ref_path = win._effective_ref_path(d)
     return {
@@ -103,7 +147,15 @@ def processing_params_from_ui(win, d: PhasorData) -> dict:
 
 
 def processing_params_for_dataset(win, d: PhasorData) -> dict:
-    """Per-sample stash when multiple samples loaded, otherwise current UI."""
+    """Return processing kwargs for a dataset, honoring per-sample stash when active.
+
+    Args:
+        win: Main window instance.
+        d: Dataset to process.
+
+    Returns:
+        Dict of kwargs for :meth:`PhasorData.apply_processing`.
+    """
     if per_sample_processing(win):
         stash = getattr(d, "processing_settings", None) or {}
         if stash:
@@ -126,7 +178,13 @@ def processing_params_for_dataset(win, d: PhasorData) -> dict:
 
 
 def apply_dataset_harmonic_channel(win, d: PhasorData, *, use_ui_settings: bool) -> None:
-    """Set harmonic / frequency / channel on d before apply_processing."""
+    """Set harmonic, frequency, and channel on a dataset before processing.
+
+    Args:
+        win: Main window instance.
+        d: Dataset whose acquisition parameters are updated in place.
+        use_ui_settings: When ``False``, leaves ``d`` unchanged.
+    """
     if not use_ui_settings:
         return
     if per_sample_processing(win):
@@ -141,8 +199,34 @@ def apply_dataset_harmonic_channel(win, d: PhasorData, *, use_ui_settings: bool)
     d.channel = max(0, win.cb_channel.currentIndex())
 
 
-def run_processing_on_dataset(win, d: PhasorData, *, use_ui_settings: bool = False):
+def run_processing_on_dataset(
+    win,
+    d: PhasorData,
+    *,
+    use_ui_settings: bool = False,
+    calibrate: bool = True,
+):
+    """Run the full apply-processing pipeline on one dataset.
+
+    Updates harmonic/channel from UI or stash, resolves reference channel when
+    calibrating, and sets ``d.maps_calibrated`` from calibration activity.
+
+    Args:
+        win: Main window providing calibration and processing parameters.
+        d: Dataset to process in place.
+        use_ui_settings: When ``True``, copy harmonic/frequency/channel from UI
+            or per-sample stash onto ``d``.
+        calibrate: When ``False``, skip reference calibration and clear ref kwargs.
+    """
     apply_dataset_harmonic_channel(win, d, use_ui_settings=use_ui_settings)
-    if win._effective_ref_path(d):
+    if calibrate and win._effective_ref_path(d):
         d.ref_channel = win._ref_channel_for_dataset(d)
-    d.apply_processing(**processing_params_for_dataset(win, d))
+    params = processing_params_for_dataset(win, d)
+    ref_cal = params.get("ref_calibration") if calibrate else None
+    if not calibrate:
+        params["ref_calibration"] = None
+        params["ref_path"] = None
+    d.apply_processing(**params)
+    d.maps_calibrated = bool(
+        calibrate and ref_cal is not None and getattr(ref_cal, "is_active", False)
+    )

@@ -17,6 +17,7 @@ from flim_phasors.session_bundle_io import (
 
 
 def _sample_maps(shape=(4, 5)):
+    """Synthetic calibrated map bundle for session round-trip tests."""
     rng = np.random.default_rng(0)
     g = rng.random(shape)
     s = rng.random(shape)
@@ -33,6 +34,7 @@ def _sample_maps(shape=(4, 5)):
 
 
 def _write_bundle(path, samples_meta, maps_per_sample, *, overlay=None, cursors=None):
+    """Write a minimal .flimsession zip with manifest and per-sample maps."""
     manifest = {
         "format": BUNDLE_FORMAT,
         "format_version": BUNDLE_VERSION,
@@ -71,6 +73,7 @@ def _write_bundle(path, samples_meta, maps_per_sample, *, overlay=None, cursors=
 
 
 def test_dataset_from_bundle_sample_roundtrip():
+    """Rebuild PhasorData from bundle metadata and map arrays."""
     meta = {
         "original_sample_path": "demo.ptu",
         "group": "A",
@@ -93,6 +96,7 @@ def test_dataset_from_bundle_sample_roundtrip():
 
 
 def test_load_session_bundle_multi_sample(tmp_path):
+    """Load a zip bundle with two samples and optional overlay."""
     maps_a = _sample_maps((3, 4))
     maps_b = _sample_maps((3, 4))
     meta = [
@@ -132,6 +136,7 @@ def test_load_session_bundle_multi_sample(tmp_path):
 
 
 def test_load_rejects_missing_manifest(tmp_path):
+    """Raise when session zip lacks session_manifest.json."""
     path = tmp_path / "bad.flimsession"
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("other.txt", "x")
