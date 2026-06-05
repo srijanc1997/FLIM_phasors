@@ -13,6 +13,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
-      - run: pytest -q
+      - run: python -m pytest -q
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: 1
+          QT_QPA_PLATFORM: offscreen
+          MPLBACKEND: Agg
