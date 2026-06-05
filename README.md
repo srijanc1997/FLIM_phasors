@@ -60,7 +60,7 @@ python -m flim_phasors
 
 Or: `python flim_phasor_gui.py` / `flim-phasor-gui` after install.
 
-## Batch processing (no GUI)
+## Batch processing (no GUI - in development)
 
 ```bash
 flim-phasor-batch path/to/samples/ -o path/to/output -r reference.ptu --harmonic 1 --min-photons 10
