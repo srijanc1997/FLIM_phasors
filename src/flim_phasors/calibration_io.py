@@ -22,6 +22,7 @@ def calibration_to_dict(cal: ReferenceCalibration, *, ui_extra: dict | None = No
         "manual_g": cal.manual_g,
         "manual_s": cal.manual_s,
         "manual_mean": cal.manual_mean,
+        "values_ready": cal.values_ready,
     }
     if ui_extra:
         d["ui"] = ui_extra
@@ -41,6 +42,9 @@ def calibration_from_dict(data: dict) -> ReferenceCalibration:
         manual_g=float(data.get("manual_g", 0.0)),
         manual_s=float(data.get("manual_s", 0.0)),
         manual_mean=float(data.get("manual_mean", 1.0)),
+        values_ready=bool(
+            data.get("values_ready", "mean_g" in data and "mean_s" in data)
+        ),
     )
     return cal
 

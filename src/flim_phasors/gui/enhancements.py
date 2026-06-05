@@ -19,6 +19,13 @@ from flim_phasors.constants import FLIM_FILE_FILTER
 from flim_phasors.cursors_io import load_cursors, save_cursors
 from flim_phasors.io import is_supported_flim_path
 from flim_phasors.memory_est import format_memory_line
+from flim_phasors.session_bundle_io import (
+    BUNDLE_EXTENSION,
+    apply_session_bundle_to_window,
+    is_session_bundle,
+    load_session_bundle,
+    save_session_bundle,
+)
 from flim_phasors.session_io import (
     apply_calibration_from_session,
     load_session_json,
@@ -121,6 +128,7 @@ class EnhancementsMixin:
         self._recent_refs_menu = file_m.addMenu("Recent references")
         file_m.addSeparator()
         file_m.addAction("Open session…", self.open_session, "Ctrl+Shift+O")
+        file_m.addAction("Save session…", self.save_session, "Ctrl+Shift+S")
         file_m.addAction("Save calibration…", self.save_calibration_file)
         file_m.addAction("Load calibration…", self.load_calibration_file)
         file_m.addSeparator()
@@ -276,6 +284,11 @@ class EnhancementsMixin:
             return
         cal, ui = load_calibration(path)
         self.ref_calibration = cal
+        if cal.source_path:
+            self.shared_ref_path = cal.source_path
+            self.lbl_ref.setText(os.path.basename(cal.source_path))
+            self.data.ref_path = cal.source_path
+            self._propagate_shared_reference()
         if ui.get("reference_lifetime_ns") is not None:
             self.sp_reflt.setValue(float(ui["reference_lifetime_ns"]))
         if ui.get("frequency_MHz") is not None:
@@ -289,13 +302,42 @@ class EnhancementsMixin:
         self._update_calibration_display()
         self._update_ref_preview()
         self._mark_calibration_current()
-        self._log(f"Calibration loaded from {os.path.basename(path)} (no reference file decode).")
+        if hasattr(self, "_ensure_compare_overlay_off"):
+            self._ensure_compare_overlay_off()
+        self._log(
+            f"Calibration loaded from {os.path.basename(path)} "
+            f"(g={cal.mean_g:.4f}, s={cal.mean_s:.4f}; reference file not decoded).")
 
     def open_session(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open session", self._dialog_dir("export_dir"), "JSON (*.json)")
+            self,
+            "Open session",
+            self._dialog_dir("session_dir"),
+            f"Session bundle (*{BUNDLE_EXTENSION});;JSON (*.json);;All (*.*)",
+        )
         if not path:
             return
+        if is_session_bundle(path):
+            self._open_session_bundle(path)
+            return
+        self._open_session_json(path)
+
+    def _open_session_bundle(self, path: str):
+        try:
+            loaded = load_session_bundle(path)
+            apply_session_bundle_to_window(self, loaded)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Session", str(e))
+            return
+        n = len(loaded["datasets"])
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        self._settings.setValue("session_dir", os.path.dirname(path))
+        self._log(
+            f"Session bundle loaded ({n} sample{'s' if n != 1 else ''}, "
+            f"{size_mb:.2f} MB) — no PTU/TIF required."
+        )
+
+    def _open_session_json(self, path: str):
         try:
             session = load_session_json(path)
         except Exception as e:
@@ -306,8 +348,10 @@ class EnhancementsMixin:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Missing files",
-                "Some paths are missing:\n" + "\n".join(missing[:8])
-                + ("\n…" if len(missing) > 8 else ""),
+                "This JSON only stores paths — original files are still required:\n"
+                + "\n".join(missing[:8])
+                + ("\n…" if len(missing) > 8 else "")
+                + f"\n\nUse {BUNDLE_EXTENSION} (File → Save session…) to archive processed maps.",
             )
         self.datasets.clear()
         self.active_idx = -1
@@ -324,7 +368,39 @@ class EnhancementsMixin:
             restore_cursors_to_phasor(self, session["cursors"])
         self._restore_ui_for_active()
         self._refresh_image_combo()
-        self._log(f"Session loaded from {os.path.basename(path)} — load/decode samples and Apply.")
+        self._settings.setValue("session_dir", os.path.dirname(path))
+        self._log(f"Session JSON loaded from {os.path.basename(path)} — load/decode samples and Apply.")
+
+    def save_session(self):
+        if self.data.real_cal is None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Save session",
+                "Run Apply on at least one image first — the bundle stores processed maps, not raw PTU data.",
+            )
+            return
+        default = self._dialog_dir("session_dir", self._dialog_dir("export_dir"))
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save session bundle",
+            default,
+            f"Session bundle (*{BUNDLE_EXTENSION})",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(BUNDLE_EXTENSION):
+            path += BUNDLE_EXTENSION
+        try:
+            result = save_session_bundle(self, path)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save session", str(e))
+            return
+        self._settings.setValue("session_dir", os.path.dirname(result["path"]))
+        self._log(
+            f"Session saved → {os.path.basename(result['path'])} "
+            f"({result['n_samples']} sample{'s' if result['n_samples'] != 1 else ''}, "
+            f"{result['size_mb']:.2f} MB)"
+        )
 
     def batch_export_folder(self):
         inp = QtWidgets.QFileDialog.getExistingDirectory(self, "Input folder of FLIM files")

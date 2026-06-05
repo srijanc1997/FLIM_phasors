@@ -26,12 +26,18 @@ class ReferenceCalibration:
     manual_g: float = 0.0
     manual_s: float = 0.0
     manual_mean: float = 1.0
+    values_ready: bool = False
     _maps: tuple[np.ndarray, np.ndarray, np.ndarray] | None = field(
         default=None, repr=False)
 
     @property
     def is_active(self) -> bool:
-        return self.use_manual or bool(self.source_path)
+        """True when g/s values are available for sample preprocessing."""
+        return self.use_manual or self.values_ready
+
+    @property
+    def has_spatial_maps(self) -> bool:
+        return self._maps is not None
 
     def set_maps(self, rmean, rreal, rimag):
         rmean = to_2d(np.asarray(rmean, dtype=float))
@@ -46,6 +52,7 @@ class ReferenceCalibration:
         else:
             self.mean_g = self.mean_s = 0.0
             self.mean_intensity = 1.0
+        self.values_ready = True
 
     def maps_for_shape(self, shape: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return (mean, real, imag) reference maps for phasor_calibrate."""
@@ -59,7 +66,12 @@ class ReferenceCalibration:
                 np.full(shape, s, dtype=float),
             )
         if self._maps is None:
-            raise ValueError("No reference calibration loaded.")
+            # Saved g/s only (Load cal JSON, session metadata) — uniform reference field.
+            return (
+                np.full(shape, float(self.mean_intensity), dtype=float),
+                np.full(shape, float(self.mean_g), dtype=float),
+                np.full(shape, float(self.mean_s), dtype=float),
+            )
         rmean, rreal, rimag = self._maps
         if rreal.shape == shape:
             return rmean, rreal, rimag
@@ -77,6 +89,7 @@ class ReferenceCalibration:
         self.mean_g = self.mean_s = 0.0
         self.mean_intensity = 1.0
         self.use_manual = False
+        self.values_ready = False
 
 
 def compute_reference_phasor(

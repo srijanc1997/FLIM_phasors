@@ -14,13 +14,23 @@ def test_calibration_roundtrip(tmp_path):
         mean_g=0.42,
         mean_s=0.21,
         use_manual=False,
+        values_ready=True,
     )
     path = tmp_path / "cal.json"
     save_calibration(path, cal, ui_extra={"harmonic": 1})
     loaded, ui = load_calibration(path)
     assert loaded.mean_g == 0.42
     assert loaded.channel == 1
+    assert loaded.values_ready is True
+    assert loaded.is_active is True
     assert ui["harmonic"] == 1
+
+
+def test_calibration_inactive_until_values_ready():
+    cal = ReferenceCalibration(source_path="ref.ptu")
+    assert cal.is_active is False
+    cal.values_ready = True
+    assert cal.is_active is True
 
 
 def test_calibration_dict_manual():
@@ -44,6 +54,20 @@ def test_cursors_io(tmp_path):
     assert len(loaded) == 1
     assert loaded[0]["center_real"] == 0.5
     assert sp == "s.ptu"
+
+
+def test_maps_for_shape_scalar_fallback():
+    cal = ReferenceCalibration(
+        source_path="ref.ptu",
+        mean_g=0.42,
+        mean_s=0.21,
+        mean_intensity=100.0,
+    )
+    rmean, rreal, rimag = cal.maps_for_shape((2, 3))
+    assert rreal.shape == (2, 3)
+    assert rreal[0, 0] == 0.42
+    assert rimag[0, 0] == 0.21
+    assert rmean[0, 0] == 100.0
 
 
 def test_memory_est_empty():

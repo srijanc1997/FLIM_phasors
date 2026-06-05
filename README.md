@@ -20,21 +20,23 @@ If TIFF files lack laser metadata, set **frequency (MHz)** and **harmonic** unde
 - **Calibrate** then **Apply** — pick reference file, calibrate g/s, then preprocess samples
 - **Filtering** — photon threshold; phasor and TCSPC spatial filters; pawFLIM optional
 - **Segmentation** — circular or elliptic phasor cursors (undo, save/load JSON); GMM via `phasor_cluster_gmm`
-- **Multi-sample** — sample table above processing controls; click a row to edit its filter; **Apply selected** / **Apply all**; phasor overlay in section 3
+- **Multi-sample** — **Multi-phasor** tab: sample table, groups, phasor overlay; **Setup** tab for filters; **Apply selected** / **Apply settings to all**
 - **Image views** — photons (log scale, auto contrast), τ maps, scale bar (µm/px)
 - **Phasor ↔ image** — click phasor to highlight nearest pixel on the image
 - **Export all** — PNG/PDF/SVG phasor plot, per-sample maps, GMM masks, CSV, Excel, `session.json`
-- **Session restore** — open exported `session.json` (paths, calibration, cursors)
+- **Save session** — one `.flimsession` bundle (processed maps + calibration + cursors; no PTU/TIF data)
+- **Open session** — load `.flimsession` (standalone) or exported `session.json` (needs original files)
 - **Batch CLI** — `flim-phasor-batch` for folder in → folder out
 - **Cancel** long decode/processing jobs from the progress dialog
 
 ## Calibration (quick guide)
 
-1. Load **Reference…** (or **Load cal…** to reuse saved g/s without re-decoding the file).
-2. Check **Ref preview** and **g / s** fields; use **Manual ref phasor** to type values directly.
-3. Orange status text means harmonic/filter/channel changed — click **Apply** to refresh.
-4. Log shows **valid px** after Apply; if `0 valid px`, lower **Min N**.
-5. **Save cal…** writes a small JSON; reference `.ptu` is not stored inside it.
+1. Load **Reference…** (path only) or **Load cal…** (reuse saved g/s — no `.ptu` decode).
+2. Click **Calibrate** once to decode the reference and store **g / s** (scalar values only; the reference histogram is not kept in RAM).
+3. Use **Manual ref phasor** to type g/s directly instead of a reference file.
+4. Orange status text means harmonic/filter/channel changed — click **Calibrate** again, then **Apply**.
+5. **Apply** uses the stored g/s values only; it does not reload the reference file.
+6. **Save cal…** writes a small JSON; reference `.ptu` is not stored inside it.
 
 ## Requirements
 
@@ -73,9 +75,8 @@ flim-phasor-batch path/to/samples/ -o path/to/output -r reference.ptu --harmonic
 3. **Reference…** — choose the calibration file (decoded on **Calibrate**, not on load).
 4. **Calibrate** — compute reference g/s (check preview).
 5. **Calibration** — frequency, harmonic, filters, **Frame** (if the stack has time).
-6. **Apply** — preprocess samples. With several images, pick a row in the **section 3** table, set filter/Min N in section 2, then **Apply selected** or **Apply settings to all**.
-7. **Paint** — segment with cursors or GMM.
-8. **Export all…** — choose a folder; phasor maps, tables, and session JSON.
+6. **Apply** — preprocess on the **Setup** tab. With several images, use the **Multi-phasor** tab to pick samples, then **Apply selected** or **Apply settings to all**.
+7. **Analyze** tab — segment with cursors or GMM (**Paint**), then **Export all…** or **File → Save session…** (`.flimsession` archive).
 
 ### Keyboard shortcuts
 
@@ -85,6 +86,7 @@ flim-phasor-batch path/to/samples/ -o path/to/output -r reference.ptu --harmonic
 | Ctrl+R | Reference… |
 | Ctrl+E | Export all… |
 | Ctrl+Shift+O | Open session… |
+| Ctrl+Shift+S | Save session… |
 | F5 | Apply |
 | Delete | Remove cursor |
 
@@ -109,6 +111,22 @@ export_folder/
       ...
 ```
 
+## Session bundle (`.flimsession`)
+
+**File → Save session…** writes one zip archive with processed phasor maps for every **Apply**-d sample (no raw PTU/TIF histograms). Use **File → Open session…** to restore segmentation, overlays, and tables on another machine without the original data files.
+
+Typical size: ~1–3 MB per 256×256 image (compressed), vs tens–hundreds of MB per PTU in RAM.
+
+```
+my_experiment.flimsession   # zip
+  manifest.json             # calibration, cursors, per-sample settings, UI state
+  samples/000/maps.npz        # real/imag, photons, τ maps (float64, compressed)
+  samples/001/maps.npz
+  overlay.npz               # optional painted segmentation (active sample)
+```
+
+Re-opening a bundle does **not** let you change filters and re-**Apply** — that still needs the original files.
+
 ## Project layout
 
 ```
@@ -121,6 +139,7 @@ FLIM_phasors/
 │   ├── calibration_io.py
 │   ├── cursors_io.py
 │   ├── session_io.py
+│   ├── session_bundle_io.py
 │   ├── memory_est.py
 │   ├── data.py
 │   ├── io.py

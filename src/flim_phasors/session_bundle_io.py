@@ -1,0 +1,473 @@
+"""Save/load a self-contained imaging session (processed maps, no PTU histograms)."""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from flim_phasors import __version__
+from flim_phasors.data import PhasorData
+from flim_phasors.gui.processing import PROC_SETTING_KEYS
+from flim_phasors.utils import dataset_display_label
+
+BUNDLE_FORMAT = "flim_phasors_session_bundle"
+BUNDLE_VERSION = 1
+BUNDLE_EXTENSION = ".flimsession"
+MANIFEST_NAME = "manifest.json"
+
+MAP_KEYS = (
+    "real_cal",
+    "imag_cal",
+    "mean_raw",
+    "mean_thr",
+    "tau_phi",
+    "tau_mod",
+    "tau_normal",
+    "tau_search_phi",
+    "tau_search_mod",
+)
+
+
+def is_session_bundle(path: str | Path) -> bool:
+    p = Path(path)
+    return p.suffix.lower() == BUNDLE_EXTENSION or p.name.lower().endswith(BUNDLE_EXTENSION)
+
+
+def _json_default(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def _maps_from_dataset(d: PhasorData) -> dict[str, np.ndarray]:
+    out: dict[str, np.ndarray] = {}
+    for key in MAP_KEYS:
+        arr = getattr(d, key, None)
+        if arr is not None:
+            out[key] = np.asarray(arr, dtype=np.float64)
+    return out
+
+
+def _apply_maps_to_dataset(d: PhasorData, maps: dict[str, np.ndarray]) -> None:
+    for key in MAP_KEYS:
+        if key in maps:
+            setattr(d, key, np.asarray(maps[key], dtype=np.float64))
+    if d.real_cal is not None:
+        d._shape_hint = tuple(int(x) for x in d.real_cal.shape)
+
+
+def _sample_meta_row(win, d: PhasorData, index: int, maps_file: str) -> dict:
+    ref = win._effective_ref_path(d) if hasattr(win, "_effective_ref_path") else d.ref_path
+    st = getattr(d, "_intensity_stats", {}) or {}
+    stash = getattr(d, "processing_settings", None) or {}
+    return {
+        "index": index,
+        "label": dataset_display_label(d, index),
+        "original_sample_path": d.sample_path or "",
+        "group": (getattr(d, "group_name", "") or "").strip(),
+        "channel": int(d.channel),
+        "n_channels": max(1, int(getattr(d, "n_channels", 1))),
+        "frame_index": int(getattr(d, "frame_index", -1)),
+        "frequency_MHz": float(d.frequency),
+        "harmonic": int(d.harmonic),
+        "work_frequency_MHz": float(d.work_frequency),
+        "pixel_size_um": float(getattr(d, "pixel_size_um", 0.0) or 0.0),
+        "reference_path": ref or "",
+        "reference_channel": int(d.ref_channel) if ref else 0,
+        "reference_n_channels": max(1, int(getattr(d, "ref_n_channels", 1))),
+        "processing_settings": {k: stash[k] for k in PROC_SETTING_KEYS if k in stash},
+        "intensity_stats": dict(st),
+        "maps_file": maps_file,
+        "computed": d.real_cal is not None,
+    }
+
+
+def _serialize_gmm_fit(fit) -> dict | None:
+    if fit is None:
+        return None
+    cr, ci, rm, ri, ang = fit
+    return {
+        "center_real": np.asarray(cr, dtype=float).tolist(),
+        "center_imag": np.asarray(ci, dtype=float).tolist(),
+        "radius_major": np.asarray(rm, dtype=float).tolist(),
+        "radius_minor": np.asarray(ri, dtype=float).tolist(),
+        "angle": np.asarray(ang, dtype=float).tolist(),
+    }
+
+
+def _deserialize_gmm_fit(block: dict | None):
+    if not block:
+        return None
+    return (
+        np.asarray(block["center_real"], dtype=float),
+        np.asarray(block["center_imag"], dtype=float),
+        np.asarray(block["radius_major"], dtype=float),
+        np.asarray(block["radius_minor"], dtype=float),
+        np.asarray(block["angle"], dtype=float),
+    )
+
+
+def _serialize_cluster_stats(stats: list[dict]) -> list[dict]:
+    rows = []
+    for st in stats or []:
+        row = dict(st)
+        color = row.get("color")
+        if color is not None:
+            row["color"] = [float(x) for x in color[:3]]
+        rows.append(row)
+    return rows
+
+
+def _deserialize_cluster_stats(rows: list[dict]) -> list[dict]:
+    out = []
+    for st in rows or []:
+        row = dict(st)
+        color = row.get("color")
+        if isinstance(color, list) and len(color) >= 3:
+            row["color"] = tuple(float(x) for x in color[:3])
+        out.append(row)
+    return out
+
+
+def build_bundle_manifest(win) -> dict:
+    datasets = [
+        d for d in (win._all_datasets() if hasattr(win, "_all_datasets") else [win.data])
+        if d.real_cal is not None
+    ]
+    cursors = []
+    if hasattr(win, "phasor"):
+        for c in win.phasor.cursors:
+            cursors.append({
+                "kind": c.get("kind", "circle"),
+                "center_real": float(c["center_real"]),
+                "center_imag": float(c["center_imag"]),
+                "radius": float(c["radius"]),
+                "radius_minor": c.get("radius_minor"),
+                "angle": float(c.get("angle", 0.0)),
+                "label": c.get("label", ""),
+                "color": [float(x) for x in c.get("color", ())[:3]] if c.get("color") else None,
+            })
+    try:
+        import phasorpy
+        pp_ver = getattr(phasorpy, "__version__", "")
+    except ImportError:
+        pp_ver = ""
+
+    ui: dict[str, Any] = {
+        "multi_image": bool(getattr(win, "chk_multi", None) and win.chk_multi.isChecked()),
+        "compare_overlay": bool(getattr(win, "chk_compare", None) and win.chk_compare.isChecked()),
+        "overlay_checked": bool(getattr(win, "chk_overlay", None) and win.chk_overlay.isChecked()),
+        "manual_pixel_um": float(win.sp_pixel_um.value()) if hasattr(win, "sp_pixel_um") else 0.0,
+        "compare_style": (
+            win.cb_compare_style.currentText()
+            if hasattr(win, "cb_compare_style") else ""
+        ),
+        "compare_group_filter": (
+            win.cb_compare_group.currentText()
+            if hasattr(win, "cb_compare_group") else ""
+        ),
+        "gmm_covariance": win.cb_cov.currentText() if hasattr(win, "cb_cov") else "",
+        "gmm_sigma": float(win._gmm_sigma()) if hasattr(win, "_gmm_sigma") else 2.0,
+        "gmm_use_bic": bool(getattr(win, "chk_bic", None) and win.chk_bic.isChecked()),
+        "gmm_n_comp": win.edit_ncomp.text().strip() if hasattr(win, "edit_ncomp") else "",
+        "gmm_fit": _serialize_gmm_fit(getattr(win, "_gmm_fit", None)),
+        "cluster_stats": _serialize_cluster_stats(getattr(win, "cluster_stats", [])),
+        "compare_checked_indices": _compare_checked_indices(win),
+    }
+
+    active = getattr(win, "active_idx", -1)
+    if active < 0 and datasets:
+        active = 0
+
+    return {
+        "format": BUNDLE_FORMAT,
+        "format_version": BUNDLE_VERSION,
+        "app_version": __version__,
+        "phasorpy_version": pp_ver,
+        "saved_utc": datetime.now(timezone.utc).isoformat(),
+        "segmentation_mode": getattr(win, "mode", "cursor"),
+        "shared_reference": bool(win.chk_shared_ref.isChecked()) if hasattr(win, "chk_shared_ref") else False,
+        "shared_reference_path": getattr(win, "shared_ref_path", ""),
+        "shared_reference_channel": int(getattr(win, "shared_ref_channel", 0)),
+        "shared_reference_n_channels": max(1, int(getattr(win, "shared_ref_n_channels", 1))),
+        "calibration": {
+            "frequency_MHz": float(win.sp_freq.value()),
+            "harmonic": int(win.sp_harm.value()),
+            "reference_lifetime_ns": float(win.sp_reflt.value()),
+            "filter": win.cb_filter.currentText() if hasattr(win, "cb_filter") else "median",
+            "min_photons": int(win.sp_thr.value()),
+            "harmonic_mask": bool(win.chk_detect_harm.isChecked()) if hasattr(win, "chk_detect_harm") else True,
+            "reference_path": getattr(win, "shared_ref_path", "") or getattr(win.data, "ref_path", ""),
+            "reference_channel": int(getattr(win, "shared_ref_channel", 0)),
+            "mean_g": float(getattr(win.ref_calibration, "mean_g", 0.0)) if hasattr(win, "ref_calibration") else 0.0,
+            "mean_s": float(getattr(win.ref_calibration, "mean_s", 0.0)) if hasattr(win, "ref_calibration") else 0.0,
+            "manual": bool(getattr(win.ref_calibration, "use_manual", False)) if hasattr(win, "ref_calibration") else False,
+            "manual_g": float(getattr(win.ref_calibration, "manual_g", 0.0)) if hasattr(win, "ref_calibration") else 0.0,
+            "manual_s": float(getattr(win.ref_calibration, "manual_s", 0.0)) if hasattr(win, "ref_calibration") else 0.0,
+        },
+        "active_sample_index": active,
+        "cursors": cursors,
+        "ui": ui,
+        "samples": [
+            _sample_meta_row(win, d, i, f"samples/{i:03d}/maps.npz")
+            for i, d in enumerate(datasets)
+        ],
+    }
+
+
+def _compare_checked_indices(win) -> list[int]:
+    from PySide6.QtCore import Qt
+
+    if not hasattr(win, "table_compare"):
+        return []
+    out = []
+    for row in range(win.table_compare.rowCount()):
+        it = win.table_compare.item(row, 0)
+        if it is None:
+            continue
+        idx = int(it.data(Qt.ItemDataRole.UserRole))
+        if it.checkState() == Qt.CheckState.Checked:
+            out.append(idx)
+    return out
+
+
+def dataset_from_bundle_sample(meta: dict, maps: dict[str, np.ndarray]) -> PhasorData:
+    d = PhasorData()
+    d.sample_path = str(meta.get("original_sample_path", "") or "")
+    d.group_name = str(meta.get("group", "") or "")
+    d.channel = int(meta.get("channel", 0))
+    d.n_channels = max(1, int(meta.get("n_channels", 1)))
+    d.frame_index = int(meta.get("frame_index", -1))
+    d.frequency = float(meta.get("frequency_MHz", 80.0))
+    d.harmonic = int(meta.get("harmonic", 1))
+    d.pixel_size_um = float(meta.get("pixel_size_um", 0.0) or 0.0)
+    ref = meta.get("reference_path") or ""
+    d.ref_path = str(ref)
+    d.ref_channel = int(meta.get("reference_channel", 0))
+    d.ref_n_channels = max(1, int(meta.get("reference_n_channels", 1)))
+    d.processing_settings = dict(meta.get("processing_settings") or {})
+    d._intensity_stats = dict(meta.get("intensity_stats") or {})
+    _apply_maps_to_dataset(d, maps)
+    return d
+
+
+def save_session_bundle(win, path: str | Path) -> dict:
+    """Write one .flimsession zip with manifest + per-sample map arrays."""
+    path = Path(path)
+    if path.suffix.lower() != BUNDLE_EXTENSION:
+        path = path.with_suffix(BUNDLE_EXTENSION)
+
+    datasets = [
+        d for d in (win._all_datasets() if hasattr(win, "_all_datasets") else [win.data])
+        if d.real_cal is not None
+    ]
+    if not datasets:
+        raise ValueError("No computed samples — run Apply on at least one image first.")
+
+    if hasattr(win, "_save_proc_from_ui"):
+        win._save_proc_from_ui(win.data)
+
+    manifest = build_bundle_manifest(win)
+    overlay = getattr(win, "last_overlay", None)
+
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for i, d in enumerate(datasets):
+            maps = _maps_from_dataset(d)
+            buf = io.BytesIO()
+            np.savez_compressed(buf, **maps)
+            zf.writestr(f"samples/{i:03d}/maps.npz", buf.getvalue())
+        if overlay is not None:
+            buf = io.BytesIO()
+            np.savez_compressed(buf, overlay=np.clip(np.asarray(overlay, dtype=float), 0, 1))
+            zf.writestr("overlay.npz", buf.getvalue())
+        zf.writestr(MANIFEST_NAME, json.dumps(manifest, indent=2, default=_json_default))
+
+    size_mb = path.stat().st_size / (1024 * 1024)
+    return {
+        "path": str(path),
+        "n_samples": len(datasets),
+        "size_mb": size_mb,
+    }
+
+
+def load_session_bundle(path: str | Path) -> dict:
+    """Read a .flimsession zip; returns manifest and restored PhasorData list."""
+    path = Path(path)
+    with zipfile.ZipFile(path, "r") as zf:
+        if MANIFEST_NAME not in zf.namelist():
+            raise ValueError(f"Not a session bundle (missing {MANIFEST_NAME}).")
+        manifest = json.loads(zf.read(MANIFEST_NAME).decode("utf-8"))
+        if manifest.get("format") != BUNDLE_FORMAT:
+            raise ValueError(f"Unsupported bundle format: {manifest.get('format')!r}")
+        version = int(manifest.get("format_version", 0))
+        if version > BUNDLE_VERSION:
+            raise ValueError(
+                f"Bundle version {version} is newer than supported ({BUNDLE_VERSION})."
+            )
+
+        datasets: list[PhasorData] = []
+        for row in manifest.get("samples", []):
+            maps_file = row.get("maps_file", "")
+            if maps_file not in zf.namelist():
+                raise ValueError(f"Missing maps in bundle: {maps_file}")
+            with zf.open(maps_file) as f:
+                npz = np.load(f)
+                maps = {k: npz[k] for k in npz.files}
+            datasets.append(dataset_from_bundle_sample(row, maps))
+
+        overlay = None
+        if "overlay.npz" in zf.namelist():
+            with zf.open("overlay.npz") as f:
+                npz = np.load(f)
+                if "overlay" in npz.files:
+                    overlay = np.asarray(npz["overlay"], dtype=float)
+
+    return {
+        "manifest": manifest,
+        "datasets": datasets,
+        "overlay": overlay,
+        "gmm_fit": _deserialize_gmm_fit((manifest.get("ui") or {}).get("gmm_fit")),
+        "cluster_stats": _deserialize_cluster_stats((manifest.get("ui") or {}).get("cluster_stats")),
+    }
+
+
+def apply_session_bundle_to_window(win, loaded: dict) -> None:
+    """Restore GUI state from load_session_bundle() output."""
+    from flim_phasors.session_io import apply_calibration_from_session, restore_cursors_to_phasor
+    from flim_phasors.utils import categorical_rgb
+
+    manifest = loaded["manifest"]
+    datasets = loaded["datasets"]
+    if not datasets:
+        raise ValueError("Bundle contains no samples.")
+
+    ui = manifest.get("ui") or {}
+    active = int(manifest.get("active_sample_index", 0))
+    active = max(0, min(active, len(datasets) - 1))
+    multi = bool(ui.get("multi_image")) or len(datasets) > 1
+    if multi:
+        win.datasets = list(datasets)
+        win.active_idx = active
+        win.data = win.datasets[active]
+    else:
+        win.datasets = []
+        win.active_idx = -1
+        win.data = datasets[active]
+
+    win.shared_ref_path = str(manifest.get("shared_reference_path", "") or "")
+    win.shared_ref_channel = int(manifest.get("shared_reference_channel", 0))
+    win.shared_ref_n_channels = max(1, int(manifest.get("shared_reference_n_channels", 1)))
+
+    if hasattr(win, "chk_multi"):
+        win.chk_multi.blockSignals(True)
+        win.chk_multi.setChecked(bool(ui.get("multi_image")) or len(win.datasets) > 1)
+        win.chk_multi.blockSignals(False)
+        if hasattr(win, "_set_multi_detail_enabled"):
+            win._set_multi_detail_enabled(win.chk_multi.isChecked())
+
+    apply_calibration_from_session(win, manifest)
+
+    mode = manifest.get("segmentation_mode", "cursor")
+    if hasattr(win, "rb_cursor"):
+        win.rb_cursor.blockSignals(True)
+        win.rb_gmm.blockSignals(True)
+        if mode == "gmm":
+            win.rb_gmm.setChecked(True)
+        else:
+            win.rb_cursor.setChecked(True)
+        win.rb_cursor.blockSignals(False)
+        win.rb_gmm.blockSignals(False)
+        if hasattr(win, "on_mode_change"):
+            win.on_mode_change()
+
+    if manifest.get("cursors"):
+        restore_cursors_to_phasor(win, manifest["cursors"])
+
+    gmm_fit = loaded.get("gmm_fit")
+    if gmm_fit is not None:
+        win._gmm_fit = gmm_fit
+        n = len(gmm_fit[0])
+        colors = [categorical_rgb(k) for k in range(n)]
+        win.phasor.show_gmm_ellipses(*gmm_fit, colors)
+
+    if hasattr(win, "cb_cov") and ui.get("gmm_covariance"):
+        win.cb_cov.setCurrentText(str(ui["gmm_covariance"]))
+    if hasattr(win, "edit_gmm_sigma"):
+        win.edit_gmm_sigma.setText(str(ui.get("gmm_sigma", 2.0)))
+    if hasattr(win, "chk_bic"):
+        win.chk_bic.setChecked(bool(ui.get("gmm_use_bic")))
+    if hasattr(win, "edit_ncomp") and ui.get("gmm_n_comp"):
+        win.edit_ncomp.setText(str(ui["gmm_n_comp"]))
+
+    if hasattr(win, "sp_pixel_um"):
+        win.sp_pixel_um.setValue(float(ui.get("manual_pixel_um", 0.0)))
+
+    win.cluster_stats = list(loaded.get("cluster_stats") or [])
+    win.last_overlay = loaded.get("overlay")
+
+    if hasattr(win, "chk_compare"):
+        win.chk_compare.blockSignals(True)
+        win.chk_compare.setChecked(bool(ui.get("compare_overlay")))
+        win.chk_compare.blockSignals(False)
+    if hasattr(win, "cb_compare_style") and ui.get("compare_style"):
+        win.cb_compare_style.setCurrentText(str(ui["compare_style"]))
+    if hasattr(win, "cb_compare_group") and ui.get("compare_group_filter"):
+        win.cb_compare_group.setCurrentText(str(ui["compare_group_filter"]))
+
+    win._restore_ui_for_active()
+    if hasattr(win, "_refresh_image_combo"):
+        win._refresh_image_combo()
+        _restore_compare_checks(win, ui.get("compare_checked_indices") or [])
+    elif hasattr(win, "_refresh_compare_list"):
+        win._refresh_compare_list()
+    if hasattr(win, "_refresh_compare_group_filter"):
+        win._refresh_compare_group_filter()
+    if hasattr(win, "_update_apply_buttons"):
+        win._update_apply_buttons()
+    if hasattr(win, "_update_multi_strip"):
+        win._update_multi_strip()
+    if hasattr(win, "_refresh_image_combo"):
+        win._refresh_image_combo()
+    if hasattr(win, "_update_phasor_display"):
+        win._update_phasor_display()
+    if hasattr(win, "_fill_table"):
+        win._fill_table()
+
+    if hasattr(win, "chk_overlay"):
+        win.chk_overlay.blockSignals(True)
+        overlay_on = bool(ui.get("overlay_checked")) and win.last_overlay is not None
+        win.chk_overlay.setChecked(overlay_on)
+        win.chk_overlay.blockSignals(False)
+    if hasattr(win, "refresh_image"):
+        win.refresh_image()
+    if hasattr(win, "_update_metadata_panel"):
+        win._update_metadata_panel()
+    if hasattr(win, "_mark_calibration_current"):
+        win._mark_calibration_current()
+
+
+def _restore_compare_checks(win, indices: list[int]) -> None:
+    from PySide6.QtCore import Qt
+
+    if not hasattr(win, "table_compare"):
+        return
+    want = set(int(i) for i in indices)
+    win.table_compare.blockSignals(True)
+    for row in range(win.table_compare.rowCount()):
+        it = win.table_compare.item(row, 0)
+        if it is None or not (it.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+            continue
+        idx = int(it.data(Qt.ItemDataRole.UserRole))
+        it.setCheckState(
+            Qt.CheckState.Checked if idx in want else Qt.CheckState.Unchecked
+        )
+    win.table_compare.blockSignals(False)

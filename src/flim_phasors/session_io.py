@@ -30,6 +30,9 @@ def apply_calibration_from_session(win, session: dict):
     if cal.use_manual:
         cal.mean_g = cal.manual_g
         cal.mean_s = cal.manual_s
+    cal.values_ready = cal.use_manual or (
+        "mean_g" in cal_block or "mean_s" in cal_block
+    )
     win.ref_calibration = cal
     ref_path = cal_block.get("reference_path") or session.get("shared_reference_path") or ""
     if ref_path and os.path.isfile(ref_path):
