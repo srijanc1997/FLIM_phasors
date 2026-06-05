@@ -68,8 +68,31 @@ from flim_phasors.session_io import (
 
 )
 
+from flim_phasors.gui.theme import (
 
+    DEFAULT_THEME,
 
+    PRIMARY_BUTTON_ATTRS,
+
+    THEME_MENU_LABELS,
+
+    THEME_PHASOR_LAB,
+
+    THEME_PHASOR_LAB_LIGHT,
+
+    is_dark_theme,
+
+    log_style_for,
+
+    normalize_theme_id,
+
+    stylesheet_for,
+
+    toolbar_colors_for,
+
+    toolbar_style_for,
+
+)
 
 
 class EnhancementsMixin:
@@ -86,7 +109,9 @@ class EnhancementsMixin:
 
         self._cursor_undo_stack: list[list] = []
 
-        self._dark_theme = bool(self._settings.value("dark_theme", False))
+        self._ui_theme = self._load_ui_theme_setting()
+
+        self._dark_theme = is_dark_theme(self._ui_theme)
 
         self._extend_ui()
 
@@ -96,9 +121,9 @@ class EnhancementsMixin:
 
         self._setup_drag_drop()
 
-        if self._dark_theme:
+        self._tag_primary_buttons()
 
-            self._apply_dark_theme(True)
+        self._apply_ui_theme(self._ui_theme)
 
 
 
@@ -284,13 +309,30 @@ class EnhancementsMixin:
 
         view_m = mb.addMenu("&View")
 
-        self._act_dark = view_m.addAction("Dark theme")
+        theme_m = view_m.addMenu("Theme")
 
-        self._act_dark.setCheckable(True)
+        self._theme_group = QtGui.QActionGroup(self)
 
-        self._act_dark.setChecked(self._dark_theme)
+        self._theme_actions = {}
 
-        self._act_dark.toggled.connect(self._apply_dark_theme)
+        for theme_id in (THEME_PHASOR_LAB, THEME_PHASOR_LAB_LIGHT):
+
+            act = theme_m.addAction(THEME_MENU_LABELS[theme_id])
+
+            act.setCheckable(True)
+
+            self._theme_group.addAction(act)
+
+            self._theme_actions[theme_id] = act
+
+            act.triggered.connect(
+                lambda _checked=False, tid=theme_id: self._apply_ui_theme(tid))
+
+        checked = self._theme_actions.get(self._ui_theme)
+
+        if checked is not None:
+
+            checked.setChecked(True)
 
 
 
@@ -956,27 +998,127 @@ class EnhancementsMixin:
 
 
 
+    def _load_ui_theme_setting(self) -> str:
+
+        """Return persisted Phasor Lab theme id."""
+
+        if self._settings.contains("ui_theme"):
+
+            return normalize_theme_id(str(self._settings.value("ui_theme", DEFAULT_THEME)))
+
+        if self._settings.contains("dark_theme"):
+
+            legacy = bool(self._settings.value("dark_theme", True))
+
+            return THEME_PHASOR_LAB if legacy else THEME_PHASOR_LAB_LIGHT
+
+        return DEFAULT_THEME
+
+
+
+    def _tag_primary_buttons(self):
+
+        """Mark key workflow buttons for accent styling in Phasor Lab themes."""
+
+        for attr in PRIMARY_BUTTON_ATTRS:
+
+            btn = getattr(self, attr, None)
+
+            if btn is not None:
+
+                btn.setProperty("primary", True)
+
+
+
+    def _repolish_primary_buttons(self):
+
+        """Re-apply stylesheet rules to primary buttons after a theme change."""
+
+        for attr in PRIMARY_BUTTON_ATTRS:
+
+            btn = getattr(self, attr, None)
+
+            if btn is not None:
+
+                style = btn.style()
+
+                style.unpolish(btn)
+
+                style.polish(btn)
+
+
+
+    def _apply_ui_theme(self, theme: str):
+
+        """Apply a Phasor Lab theme and persist the preference."""
+
+        theme = normalize_theme_id(theme)
+
+        self._ui_theme = theme
+
+        self._dark_theme = is_dark_theme(theme)
+
+        self._settings.setValue("ui_theme", theme)
+
+        self._settings.setValue("dark_theme", self._dark_theme)
+
+        self.setStyleSheet(stylesheet_for(theme))
+
+        self._apply_theme_widgets(theme)
+
+        self._repolish_primary_buttons()
+
+        for theme_id, act in getattr(self, "_theme_actions", {}).items():
+
+            act.setChecked(theme_id == theme)
+
+
+
+    def _apply_theme_widgets(self, theme: str):
+
+        """Refresh log and matplotlib toolbar styles after a theme change."""
+
+        if hasattr(self, "txt_log"):
+
+            self.txt_log.setStyleSheet(log_style_for(theme))
+
+        tb_style = toolbar_style_for(theme)
+
+        tb_bg_hex, tb_fg_hex = toolbar_colors_for(theme)
+
+        tb_bg = QtGui.QColor(tb_bg_hex)
+
+        tb_fg = QtGui.QColor(tb_fg_hex)
+
+        for attr in ("phasor_toolbar", "image_toolbar"):
+
+            tb = getattr(self, attr, None)
+
+            if tb is not None:
+
+                tb.setStyleSheet(tb_style)
+
+                pal = tb.palette()
+
+                pal.setColor(QtGui.QPalette.ColorRole.Window, tb_bg)
+
+                pal.setColor(QtGui.QPalette.ColorRole.Button, tb_bg)
+
+                pal.setColor(QtGui.QPalette.ColorRole.WindowText, tb_fg)
+
+                pal.setColor(QtGui.QPalette.ColorRole.ButtonText, tb_fg)
+
+                tb.setPalette(pal)
+
+                tb.setAutoFillBackground(True)
+
+
+
     def _apply_dark_theme(self, on: bool):
 
-        """Toggle dark stylesheet and persist the preference in QSettings."""
+        """Backward-compatible wrapper for legacy dark-theme toggles."""
 
-        self._dark_theme = on
-
-        self._settings.setValue("dark_theme", on)
-
-        if on:
-
-            self.setStyleSheet(
-
-                "QWidget { background-color: #2b2b2b; color: #e0e0e0; }"
-
-                "QGroupBox { border: 1px solid #555; margin-top: 6px; padding-top: 6px; }"
-
-                "QPlainTextEdit { background-color: #1e1e1e; }")
-
-        else:
-
-            self.setStyleSheet("")
+        self._apply_ui_theme(THEME_PHASOR_LAB if on else THEME_PHASOR_LAB_LIGHT)
 
 
 
