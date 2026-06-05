@@ -28,6 +28,8 @@ env/
 # Editors / IDEs
 .idea/
 .vscode/
+.cursor/
+.githooks/
 
 # FLIM data files (don't commit large raw datasets)
 *.ptu
