@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -65,3 +66,6 @@ intersphinx_mapping = {
 html_theme = "sphinx_rtd_theme"
 html_static_path = ["_static"]
 html_title = "flim-phasors API"
+
+# Set in CI for correct links on GitHub Pages (project site subpath).
+html_baseurl = os.environ.get("SPHINX_HTML_BASE_URL", "")

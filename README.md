@@ -1,5 +1,7 @@
 # FLIM Phasors
 
+[![API docs](https://img.shields.io/badge/API%20docs-GitHub%20Pages-blue)](https://srijanc1997.github.io/FLIM_phasors/)
+
 Interactive **phasor analysis and segmentation** for fluorescence lifetime imaging (FLIM). Works with general TCSPC data from PicoQuant and Imspector-style TIFF stacks.
 
 Built on [phasorpy](https://github.com/phasorpy/phasorpy) with a PySide6 + matplotlib desktop UI.
@@ -164,10 +166,14 @@ pytest
 
 ## API documentation (Sphinx)
 
-Install the documentation extras, then build HTML from the `docs/` folder:
+**Published docs:** https://srijanc1997.github.io/FLIM_phasors/
+
+The site is built automatically on every push to `main` by the [docs workflow](.github/workflows/docs.yml).
+
+### Build locally
 
 ```bash
-pip install -e ".[docs]"
+pip install -e ".[all,docs]"
 cd docs
 python -m sphinx.cmd.build -b html . _build/html
 ```
@@ -177,6 +183,12 @@ Open `docs/_build/html/index.html` in a browser. For live reload while editing d
 ```bash
 python -m sphinx_autobuild docs docs/_build/html
 ```
+
+### First-time GitHub Pages setup
+
+1. Push these changes to `main`.
+2. On GitHub: **Settings → Pages → Build and deployment → Source** → choose **GitHub Actions**.
+3. After the `docs` workflow finishes, the site is live at the URL above (may take 1–2 minutes).
 
 ## License
 
