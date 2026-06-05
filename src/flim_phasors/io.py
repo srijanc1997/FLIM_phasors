@@ -1,4 +1,4 @@
-"""Load FLIM data from PicoQuant PTU and Imspector TIFF; decode caches."""
+"""Load FLIM data from PicoQuant PTU and Imspector TIFF."""
 
 from __future__ import annotations
 
@@ -6,16 +6,27 @@ import os
 
 import numpy as np
 from phasorpy.io import signal_from_imspector_tiff, signal_from_ptu
-from phasorpy.phasor import phasor_from_signal
 
-from flim_phasors.utils import reduce_signal, to_2d
-
-_REF_SIGNAL_CACHE: dict[str, object] = {}
-_REF_PHASOR_CACHE: dict[tuple, tuple] = {}
-
-
-def _cache_key(path: str) -> str:
-    return os.path.normcase(os.path.abspath(path))
+# --- unused (focused cleanup): uncomment if needed ---
+# Legacy alias — phasor maps only, no full histogram cache
+# def reference_phasor(ref_path: str, channel: int, harmonic):
+#     """Return (mean, real, imag) reference phasor maps (histogram not kept in RAM)."""
+#     from flim_phasors.calibration import get_cached_reference_phasor
+#
+#     cal = get_cached_reference_phasor(ref_path, channel, harmonic)
+#     if cal._maps is None:
+#         raise ValueError(f"No reference phasor for {ref_path}")
+#     return cal._maps
+#
+#
+# def clear_signal_caches():
+#     from flim_phasors.calibration import clear_calibration_cache
+#
+#     clear_calibration_cache()
+#
+#
+# def _cache_key(path: str) -> str:
+#     return os.path.normcase(os.path.abspath(path))
 
 
 def file_extension(path: str) -> str:
@@ -44,27 +55,3 @@ def load_flim_signal(path: str, *, channel=None, frame=-1, dtype=np.uint32):
                 sig = sig.squeeze("T", drop=True)
         return sig
     raise ValueError(f"Unsupported FLIM file type: {ext!r} ({path})")
-
-
-def load_reference_signal(path: str):
-    """Decode a reference file once; reuse the in-memory histogram for later Apply calls."""
-    key = _cache_key(path)
-    if key not in _REF_SIGNAL_CACHE:
-        _REF_SIGNAL_CACHE[key] = load_flim_signal(path, channel=None, frame=-1, dtype=np.uint32)
-    return _REF_SIGNAL_CACHE[key]
-
-
-def reference_phasor(ref_path: str, channel: int, harmonic):
-    """Cached (mean, real, imag) for a reference file at the given channel and harmonic(s)."""
-    harm_key = tuple(harmonic) if isinstance(harmonic, (list, tuple)) else (int(harmonic),)
-    key = (_cache_key(ref_path), int(channel), harm_key)
-    if key not in _REF_PHASOR_CACHE:
-        rsig = reduce_signal(load_reference_signal(ref_path), channel)
-        rmean, rreal, rimag = phasor_from_signal(rsig, axis="H", harmonic=harmonic)
-        _REF_PHASOR_CACHE[key] = (rmean, rreal, rimag)
-    return _REF_PHASOR_CACHE[key]
-
-
-def clear_signal_caches():
-    _REF_SIGNAL_CACHE.clear()
-    _REF_PHASOR_CACHE.clear()

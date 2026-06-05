@@ -53,6 +53,8 @@ class PhasorCanvas(FigureCanvas):
         self.selected = -1
         self._dragging = False
         self._gmm_artists = []
+        self._click_marker = None
+        self._image_highlight = None
         self._init_axes()
         self.mpl_connect("button_press_event", self.on_press)
         self.mpl_connect("button_release_event", self.on_release)
@@ -71,8 +73,9 @@ class PhasorCanvas(FigureCanvas):
         self.ax.margins(0)
         self.ax.grid(alpha=0.2)
 
-    def set_data(self, data):
-        self.data = data
+    # --- unused (focused cleanup): uncomment if needed ---
+    # def set_data(self, data):
+    #     self.data = data
 
     def set_compare(self, enabled, style, layers):
         self.compare_enabled = bool(enabled)
@@ -184,9 +187,20 @@ class PhasorCanvas(FigureCanvas):
                 self.ax.legend(handles, labels, loc="upper right", fontsize=7, framealpha=0.88)
 
         self._redraw_cursors()
+        if self._click_marker is not None:
+            self.ax.plot(
+                self._click_marker[0], self._click_marker[1],
+                "wx", ms=10, mew=2, zorder=20)
         self.ax.set_xlim(0, 1.05)
         self.ax.set_ylim(0, 0.75)
         self.draw_idle()
+
+    def set_click_marker(self, g: float | None, s: float | None):
+        if g is None or s is None:
+            self._click_marker = None
+        else:
+            self._click_marker = (float(g), float(s))
+        self.redraw_hist()
 
     def add_cursor(self, radius=0.05, *, kind="circle", radius_minor=None, angle=0.0):
         if self.data is not None and self.data.valid_mask().sum() > 0:
@@ -295,21 +309,22 @@ class PhasorCanvas(FigureCanvas):
             self._gmm_artists.append(pt)
         self.draw_idle()
 
-    def show_gmm(self, means, covs, colors):
-        self.clear_gmm()
-        for k in range(len(means)):
-            mg, ms = means[k]; cov = covs[k]
-            vals, vecs = np.linalg.eigh(cov)
-            order = vals.argsort()[::-1]; vals, vecs = vals[order], vecs[:, order]
-            angle = np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0]))
-            for n in (1, 2):
-                w, h = 2 * n * np.sqrt(np.maximum(vals, 1e-9))
-                e = Ellipse((mg, ms), w, h, angle=angle, fill=False,
-                            edgecolor=colors[k], lw=1.5, alpha=0.9 / n)
-                self.ax.add_patch(e); self._gmm_artists.append(e)
-            pt = self.ax.plot(mg, ms, "x", color=colors[k], ms=8, mew=2)[0]
-            self._gmm_artists.append(pt)
-        self.draw_idle()
+    # --- unused (focused cleanup): uncomment if needed; GUI uses show_gmm_ellipses ---
+    # def show_gmm(self, means, covs, colors):
+    #     self.clear_gmm()
+    #     for k in range(len(means)):
+    #         mg, ms = means[k]; cov = covs[k]
+    #         vals, vecs = np.linalg.eigh(cov)
+    #         order = vals.argsort()[::-1]; vals, vecs = vals[order], vecs[:, order]
+    #         angle = np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0]))
+    #         for n in (1, 2):
+    #             w, h = 2 * n * np.sqrt(np.maximum(vals, 1e-9))
+    #             e = Ellipse((mg, ms), w, h, angle=angle, fill=False,
+    #                         edgecolor=colors[k], lw=1.5, alpha=0.9 / n)
+    #             self.ax.add_patch(e); self._gmm_artists.append(e)
+    #         pt = self.ax.plot(mg, ms, "x", color=colors[k], ms=8, mew=2)[0]
+    #         self._gmm_artists.append(pt)
+    #     self.draw_idle()
 
     def clear_gmm(self):
         for a in self._gmm_artists:

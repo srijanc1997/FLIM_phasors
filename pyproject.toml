@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "flim-phasors"
 version = "0.2.0"
-description = "Interactive FLIM phasor analysis and segmentation (PTU & TIFF)"
+description = "Interactive FLIM phasor analysis and segmentation for TCSPC data"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
@@ -21,9 +21,11 @@ dependencies = [
 pawflim = ["pawflim"]
 excel = ["openpyxl>=3.1"]
 all = ["pawflim", "openpyxl>=3.1"]
+dev = ["pytest>=7.0"]
 
 [project.scripts]
 flim-phasor-gui = "flim_phasors.app:main"
+flim-phasor-batch = "flim_phasors.batch_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

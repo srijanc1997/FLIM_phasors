@@ -14,14 +14,12 @@ from phasorpy.filter import (
 from phasorpy.lifetime import phasor_to_lifetime_search
 from phasorpy.lifetime import (
     phasor_calibrate,
-    phasor_from_lifetime,
     phasor_to_apparent_lifetime,
     phasor_to_normal_lifetime,
 )
 from phasorpy.phasor import phasor_from_signal
 
-from flim_phasors.analysis import global_phasor_center
-from flim_phasors.io import load_flim_signal, reference_phasor
+from flim_phasors.io import load_flim_signal
 from flim_phasors.utils import photon_count_from_signal, reduce_signal, to_2d
 
 
@@ -35,8 +33,6 @@ class PhasorData:
         self.channel = 0
         self.frequency = 80.0
         self.harmonic = 1
-        self.is_synthetic = False
-        self._syn = None
         self.mean_raw = None
         self.mean_thr = None
         self.real_cal = None
@@ -46,18 +42,42 @@ class PhasorData:
         self.tau_normal = None
         self.tau_search_phi = None
         self.tau_search_mod = None
-        self.phasor_center_g = None
-        self.phasor_center_s = None
+        self.frame_index = -1
         self.sample_path = ""
         self.group_name = ""
         self.ref_path = ""
         self.ref_n_channels = 1
         self.ref_channel = 0
+        self.pixel_size_um = 0.0
+        self._shape_hint = None
+        self.processing_settings = None  # per-sample filter/harmonic stash (dict)
 
-    def load_sample(self, path):
-        sig = load_flim_signal(path, channel=None, frame=-1, dtype=np.uint32)
+    # --- unused (focused cleanup): uncomment if needed ---
+    # def unload_histogram(self):
+    #     """Drop TCSPC histogram from RAM; keep computed phasor maps."""
+    #     self.signal_full = None
+
+    def ensure_loaded(self, frame=None):
+        if self.signal_full is not None:
+            return self._shape_hint or (256, 256), self.n_channels
+        if not self.sample_path:
+            raise ValueError("No sample path to load.")
+        return self.load_sample(self.sample_path, frame=frame)
+
+    # --- unused (focused cleanup): uncomment if needed ---
+    # def register_lazy(self, path: str, *, frame: int = -1, n_channels: int = 1, frequency: float = 80.0):
+    #     """Register path without decoding histogram (multi-image lazy mode)."""
+    #     self.sample_path = path
+    #     self.frame_index = int(frame)
+    #     self.n_channels = max(1, int(n_channels))
+    #     self.frequency = float(frequency)
+    def load_sample(self, path, frame=None):
+        if frame is None:
+            frame = int(getattr(self, "frame_index", -1))
+        else:
+            self.frame_index = int(frame)
+        sig = load_flim_signal(path, channel=None, frame=self.frame_index, dtype=np.uint32)
         self.signal_full = sig
-        self.is_synthetic = False
         self.sample_path = path
         self.n_channels = int(sig.sizes["C"]) if "C" in sig.dims else 1
         self.channel = 0
@@ -65,60 +85,33 @@ class PhasorData:
         red = reduce_signal(sig, 0)
         yx = [s for d, s in zip(red.dims, red.shape) if d != "H"]
         shape = tuple(yx) if len(yx) == 2 else (red.shape[0], red.shape[1])
+        self._shape_hint = shape
+        attrs = getattr(sig, "attrs", {}) or {}
+        ps = attrs.get("pixel_size") or attrs.get("PixelSize")
+        if ps is not None:
+            try:
+                self.pixel_size_um = float(ps)
+            except (TypeError, ValueError):
+                pass
         return shape, self.n_channels
-
-    def load_synthetic(self, shape=(256, 256)):
-        h, w = shape
-        rng = np.random.default_rng(0)
-        freq = 80.0
-        self.frequency = freq
-        self.harmonic = 1
-        self.is_synthetic = True
-        self.signal_full = None
-        self.n_channels = 1
-        self.channel = 0
-        g = np.zeros(shape)
-        s = np.zeros(shape)
-        mean = np.zeros(shape)
-        bg_g, bg_s = phasor_from_lifetime(freq, 0.4)
-        g[:] = bg_g
-        s[:] = bg_s
-        mean[:] = rng.uniform(20, 80, shape)
-        yy, xx = np.mgrid[0:h, 0:w]
-        col_g, col_s = phasor_from_lifetime(freq, 0.25)
-        for _ in range(6):
-            cy, cx, r = rng.integers(0, h), rng.integers(0, w), rng.integers(15, 40)
-            m = (yy - cy) ** 2 + (xx - cx) ** 2 < r ** 2
-            g[m] = col_g
-            s[m] = col_s
-            mean[m] = rng.uniform(300, 900, m.sum())
-        ves_g, ves_s = phasor_from_lifetime(freq, 2.0)
-        for _ in range(5):
-            y0 = rng.integers(0, h)
-            x = np.arange(w)
-            y = (y0 + 25 * np.sin(x / 30.0 + rng.uniform(0, 6))).astype(int) % h
-            for dy in range(-3, 4):
-                yi = (y + dy) % h
-                g[yi, x] = ves_g
-                s[yi, x] = ves_s
-                mean[yi, x] = rng.uniform(400, 1000, w)
-        g += rng.normal(0, 0.012, shape)
-        s += rng.normal(0, 0.012, shape)
-        self._syn = (mean, g, s)
-        self.sample_path = "<synthetic demo>"
-        return shape, 1
 
     def _sample_channel_signal(self):
         return reduce_signal(self.signal_full, self.channel)
 
-    def _reference_phasor(self, ref_path, harmonic):
-        rmean, rreal, rimag = reference_phasor(ref_path, self.ref_channel, harmonic)
+    def _apply_reference_calibration(self, real, imag, mean, ref_cal, *, frequency, lifetime, harmonic):
+        shape = real.shape
+        rmean, rreal, rimag = ref_cal.maps_for_shape(shape)
         if isinstance(harmonic, (list, tuple)):
-            return rmean, rreal, rimag
-        return to_2d(rmean), to_2d(rreal), to_2d(rimag)
+            return phasor_calibrate(
+                real, imag, rmean, rreal, rimag,
+                frequency=frequency, lifetime=float(lifetime), harmonic=harmonic)
+        return phasor_calibrate(
+            real, imag, rmean, rreal, rimag,
+            frequency=frequency, lifetime=float(lifetime), harmonic=harmonic)
 
     def apply_processing(
         self,
+        ref_calibration=None,
         ref_path=None,
         ref_lifetime=4.0,
         filter_mode="median",
@@ -132,17 +125,17 @@ class PhasorData:
         H = int(self.harmonic)
         freq = float(self.frequency)
 
-        if filter_mode == "pawflim" and not self.is_synthetic:
+        if filter_mode == "pawflim":
             harmonics = [H, 2 * H]
             sig = self._sample_channel_signal()
             photon_count = photon_count_from_signal(sig)
             mean, real, imag = phasor_from_signal(sig, axis="H", harmonic=harmonics)
-            if ref_path:
-                rmean, rreal, rimag = self._reference_phasor(ref_path, harmonics)
-                real, imag = phasor_calibrate(
-                    real, imag, rmean, rreal, rimag,
-                    frequency=freq, lifetime=float(ref_lifetime), harmonic=harmonics)
-                self.ref_path = ref_path
+            if ref_calibration is not None and ref_calibration.is_active:
+                real, imag = self._apply_reference_calibration(
+                    real, imag, mean, ref_calibration,
+                    frequency=freq, lifetime=ref_lifetime, harmonic=harmonics)
+                if ref_path:
+                    self.ref_path = ref_path
             mean, real, imag = phasor_filter_pawflim(
                 mean, real, imag, sigma=float(paw_sigma),
                 levels=int(paw_levels), harmonic=harmonics)
@@ -150,27 +143,22 @@ class PhasorData:
             imag = to_2d(imag[0])
             mean = to_2d(mean)
         else:
-            if self.is_synthetic:
-                mean, real, imag = (a.astype(float).copy() for a in self._syn)
-                mean, real, imag = to_2d(mean), to_2d(real), to_2d(imag)
-                photon_count = mean.copy()
-            else:
-                sig = self._sample_channel_signal()
-                if filter_mode == "signal median" and median_size >= 1:
-                    sig = signal_filter_median(
-                        sig, size=int(median_size), repeat=int(median_repeat))
-                elif filter_mode == "signal gaussian" and median_size >= 1:
-                    sig = signal_filter_gaussian(
-                        sig, size=int(median_size), repeat=int(median_repeat))
-                photon_count = photon_count_from_signal(sig)
-                mean, real, imag = phasor_from_signal(sig, axis="H", harmonic=H)
-                mean, real, imag = to_2d(mean), to_2d(real), to_2d(imag)
-            if ref_path and not self.is_synthetic:
-                rmean, rreal, rimag = self._reference_phasor(ref_path, H)
-                real, imag = phasor_calibrate(
-                    real, imag, rmean, rreal, rimag,
-                    frequency=freq, lifetime=float(ref_lifetime), harmonic=H)
-                self.ref_path = ref_path
+            sig = self._sample_channel_signal()
+            if filter_mode == "signal median" and median_size >= 1:
+                sig = signal_filter_median(
+                    sig, size=int(median_size), repeat=int(median_repeat))
+            elif filter_mode == "signal gaussian" and median_size >= 1:
+                sig = signal_filter_gaussian(
+                    sig, size=int(median_size), repeat=int(median_repeat))
+            photon_count = photon_count_from_signal(sig)
+            mean, real, imag = phasor_from_signal(sig, axis="H", harmonic=H)
+            mean, real, imag = to_2d(mean), to_2d(real), to_2d(imag)
+            if ref_calibration is not None and ref_calibration.is_active:
+                real, imag = self._apply_reference_calibration(
+                    real, imag, mean, ref_calibration,
+                    frequency=freq, lifetime=ref_lifetime, harmonic=H)
+                if ref_path:
+                    self.ref_path = ref_path
             if filter_mode == "median" and median_size >= 1 and median_repeat >= 1:
                 mean, real, imag = phasor_filter_median(
                     mean, real, imag, size=int(median_size), repeat=int(median_repeat))
@@ -218,14 +206,6 @@ class PhasorData:
             ts_phi, ts_mod = phasor_to_lifetime_search(real, imag, work_freq)
         self.tau_search_phi = np.asarray(ts_phi, dtype=float)
         self.tau_search_mod = np.asarray(ts_mod, dtype=float)
-
-        try:
-            cg, cs, _ = global_phasor_center(mean_thr, real, imag)
-            self.phasor_center_g = cg
-            self.phasor_center_s = cs
-        except Exception:
-            self.phasor_center_g = None
-            self.phasor_center_s = None
 
     @property
     def work_frequency(self):

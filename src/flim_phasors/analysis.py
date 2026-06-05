@@ -6,8 +6,7 @@ import numpy as np
 from phasorpy.cluster import phasor_cluster_gmm
 from phasorpy.cursor import mask_from_elliptic_cursor
 from phasorpy.lifetime import (
-    phasor_center,
-    phasor_to_apparent_lifetime,
+    # phasor_center,  # unused (focused cleanup)
     phasor_to_lifetime_search,
     phasor_to_normal_lifetime,
 )
@@ -90,7 +89,10 @@ def lifetimes_at_phasor(g, s, frequency_mhz):
     return float(np.asarray(tp).ravel()[0]), float(np.asarray(tm).ravel()[0]), float(tn)
 
 
-def global_phasor_center(mean, real, imag, *, method="mean"):
-    """Intensity-weighted phasor center (g, s) and mean photons."""
-    m, gr, gi = phasor_center(mean, real, imag, method=method)
-    return float(np.asarray(gr).ravel()[0]), float(np.asarray(gi).ravel()[0]), float(np.asarray(m).ravel()[0])
+# --- unused (focused cleanup): uncomment if needed ---
+# def global_phasor_center(mean, real, imag, *, method="mean"):
+#     """Intensity-weighted phasor center (g, s) and mean photons."""
+#     from phasorpy.lifetime import phasor_center
+#
+#     m, gr, gi = phasor_center(mean, real, imag, method=method)
+#     return float(np.asarray(gr).ravel()[0]), float(np.asarray(gi).ravel()[0]), float(np.asarray(m).ravel()[0])

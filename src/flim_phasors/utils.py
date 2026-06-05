@@ -54,10 +54,7 @@ def photon_count_from_signal(sig):
 
 
 def dataset_short_label(d, index=0):
-    name = os.path.basename(d.sample_path) if d.sample_path else f"image {index + 1}"
-    if name.startswith("<"):
-        return "synthetic demo"
-    return name
+    return os.path.basename(d.sample_path) if d.sample_path else f"image {index + 1}"
 
 
 def dataset_display_label(d, index=0):

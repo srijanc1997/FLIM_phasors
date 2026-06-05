@@ -33,7 +33,8 @@ CATEGORICAL_NAMES = (
     "cyan", "orange", "brown", "indigo", "teal", "slate",
 )
 
-SUPPORTED_EXTENSIONS = (".ptu", ".tif", ".tiff")
+# --- unused (focused cleanup): uncomment if needed; see io.is_supported_flim_path ---
+# SUPPORTED_EXTENSIONS = (".ptu", ".tif", ".tiff")
 
 FLIM_FILE_FILTER = (
     "FLIM files (*.ptu *.tif *.tiff);;"

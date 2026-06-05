@@ -1,0 +1,132 @@
+"""Batch-process FLIM samples from the command line (no GUI)."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+from flim_phasors.calibration import compute_reference_phasor
+from flim_phasors.data import PhasorData
+from flim_phasors.export_bundle import export_sample_maps
+# export_analysis_bundle  # unused (focused cleanup)
+from flim_phasors.io import is_supported_flim_path
+
+
+# --- unused (focused cleanup): uncomment if needed ---
+# class _BatchWin:
+#     """Minimal stand-in for MainWindow export helpers."""
+#
+#     def __init__(self, args):
+#         self.cb_filter = type("F", (), {"currentText": lambda s: args.filter})()
+#         self.data = PhasorData()
+#         self.datasets = []
+#         self.active_idx = -1
+#         self.cluster_stats = []
+#         self.last_overlay = None
+#         self.mode = ""
+#         self.shared_ref_path = args.reference or ""
+#         self.chk_shared_ref = type("C", (), {"isChecked": lambda s: bool(args.reference)})()
+#         self.ref_calibration = None
+#
+#     def _effective_ref_path(self, d=None):
+#         return self.shared_ref_path or (d.ref_path if d else "")
+#
+#     def _all_datasets(self):
+#         return self.datasets if self.datasets else [self.data]
+
+
+def _collect_paths(folder: Path) -> list[str]:
+    out = []
+    for ext in (".ptu", ".tif", ".tiff"):
+        out.extend(str(p) for p in sorted(folder.glob(f"*{ext}")))
+    return [p for p in out if is_supported_flim_path(p)]
+
+
+def process_one(
+    path: str,
+    *,
+    ref_path: str,
+    ref_channel: int,
+    ref_lifetime: float,
+    harmonic: int,
+    frequency: float,
+    filter_mode: str,
+    min_photons: int,
+    ref_cal=None,
+):
+    d = PhasorData()
+    d.load_sample(path)
+    d.harmonic = harmonic
+    d.frequency = frequency
+    d.channel = 0
+    if ref_path:
+        d.ref_path = ref_path
+        d.ref_channel = ref_channel
+    d.apply_processing(
+        ref_calibration=ref_cal,
+        ref_path=ref_path or None,
+        ref_lifetime=ref_lifetime,
+        filter_mode=filter_mode,
+        intensity_min=float(min_photons),
+    )
+    return d
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description="Batch FLIM phasor processing")
+    p.add_argument("input", help="Sample file or folder of .ptu/.tif")
+    p.add_argument("-o", "--output", required=True, help="Output folder")
+    p.add_argument("-r", "--reference", help="Reference .ptu/.tif for calibration")
+    p.add_argument("--ref-channel", type=int, default=0)
+    p.add_argument("--ref-lifetime", type=float, default=4.0)
+    p.add_argument("--harmonic", type=int, default=1)
+    p.add_argument("--frequency", type=float, default=80.0)
+    p.add_argument("--filter", default="median", choices=["median", "gaussian", "pawflim", "signal median", "signal gaussian"])
+    p.add_argument("--min-photons", type=int, default=0)
+    args = p.parse_args(argv)
+
+    inp = Path(args.input)
+    paths = _collect_paths(inp) if inp.is_dir() else [str(inp)]
+    paths = [p for p in paths if is_supported_flim_path(p)]
+    if not paths:
+        print("No supported FLIM files found.", file=sys.stderr)
+        return 1
+
+    ref_cal = None
+    if args.reference:
+        if not os.path.isfile(args.reference):
+            print(f"Reference not found: {args.reference}", file=sys.stderr)
+            return 1
+        ref_cal = compute_reference_phasor(args.reference, args.ref_channel, args.harmonic)
+
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
+    summary = []
+    for i, sp in enumerate(paths):
+        print(f"[{i + 1}/{len(paths)}] {os.path.basename(sp)}")
+        d = process_one(
+            sp,
+            ref_path=args.reference or "",
+            ref_channel=args.ref_channel,
+            ref_lifetime=args.ref_lifetime,
+            harmonic=args.harmonic,
+            frequency=args.frequency,
+            filter_mode=args.filter,
+            min_photons=args.min_photons,
+            ref_cal=ref_cal,
+        )
+        sub = out / f"{i + 1:02d}_{Path(sp).stem}"
+        sub.mkdir(parents=True, exist_ok=True)
+        export_sample_maps(sub, d)
+        summary.append({"path": sp, "valid_pixels": int(d.valid_mask().sum()) if d.real_cal is not None else 0})
+
+    (out / "batch_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"Done — {len(paths)} sample(s) → {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

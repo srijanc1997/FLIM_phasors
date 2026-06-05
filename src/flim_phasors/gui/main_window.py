@@ -1,5 +1,4 @@
 """Main application window."""
-import csv
 import os
 import sys
 import time
@@ -9,7 +8,9 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as Navigation
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
+from flim_phasors import __version__
 from flim_phasors.analysis import fit_phasor_gmm, label_pixels_by_gmm, lifetimes_at_phasor
+from flim_phasors.export_bundle import export_analysis_bundle
 from flim_phasors.constants import (
     COMPARE_STYLE_MAP,
     CURSOR_SHAPES,
@@ -17,10 +18,23 @@ from flim_phasors.constants import (
     FLIM_FILE_FILTER,
     IMAGE_VIEW_ITEMS,
 )
+from flim_phasors.calibration import ReferenceCalibration, compute_reference_phasor
+from flim_phasors.calibration import clear_calibration_cache
 from flim_phasors.data import PhasorData
-from flim_phasors.io import is_supported_flim_path, load_reference_signal
+from flim_phasors.io import is_supported_flim_path
+from flim_phasors.busy import CancelledError, run_busy_qt
 from flim_phasors.canvas.image import ImageCanvas
 from flim_phasors.canvas.phasor import PhasorCanvas
+from flim_phasors.gui.enhancements import EnhancementsMixin
+from flim_phasors.gui.processing import (
+    apply_processing_settings_to_ui,
+    capture_processing_from_ui,
+    filter_label_for_dataset,
+    per_sample_processing,
+    processing_params_for_dataset,
+    run_processing_on_dataset,
+)
+from flim_phasors.memory_est import format_memory_line
 from flim_phasors.utils import (
     categorical_name,
     categorical_rgb,
@@ -38,17 +52,20 @@ from phasorpy.cursor import mask_from_circular_cursor, mask_from_elliptic_cursor
 from phasorpy.lifetime import phasor_to_apparent_lifetime, phasor_to_normal_lifetime
 
 
-class MainWindow(QtWidgets.QMainWindow):
+class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FLIM Phasor Analyzer — CAM segmentation")
+        self.setWindowTitle(f"FLIM Phasor Analyzer v{__version__}")
         self.resize(1500, 980)
+        self._settings = QtCore.QSettings("FLIMPhasors", "FLIMPhasorAnalyzer")
         self.data = PhasorData()
         self.datasets = []        # multi-image mode: list of PhasorData
+        self._loading_proc_ui = False
         self.active_idx = -1
         self.shared_ref_path = ""
         self.shared_ref_n_channels = 1
         self.shared_ref_channel = 0
+        self.ref_calibration = ReferenceCalibration()
         self.last_overlay = None
         self.cluster_stats = []
         self.mode = "cursor"
@@ -58,6 +75,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._paint_timer.setInterval(250)   # ms after interaction stops -> full recompute
         self._paint_timer.timeout.connect(self._deferred_full_compute)
         self._build_ui()
+        self._init_enhancements()
         QtGui.QShortcut(QtGui.QKeySequence(Qt.Key.Key_Delete), self, self.remove_cursor)
         QtGui.QShortcut(QtGui.QKeySequence(Qt.Key.Key_Backspace), self, self.remove_cursor)
 
@@ -95,8 +113,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "Load one or more FLIM files (.ptu, .tif). "
             "In the file dialog, Ctrl+click or Shift+click to select multiple.")
         btn_sample.clicked.connect(self.choose_sample)
-        # btn_demo = QtWidgets.QPushButton("Demo")
-        # btn_demo.clicked.connect(self.load_demo)
         self.cb_channel = QtWidgets.QComboBox()
         self.cb_channel.addItem("0")
         self.cb_channel.setMinimumWidth(48)
@@ -106,7 +122,6 @@ class MainWindow(QtWidgets.QMainWindow):
         ch_lbl.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
         row_s.addWidget(ch_lbl)
         row_s.addWidget(self.cb_channel)
-        # row_s.addWidget(btn_demo)
         sl.addLayout(row_s)
         self.lbl_sample = QtWidgets.QLabel("(no sample)")
         self.lbl_sample.setStyleSheet(_lbl_file)
@@ -118,7 +133,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_shared_ref = QtWidgets.QCheckBox("Shared ref")
         self.chk_shared_ref.setChecked(True)
         self.chk_shared_ref.setToolTip(
-            "One reference calibrates all samples when checked.")
+            "One reference measurement calibrates all samples (only phasor maps are kept in memory).")
         self.chk_shared_ref.toggled.connect(self.on_shared_ref_toggle)
         rl.addWidget(self.chk_shared_ref)
         row_r = QtWidgets.QHBoxLayout(); row_r.setSpacing(4)
@@ -155,9 +170,27 @@ class MainWindow(QtWidgets.QMainWindow):
         io_main.addWidget(self.txt_log)
         pl.addWidget(gb_io)
 
-        # ---- calibration ----
-        gb_proc = QtWidgets.QGroupBox("2 · Calibration")
-        prg = QtWidgets.QGridLayout(gb_proc)
+        # ---- samples & processing ----
+        self.gb_proc = QtWidgets.QGroupBox("2 · Samples & processing")
+        proc_vl = QtWidgets.QVBoxLayout(self.gb_proc)
+        self._proc_active_row = QtWidgets.QWidget()
+        proc_active_l = QtWidgets.QHBoxLayout(self._proc_active_row)
+        proc_active_l.setContentsMargins(0, 0, 0, 0)
+        proc_active_l.addWidget(QtWidgets.QLabel("Active sample"))
+        self.cb_sample = QtWidgets.QComboBox()
+        self.cb_sample.setToolTip(
+            "Sample shown in the plots and used for Calibrate / Apply below.")
+        self.cb_sample.currentIndexChanged.connect(self._on_sample_combo_change)
+        proc_active_l.addWidget(self.cb_sample, 1)
+        self.lbl_proc_active = QtWidgets.QLabel("")
+        self.lbl_proc_active.setStyleSheet(_lbl_file)
+        self.lbl_proc_active.setWordWrap(True)
+        proc_active_l.addWidget(self.lbl_proc_active, 1)
+        self._proc_active_row.setVisible(False)
+        proc_vl.addWidget(self._proc_active_row)
+        self.proc_inner = QtWidgets.QWidget()
+        prg = QtWidgets.QGridLayout(self.proc_inner)
+        self.proc_grid = prg
         prg.setHorizontalSpacing(6)
         prg.setVerticalSpacing(3)
         self.sp_harm = QtWidgets.QSpinBox(); self.sp_harm.setRange(1, 8); self.sp_harm.setValue(1)
@@ -192,11 +225,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_photon_range = QtWidgets.QLabel("(apply for photon range)")
         self.lbl_photon_range.setStyleSheet(_lbl_file)
 
-        for sp in (self.sp_harm, self.sp_msize, self.sp_mrep, self.sp_plevels, self.sp_thr):
-            sp.setMaximumWidth(72)
-        for sp in (self.sp_freq, self.sp_reflt, self.sp_psigma):
-            sp.setMaximumWidth(96)
-
         prg.addWidget(QtWidgets.QLabel("Harm."), 0, 0)
         prg.addWidget(self.sp_harm, 0, 1)
         prg.addWidget(QtWidgets.QLabel("Laser"), 0, 2)
@@ -222,86 +250,191 @@ class MainWindow(QtWidgets.QMainWindow):
         prg.addWidget(QtWidgets.QLabel("Min N"), 4, 0)
         prg.addWidget(self.sp_thr, 4, 1)
         prg.addWidget(self.chk_detect_harm, 4, 2, 1, 2)
-        prg.addWidget(self.lbl_photon_range, 5, 0, 1, 4)
-        btn_apply = QtWidgets.QPushButton("Apply"); btn_apply.clicked.connect(self.apply_processing)
-        prg.addWidget(btn_apply, 6, 0, 1, 4)
-        pl.addWidget(gb_proc)
+        prg.addWidget(QtWidgets.QLabel("Frame"), 5, 0)
+        self.sp_frame = QtWidgets.QSpinBox()
+        self.sp_frame.setRange(-1, 0)
+        self.sp_frame.setValue(-1)
+        self.sp_frame.setSpecialValueText("all")
+        self.sp_frame.setToolTip(
+            "Time index for stacks with a T dimension (-1 = sum all frames). Reloads the active sample.")
+        self.sp_frame.valueChanged.connect(self.on_frame_change)
+        prg.addWidget(self.sp_frame, 5, 1)
+        for sp in (
+            self.sp_harm, self.sp_msize, self.sp_mrep, self.sp_plevels,
+            self.sp_thr, self.sp_frame,
+        ):
+            self._spin_for_typing(sp, min_width=76)
+        for sp in (self.sp_freq, self.sp_reflt, self.sp_psigma):
+            self._spin_for_typing(sp, min_width=88)
+        self.sp_thr.setMinimumWidth(96)
+        prg.addWidget(self.lbl_photon_range, 6, 0, 1, 4)
+        prg.addWidget(QtWidgets.QLabel("Ref g"), 7, 0)
+        self.edit_ref_g = QtWidgets.QLineEdit("0")
+        self.edit_ref_g.setValidator(QtGui.QDoubleValidator(-0.05, 1.05, 5, self))
+        self.edit_ref_g.setFixedWidth(56)
+        prg.addWidget(self.edit_ref_g, 7, 1)
+        prg.addWidget(QtWidgets.QLabel("s"), 7, 2)
+        self.edit_ref_s = QtWidgets.QLineEdit("0")
+        self.edit_ref_s.setValidator(QtGui.QDoubleValidator(-0.05, 1.05, 5, self))
+        self.edit_ref_s.setFixedWidth(56)
+        prg.addWidget(self.edit_ref_s, 7, 3)
+        self.chk_manual_cal = QtWidgets.QCheckBox("Manual ref phasor")
+        self.chk_manual_cal.setToolTip(
+            "Type g/s above, click Set g/s, then Apply on samples.")
+        self.chk_manual_cal.toggled.connect(self._on_manual_cal_toggled)
+        prg.addWidget(self.chk_manual_cal, 8, 0, 1, 2)
+        self.btn_set_manual_gs = QtWidgets.QPushButton("Set g/s")
+        self.btn_set_manual_gs.setFixedWidth(56)
+        self.btn_set_manual_gs.setToolTip(
+            "Apply the manual g and s values to calibration (updates ref preview). "
+            "Then click Apply to preprocess samples.")
+        self.btn_set_manual_gs.clicked.connect(self.apply_manual_gs)
+        self.btn_set_manual_gs.setEnabled(False)
+        prg.addWidget(self.btn_set_manual_gs, 8, 2)
+        btn_clear_cal = QtWidgets.QPushButton("Clear cal")
+        btn_clear_cal.setFixedWidth(64)
+        btn_clear_cal.clicked.connect(self._clear_calibration)
+        prg.addWidget(btn_clear_cal, 8, 3)
+        self.lbl_cal_display = QtWidgets.QLabel("(uncalibrated — load a reference file)")
+        self.lbl_cal_display.setStyleSheet(_lbl_file)
+        self.lbl_cal_display.setWordWrap(True)
+        prg.addWidget(self.lbl_cal_display, 9, 0, 1, 4)
+        self.edit_ref_g.setEnabled(False)
+        self.edit_ref_s.setEnabled(False)
+        row_cal_apply = QtWidgets.QHBoxLayout()
+        self.btn_calibrate = QtWidgets.QPushButton("Calibrate")
+        self.btn_calibrate.setToolTip(
+            "Compute reference g/s from the file chosen under Reference (no sample processing).")
+        self.btn_calibrate.clicked.connect(self.calibrate_reference)
+        self.btn_apply = QtWidgets.QPushButton("Apply")
+        self.btn_apply.clicked.connect(lambda: self.apply_processing(scope="active"))
+        row_cal_apply.addWidget(self.btn_calibrate)
+        row_cal_apply.addWidget(self.btn_apply, 1)
+        prg.addLayout(row_cal_apply, 10, 0, 1, 4)
+        self.sp_harm.valueChanged.connect(self._on_harm_or_ref_setting_changed)
+        proc_vl.addWidget(self.proc_inner)
+        pl.addWidget(self.gb_proc)
         self.on_filter_change("median")
+        self._connect_per_sample_proc_autosave()
+        self._table_sel_lock = False
 
-        # ---- multi-sample overlay ----
-        gb_multi = QtWidgets.QGroupBox("3 · Multi-sample")
+        # ---- multi-image (sample list + overlay) ----
+        gb_multi = QtWidgets.QGroupBox("3 · Multi-image")
         mbl = QtWidgets.QVBoxLayout(gb_multi)
         mbl.setSpacing(3)
-        self.chk_multi = QtWidgets.QCheckBox("Multi-image")
+        self.chk_multi = QtWidgets.QCheckBox("Multi-image mode")
+        self.chk_multi.setToolTip(
+            "Load and compare several samples. Use the table below to switch images.")
         self.chk_multi.toggled.connect(self.on_multi_toggle)
         mbl.addWidget(self.chk_multi)
-        row_img = QtWidgets.QHBoxLayout()
-        self.cb_image = QtWidgets.QComboBox()
-        self.cb_image.setToolTip("Active sample for segmentation")
-        self.cb_image.currentIndexChanged.connect(self.on_image_combo_change)
-        btn_rmimg = QtWidgets.QPushButton("−"); btn_rmimg.setFixedWidth(28)
-        btn_rmimg.setToolTip("Remove active sample from list")
-        btn_rmimg.clicked.connect(self.remove_image)
-        row_img.addWidget(self.cb_image, 1); row_img.addWidget(btn_rmimg)
-        mbl.addLayout(row_img)
+        self._multi_strip = QtWidgets.QWidget()
+        multi_l = QtWidgets.QVBoxLayout(self._multi_strip)
+        multi_l.setContentsMargins(0, 0, 0, 0)
+        row_tbl = QtWidgets.QHBoxLayout()
+        self.table_compare = QtWidgets.QTableWidget(0, 8)
+        self.table_compare.setHorizontalHeaderLabels(
+            ["Show", "#", "Sample", "Group", "Filter", "Min N", "Ref", "Status"])
+        self.table_compare.verticalHeader().setVisible(False)
+        self.table_compare.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table_compare.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.table_compare.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
+            | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed)
+        self.table_compare.setMinimumHeight(96)
+        self.table_compare.setMaximumHeight(140)
+        self.table_compare.setToolTip(
+            "Click a row to activate that sample. Double-click Group to rename. "
+            "Tick Show for phasor overlay.")
+        hdr = self.table_compare.horizontalHeader()
+        hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(7, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.table_compare.cellChanged.connect(self._on_compare_table_changed)
+        self.table_compare.itemSelectionChanged.connect(self._on_sample_table_selection)
+        self.btn_rmimg = QtWidgets.QPushButton("−")
+        self.btn_rmimg.setFixedWidth(28)
+        self.btn_rmimg.setToolTip("Remove selected sample")
+        self.btn_rmimg.clicked.connect(self.remove_image)
+        row_tbl.addWidget(self.table_compare, 1)
+        row_tbl.addWidget(self.btn_rmimg)
+        multi_l.addLayout(row_tbl)
+        self.lbl_editing = QtWidgets.QLabel("Active: —")
+        self.lbl_editing.setStyleSheet(_lbl_file)
+        self.lbl_editing.setWordWrap(True)
+        multi_l.addWidget(self.lbl_editing)
+        row_apply_all = QtWidgets.QHBoxLayout()
+        self.btn_apply_settings_all = QtWidgets.QPushButton("Apply settings to all")
+        self.btn_apply_settings_all.setToolTip(
+            "Copy the current filter settings from section 2 to every sample, "
+            "then preprocess all.")
+        self.btn_apply_settings_all.clicked.connect(self.apply_settings_to_all)
+        row_apply_all.addWidget(self.btn_apply_settings_all, 1)
+        multi_l.addLayout(row_apply_all)
+        self._multi_strip.setVisible(False)
+        mbl.addWidget(self._multi_strip)
         row_grp = QtWidgets.QHBoxLayout()
         row_grp.addWidget(QtWidgets.QLabel("Group"))
         self.edit_group = QtWidgets.QLineEdit()
-        self.edit_group.setPlaceholderText("e.g. Tumor, Control")
+        self.edit_group.setPlaceholderText("e.g. condition A")
         self.edit_group.setToolTip(
-            "Label for the active sample. Shown in the list and phasor overlay legend.")
+            "Label for the active sample (overlay legend and table).")
         self.edit_group.editingFinished.connect(self._apply_group_from_field)
-        btn_grp = QtWidgets.QPushButton("Apply")
-        btn_grp.setFixedWidth(52)
+        btn_grp = QtWidgets.QPushButton("Set")
+        btn_grp.setFixedWidth(40)
         btn_grp.clicked.connect(self._apply_group_from_field)
         row_grp.addWidget(self.edit_group, 1)
         row_grp.addWidget(btn_grp)
         mbl.addLayout(row_grp)
-        self.chk_compare = QtWidgets.QCheckBox("Phasor overlay")
+        self.chk_compare = QtWidgets.QCheckBox("Multi-image phasor view")
+        self.chk_compare.setToolTip(
+            "Overlay preprocessed samples on the phasor plot. "
+            "Turned on automatically in multi-image mode.")
         self.chk_compare.toggled.connect(self._on_compare_ui_changed)
         mbl.addWidget(self.chk_compare)
         row_cmp = QtWidgets.QHBoxLayout()
         self.cb_compare_style = QtWidgets.QComboBox()
         self.cb_compare_style.addItems(list(COMPARE_STYLE_MAP.keys()))
         self.cb_compare_style.currentIndexChanged.connect(self._on_compare_ui_changed)
-        btn_cmp_all = QtWidgets.QPushButton("All"); btn_cmp_all.setFixedWidth(32)
+        btn_cmp_all = QtWidgets.QPushButton("All")
+        btn_cmp_all.setFixedWidth(32)
+        btn_cmp_all.setToolTip("Show every preprocessed sample on the phasor plot.")
         btn_cmp_all.clicked.connect(self._compare_select_all)
-        btn_cmp_none = QtWidgets.QPushButton("None"); btn_cmp_none.setFixedWidth(36)
+        btn_cmp_none = QtWidgets.QPushButton("None")
+        btn_cmp_none.setFixedWidth(36)
         btn_cmp_none.clicked.connect(self._compare_select_none)
         row_cmp.addWidget(self.cb_compare_style, 1)
         row_cmp.addWidget(btn_cmp_all)
         row_cmp.addWidget(btn_cmp_none)
         mbl.addLayout(row_cmp)
-        self.table_compare = QtWidgets.QTableWidget(0, 5)
-        self.table_compare.setHorizontalHeaderLabels(["Show", "#", "Group", "Sample", "Status"])
-        self.table_compare.verticalHeader().setVisible(False)
-        self.table_compare.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table_compare.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
-        self.table_compare.setEditTriggers(
-            QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
-            | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed)
-        self.table_compare.setMinimumHeight(96)
-        self.table_compare.setMaximumHeight(130)
-        self.table_compare.setToolTip(
-            "Group: name samples (e.g. condition). Tick Show to include on the multi-phasor plot.")
-        hdr = self.table_compare.horizontalHeader()
-        hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.table_compare.cellChanged.connect(self._on_compare_table_changed)
-        mbl.addWidget(self.table_compare, 1)
+        row_grp_filt = QtWidgets.QHBoxLayout()
+        row_grp_filt.addWidget(QtWidgets.QLabel("Overlay group"))
+        self.cb_compare_group = QtWidgets.QComboBox()
+        self.cb_compare_group.addItem("All groups")
+        self.cb_compare_group.setToolTip("Limit phasor overlay to one group name.")
+        self.cb_compare_group.currentIndexChanged.connect(self._on_compare_ui_changed)
+        row_grp_filt.addWidget(self.cb_compare_group, 1)
+        mbl.addLayout(row_grp_filt)
         self._compare_sel_buttons = (btn_cmp_all, btn_cmp_none)
         self._multi_detail_widgets = (
-            self.cb_image, btn_rmimg, self.edit_group, btn_grp,
-            self.chk_compare, self.cb_compare_style,
-            self.table_compare, btn_cmp_all, btn_cmp_none,
+            self._proc_active_row, self.cb_sample,
+            self._multi_strip, self.table_compare, self.btn_rmimg,
+            self.lbl_editing, self.btn_apply_settings_all,
+            self.edit_group, btn_grp,
+            self.chk_compare, self.cb_compare_style, self.cb_compare_group,
+            btn_cmp_all, btn_cmp_none,
         )
         self._set_multi_detail_enabled(False)
         self._set_compare_controls_enabled(False)
         pl.addWidget(gb_multi)
         self.gb_multi = gb_multi
+        self._update_apply_buttons()
 
         # ---- mode ----
         gb_mode = QtWidgets.QGroupBox("4 · Segmentation")
@@ -377,8 +510,8 @@ class MainWindow(QtWidgets.QMainWindow):
         pl.addWidget(gb_mode)
 
         # ---- actions ----
-        gb_act = QtWidgets.QGroupBox("5 · Export")
-        al = QtWidgets.QVBoxLayout(gb_act)
+        self.gb_act = QtWidgets.QGroupBox("5 · Results")
+        al = QtWidgets.QVBoxLayout(self.gb_act)
         al.setSpacing(3)
         row_paint = QtWidgets.QHBoxLayout()
         b_paint = QtWidgets.QPushButton("Paint"); b_paint.clicked.connect(self.compute_and_paint)
@@ -387,15 +520,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_overlay.stateChanged.connect(self.refresh_image)
         row_paint.addWidget(b_paint, 1); row_paint.addWidget(self.chk_live); row_paint.addWidget(self.chk_overlay)
         al.addLayout(row_paint)
-        row = QtWidgets.QHBoxLayout()
-        b1 = QtWidgets.QPushButton("PNG seg"); b1.clicked.connect(self.save_overlay)
-        b2 = QtWidgets.QPushButton("PNG phasor"); b2.clicked.connect(self.save_phasor)
-        row.addWidget(b1); row.addWidget(b2); al.addLayout(row)
-        rowx = QtWidgets.QHBoxLayout()
-        b3 = QtWidgets.QPushButton("CSV"); b3.clicked.connect(self.export_csv)
-        b4 = QtWidgets.QPushButton("Excel"); b4.clicked.connect(self.export_xlsx)
-        rowx.addWidget(b3); rowx.addWidget(b4); al.addLayout(rowx)
-        pl.addWidget(gb_act)
+        btn_export = QtWidgets.QPushButton("Export all…")
+        btn_export.setToolTip(
+            "Save a folder with phasor plot, maps for every sample, tables, session JSON, and Excel (if openpyxl).")
+        btn_export.clicked.connect(self.export_all)
+        al.addWidget(btn_export)
+        pl.addWidget(self.gb_act)
         panel_scroll.setWidget(panel_inner)
         panel_wrap = QtWidgets.QWidget()
         panel_wrap.setFixedWidth(420)
@@ -442,7 +572,8 @@ class MainWindow(QtWidgets.QMainWindow):
         main.addWidget(panel_wrap)
 
         self.status = self.statusBar()
-        self._log("Ready — load a sample and optional reference.")
+        self._log(
+            "Ready — load sample(s), choose Reference, Calibrate, then Apply to preprocess.")
 
     def _log(self, message, update_status=True):
         """Append a timestamped line to the Files log and optionally the status bar."""
@@ -462,20 +593,24 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow(lbl, widget)
         return (lbl, widget)
 
-    def _run_busy(self, message: str, fn):
-        """Run a blocking call with a modal progress dialog; return (result, seconds)."""
-        self._log(message, update_status=False)
-        dlg = QtWidgets.QProgressDialog(message, None, 0, 0, self)
-        dlg.setWindowModality(Qt.WindowModality.WindowModal)
-        dlg.setMinimumDuration(0)
-        dlg.setCancelButton(None)
-        dlg.show()
-        QtWidgets.QApplication.processEvents()
-        t0 = time.perf_counter()
+    def _run_busy(self, message: str, fn, *, cancellable: bool = True):
+        """Run heavy work off the GUI thread; optional Cancel."""
         try:
-            return fn(), time.perf_counter() - t0
-        finally:
-            dlg.close()
+            return run_busy_qt(
+                self, message, fn,
+                log_fn=lambda m: self._log(m, update_status=False),
+                cancellable=cancellable,
+            )
+        except CancelledError:
+            self._log("Cancelled.")
+            raise
+
+    @staticmethod
+    def _spin_for_typing(sp, *, min_width: int = 76):
+        """Hide stepper arrows so typed values are fully visible."""
+        sp.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        sp.setMinimumWidth(min_width)
+        sp.setMaximumWidth(16777215)
 
     @staticmethod
     def _fmt_elapsed(seconds: float) -> str:
@@ -492,6 +627,121 @@ class MainWindow(QtWidgets.QMainWindow):
         for w in self.row_psigma:
             w.setVisible(is_paw)
 
+    def _connect_per_sample_proc_autosave(self):
+        for w in (
+            self.sp_harm, self.sp_freq, self.sp_reflt, self.sp_msize, self.sp_mrep,
+            self.sp_psigma, self.sp_plevels, self.sp_thr,
+        ):
+            w.valueChanged.connect(self._on_per_sample_proc_changed)
+        self.cb_filter.currentTextChanged.connect(self._on_per_sample_proc_changed)
+        self.chk_detect_harm.toggled.connect(self._on_per_sample_proc_changed)
+        self.cb_channel.currentIndexChanged.connect(self._on_per_sample_proc_changed)
+
+    def _on_per_sample_proc_changed(self, *_args):
+        if self._loading_proc_ui or not per_sample_processing(self):
+            return
+        self._save_proc_from_ui(self.data)
+        self._refresh_compare_list()
+
+    def _init_dataset_proc_settings(self, d: PhasorData):
+        if d.processing_settings is None:
+            d.processing_settings = capture_processing_from_ui(self)
+
+    def _save_proc_from_ui(self, d: PhasorData):
+        if d is None:
+            return
+        if per_sample_processing(self):
+            d.processing_settings = capture_processing_from_ui(self)
+
+    def _load_proc_to_ui(self, d: PhasorData):
+        if not per_sample_processing(self):
+            return
+        stash = getattr(d, "processing_settings", None)
+        if not stash:
+            self._init_dataset_proc_settings(d)
+            stash = d.processing_settings
+        self._loading_proc_ui = True
+        try:
+            apply_processing_settings_to_ui(self, stash)
+        finally:
+            self._loading_proc_ui = False
+
+    def _update_multi_strip(self):
+        multi_on = hasattr(self, "chk_multi") and self.chk_multi.isChecked()
+        show_strip = multi_on and len(self.datasets) > 1
+        show_active = multi_on and len(self.datasets) >= 1
+        if hasattr(self, "_multi_strip"):
+            self._multi_strip.setVisible(show_strip)
+        if hasattr(self, "_proc_active_row"):
+            self._proc_active_row.setVisible(show_active)
+            if hasattr(self, "lbl_proc_active"):
+                self.lbl_proc_active.setVisible(not show_active)
+        if hasattr(self, "lbl_editing"):
+            if show_strip and 0 <= self.active_idx < len(self.datasets):
+                self.lbl_editing.setText(
+                    f"Active: {dataset_display_label(self.data, self.active_idx)}")
+            elif multi_on:
+                self.lbl_editing.setText("Load another sample to compare.")
+            else:
+                self.lbl_editing.setText("")
+        self._update_proc_active_label()
+
+    def _refresh_sample_combo(self):
+        if not hasattr(self, "cb_sample"):
+            return
+        cb = self.cb_sample
+        cb.blockSignals(True)
+        cb.clear()
+        for i, d in enumerate(self.datasets):
+            cb.addItem(dataset_display_label(d, i))
+        if 0 <= self.active_idx < len(self.datasets):
+            cb.setCurrentIndex(self.active_idx)
+        cb.blockSignals(False)
+        self._update_multi_strip()
+
+    def _on_sample_combo_change(self, idx: int):
+        self._on_sample_picker_change(idx)
+
+    def _on_sample_picker_change(self, idx: int):
+        if self._table_sel_lock or not (0 <= idx < len(self.datasets)):
+            return
+        if idx == self.active_idx:
+            return
+        self._activate_dataset(idx)
+
+    def _sync_sample_table_selection(self):
+        if not hasattr(self, "table_compare"):
+            return
+        self._table_sel_lock = True
+        self.table_compare.blockSignals(True)
+        if hasattr(self, "cb_sample"):
+            self.cb_sample.blockSignals(True)
+        if 0 <= self.active_idx < self.table_compare.rowCount():
+            self.table_compare.selectRow(self.active_idx)
+            self.table_compare.scrollToItem(
+                self.table_compare.item(self.active_idx, 0),
+                QtWidgets.QAbstractItemView.ScrollHint.PositionAtCenter)
+        if hasattr(self, "cb_sample") and 0 <= self.active_idx < self.cb_sample.count():
+            self.cb_sample.setCurrentIndex(self.active_idx)
+        if hasattr(self, "cb_sample"):
+            self.cb_sample.blockSignals(False)
+        self.table_compare.blockSignals(False)
+        self._table_sel_lock = False
+        self._update_multi_strip()
+
+    def _update_apply_buttons(self):
+        if not hasattr(self, "chk_multi"):
+            return
+        multi = len(self.datasets) > 1
+        if multi:
+            self.btn_apply.setText("Apply selected")
+            self.btn_apply.setToolTip(
+                "Preprocess the active sample with the settings in section 2.")
+        else:
+            self.btn_apply.setText("Apply")
+            self.btn_apply.setToolTip(
+                "Preprocess the loaded sample: phasor maps, filters, and calibration if set.")
+
     # ---- mode switching ----------------------------------------------------
     def on_mode_change(self):
         self.mode = "cursor" if self.rb_cursor.isChecked() else "gmm"
@@ -506,9 +756,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self._fill_table()
 
     # ---- file actions ------------------------------------------------------
+    def _dialog_dir(self, key: str, fallback: str = "") -> str:
+        return self._settings.value(key, fallback) or ""
+
     def choose_sample(self):
+        start = self._dialog_dir("sample_dir")
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            self, "Choose sample FLIM file(s)", "", FLIM_FILE_FILTER)
+            self, "Choose sample FLIM file(s)", start, FLIM_FILE_FILTER)
+        if paths:
+            self._settings.setValue("sample_dir", os.path.dirname(paths[0]))
+            for p in paths[:5]:
+                if hasattr(self, "_remember_recent"):
+                    self._remember_recent("recent_samples", p)
         if not paths:
             return
         supported = []
@@ -533,7 +792,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _prepare_sample_load(self, paths):
         """Confirm how new paths merge with the current session. Returns False if cancelled."""
-        has_current = self.data.signal_full is not None or self.data.is_synthetic
+        has_current = self.data.signal_full is not None
         batch = len(paths) > 1
 
         if batch:
@@ -585,19 +844,24 @@ class MainWindow(QtWidgets.QMainWindow):
         return True
 
     def _load_sample_paths(self, paths):
-        """Decode one or more FLIM files and run phasor processing."""
+        """Decode FLIM files into memory (no phasor preprocessing until Apply)."""
         n = len(paths)
         loaded = []
         t_decode = 0.0
+        frame = int(self.sp_frame.value()) if hasattr(self, "sp_frame") else -1
         for i, path in enumerate(paths):
             d = PhasorData()
             try:
                 (shape, nch), elapsed = self._run_busy(
                     f"Decoding {i + 1}/{n}: {os.path.basename(path)}…",
-                    lambda p=path, ds=d: ds.load_sample(p),
+                    lambda p=path, ds=d, fr=frame: ds.load_sample(p, frame=fr),
                 )
                 t_decode += elapsed
                 loaded.append((d, path, shape, nch))
+            except CancelledError:
+                if not loaded:
+                    return
+                break
             except Exception as e:
                 self._log(f"Load error ({os.path.basename(path)}): {e}")
                 QtWidgets.QMessageBox.critical(
@@ -610,32 +874,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self._activate_new_dataset(d)
             self._log(
                 f"Loaded {os.path.basename(path)} — {shape[1]}×{shape[0]}, {nch} ch, "
-                f"{d.frequency:.2f} MHz")
+                f"{d.frequency:.2f} MHz · {format_memory_line(d)}")
 
-        if self.chk_multi.isChecked() and self.datasets:
-            t0 = time.perf_counter()
-            for d in self.datasets:
-                if d.signal_full is not None:
-                    self._run_processing_on_dataset(d, use_ui_settings=False)
-            if 0 <= self.active_idx < len(self.datasets):
-                self.data = self.datasets[self.active_idx]
-            self._restore_ui_for_active()
-            self._refresh_compare_list()
-            self._update_phasor_display()
-            self.chk_overlay.blockSignals(True)
-            self.chk_overlay.setChecked(False)
-            self.chk_overlay.blockSignals(False)
-            self.refresh_image()
-            t_proc = time.perf_counter() - t0
-            self._log(
-                f"{len(loaded)} sample(s) ready — decode {self._fmt_elapsed(t_decode)}, "
-                f"phasor {self._fmt_elapsed(t_proc)} (multi-image).")
+        self._restore_ui_for_active()
+        self._refresh_compare_list()
+        if self.chk_multi.isChecked() and len(self.datasets) >= 2:
+            self._start_multi_phasor_view(select_all=False)
         else:
-            _, t_proc = self._run_busy("Computing phasor…", self.apply_processing)
-            d, path, shape, nch = loaded[-1]
-            self._log(
-                f"Loaded {os.path.basename(path)} — decode {self._fmt_elapsed(t_decode)}, "
-                f"phasor {self._fmt_elapsed(t_proc)}")
+            self._update_phasor_display()
+        self.refresh_image()
+        self._log(
+            f"{len(loaded)} sample(s) decoded ({self._fmt_elapsed(t_decode)}) — "
+            "choose Reference, Calibrate, then Apply.")
 
     def _effective_ref_path(self, d=None):
         d = d or self.data
@@ -663,8 +913,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_shared_ref_toggle(self, checked):
         if checked and self.shared_ref_path:
             self._propagate_shared_reference()
-            if any(d.signal_full is not None or d.is_synthetic for d in self._all_datasets()):
-                self._recompute_all_datasets()
         self._restore_ui_for_active()
         self._log(
             "Shared reference on — one reference file calibrates all samples."
@@ -678,9 +926,148 @@ class MainWindow(QtWidgets.QMainWindow):
                 seen.append(d)
         return seen
 
+    def _reference_harmonic_for_cal(self):
+        h = int(self.sp_harm.value())
+        if self.cb_filter.currentText() == "pawflim":
+            return [h, 2 * h]
+        return h
+
+    def _effective_ref_file_path(self):
+        if self.chk_shared_ref.isChecked() and self.shared_ref_path:
+            return self.shared_ref_path
+        return self.data.ref_path or ""
+
+    def _recompute_reference_calibration(self):
+        """Decode reference once, store phasor maps only (histogram is released)."""
+        path = self._effective_ref_file_path()
+        if not path:
+            return False
+        ch = self._ref_channel_for_dataset(self.data)
+        harm = self._reference_harmonic_for_cal()
+
+        def work():
+            return compute_reference_phasor(path, ch, harm)
+
+        try:
+            cal, elapsed = self._run_busy(
+                f"Reference phasor ({os.path.basename(path)})…", work)
+        except Exception as e:
+            self._log(f"Reference calibration error: {e}")
+            QtWidgets.QMessageBox.critical(self, "Reference error", str(e))
+            return False
+        self.ref_calibration = cal
+        self.ref_calibration.use_manual = self.chk_manual_cal.isChecked()
+        if self.chk_manual_cal.isChecked():
+            self._apply_manual_calibration_fields()
+        else:
+            self._sync_manual_fields_from_calibration()
+        self._update_calibration_display()
+        self._update_ref_preview()
+        self._mark_calibration_current()
+        self._log(
+            f"Reference calibration stored (g={cal.mean_g:.4f}, s={cal.mean_s:.4f}) "
+            f"— maps only in RAM, not raw file ({self._fmt_elapsed(elapsed)}).")
+        return True
+
+    def _sync_manual_fields_from_calibration(self):
+        self.edit_ref_g.blockSignals(True)
+        self.edit_ref_s.blockSignals(True)
+        self.edit_ref_g.setText(f"{self.ref_calibration.mean_g:.5f}")
+        self.edit_ref_s.setText(f"{self.ref_calibration.mean_s:.5f}")
+        self.edit_ref_g.blockSignals(False)
+        self.edit_ref_s.blockSignals(False)
+
+    def _apply_manual_calibration_fields(self):
+        try:
+            self.ref_calibration.manual_g = float(self.edit_ref_g.text().strip())
+            self.ref_calibration.manual_s = float(self.edit_ref_s.text().strip())
+        except ValueError:
+            return
+        self.ref_calibration.use_manual = True
+        self.ref_calibration.mean_g = self.ref_calibration.manual_g
+        self.ref_calibration.mean_s = self.ref_calibration.manual_s
+
+    def _update_calibration_display(self):
+        cal = self.ref_calibration
+        if not cal.is_active:
+            self.lbl_cal_display.setText("(uncalibrated — load a reference file)")
+            return
+        src = "manual g,s" if cal.use_manual else os.path.basename(cal.source_path or "")
+        self.lbl_cal_display.setText(
+            f"{src}  |  g={cal.mean_g:.4f}, s={cal.mean_s:.4f}  |  "
+            f"τ_ref={self.sp_reflt.value():.2f} ns  |  ch {cal.channel}")
+
+    def _on_manual_cal_toggled(self, checked):
+        self.edit_ref_g.setEnabled(checked)
+        self.edit_ref_s.setEnabled(checked)
+        self.btn_set_manual_gs.setEnabled(checked)
+        self.ref_calibration.use_manual = checked
+        if checked:
+            self._sync_manual_fields_from_calibration()
+        elif self.ref_calibration.source_path:
+            self._recompute_reference_calibration()
+        self._update_calibration_display()
+        self._update_ref_preview()
+
+    def apply_manual_gs(self):
+        """Apply typed g/s to calibration (does not preprocess samples)."""
+        if not self.chk_manual_cal.isChecked():
+            QtWidgets.QMessageBox.information(
+                self, "Manual calibration", "Enable Manual ref phasor first.")
+            return
+        try:
+            g = float(self.edit_ref_g.text().strip())
+            s = float(self.edit_ref_s.text().strip())
+        except ValueError:
+            QtWidgets.QMessageBox.warning(
+                self, "Manual calibration", "Enter valid numeric g and s values.")
+            return
+        if not (-0.05 <= g <= 1.05 and -0.05 <= s <= 1.05):
+            QtWidgets.QMessageBox.warning(
+                self, "Manual calibration",
+                "g and s should be on the phasor semicircle (roughly g: 0–1, s: 0–0.7).")
+            return
+        self.ref_calibration.use_manual = True
+        self.ref_calibration.manual_g = g
+        self.ref_calibration.manual_s = s
+        self.ref_calibration.mean_g = g
+        self.ref_calibration.mean_s = s
+        self._update_calibration_display()
+        self._update_ref_preview()
+        self._mark_calibration_current()
+        self._log(
+            f"Manual g/s set — g={g:.4f}, s={s:.4f}. "
+            "Click Apply to preprocess sample(s) with this calibration.")
+
+    def _on_harm_or_ref_setting_changed(self, *_args):
+        """Harmonic affects calibration — user must click Apply (avoids reloading huge refs)."""
+        if self.ref_calibration.is_active:
+            self._update_calibration_display()
+            self._update_calibration_stale_style()
+
+    def _clear_calibration(self):
+        self.ref_calibration.clear()
+        clear_calibration_cache()
+        self.shared_ref_path = ""
+        self.shared_ref_n_channels = 1
+        self.lbl_ref.setText("(none)")
+        self.chk_manual_cal.setChecked(False)
+        self._sync_manual_fields_from_calibration()
+        self._update_calibration_display()
+        self._update_ref_preview()
+        for d in self._all_datasets():
+            d.ref_path = ""
+        self._log("Calibration cleared.")
+
     def choose_ref(self):
+        """Pick the calibration reference file (decode happens on Calibrate)."""
+        start = self._dialog_dir("reference_dir", self._dialog_dir("sample_dir"))
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Choose reference FLIM file", "", FLIM_FILE_FILTER)
+            self, "Choose calibration reference file", start, FLIM_FILE_FILTER)
+        if path:
+            self._settings.setValue("reference_dir", os.path.dirname(path))
+            if hasattr(self, "_remember_recent"):
+                self._remember_recent("recent_refs", path)
         if not path:
             return
         if not is_supported_flim_path(path):
@@ -689,54 +1076,59 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Use a PicoQuant .ptu or Imspector .tif / .tiff FLIM stack.",
             )
             return
-        try:
-            rsig, t_ref = self._run_busy(
-                f"Decoding reference ({os.path.basename(path)})…",
-                lambda: load_reference_signal(path))
-        except Exception as e:
-            self._log(f"Reference load error: {e}")
-            QtWidgets.QMessageBox.critical(self, "Reference load error", str(e)); return
-        ref_nch = int(rsig.sizes["C"]) if "C" in rsig.dims else 1
+        self._set_reference_path(path)
+
+    def _set_reference_path(self, path: str):
+        """Store reference path only; user runs Calibrate then Apply."""
         self.shared_ref_path = path
+        self.lbl_ref.setText(os.path.basename(path))
+        self.data.ref_path = path
+        self._propagate_shared_reference()
+        self.shared_ref_n_channels = max(1, self.shared_ref_n_channels)
+        self._update_ref_channel_combo()
+        self.lbl_cal_display.setText(
+            f"{os.path.basename(path)} selected — click Calibrate, then Apply on samples.")
+        self._log(f"Reference file selected: {os.path.basename(path)} (not decoded yet).")
+
+    def calibrate_reference(self):
+        """Decode reference and compute g/s (does not preprocess samples)."""
+        path = self._effective_ref_file_path()
+        if not path:
+            start = self._dialog_dir("reference_dir", self._dialog_dir("sample_dir"))
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Choose calibration reference file", start, FLIM_FILE_FILTER)
+            if not path:
+                QtWidgets.QMessageBox.information(
+                    self, "Calibrate",
+                    "Choose a reference file under Reference… or here first.")
+                return
+            if not is_supported_flim_path(path):
+                return
+            self._set_reference_path(path)
+        if self.chk_manual_cal.isChecked():
+            self._apply_manual_calibration_fields()
+            self.ref_calibration.use_manual = True
+            self.ref_calibration.source_path = path or ""
+            self._update_calibration_display()
+            self._update_ref_preview()
+            self._mark_calibration_current()
+            self._log("Manual calibration values applied.")
+            return
+        if not self._recompute_reference_calibration():
+            return
+        ref_nch = max(1, int(self.ref_calibration.n_channels))
         self.shared_ref_n_channels = ref_nch
         self.shared_ref_channel = min(self.shared_ref_channel, ref_nch - 1)
         if self.data.signal_full is not None:
             self.shared_ref_channel = min(self.data.channel, ref_nch - 1)
-        self.lbl_ref.setText(os.path.basename(path))
+        self.data.ref_n_channels = ref_nch
+        self._propagate_shared_reference()
         self._update_ref_channel_combo()
-        if self.chk_shared_ref.isChecked():
-            self._propagate_shared_reference()
-            if any(d.signal_full is not None or d.is_synthetic for d in self._all_datasets()):
-                self._recompute_all_datasets()
-                self._log(
-                    f"Shared reference ch {self.shared_ref_channel} ({self._fmt_elapsed(t_ref)}); "
-                    "all loaded samples recalibrated.")
-            else:
-                self._log(
-                    f"Shared reference — {ref_nch} channel(s) ({self._fmt_elapsed(t_ref)}). "
-                    "Load samples, then Apply.")
-        else:
-            self.data.ref_path = path
-            self.data.ref_n_channels = ref_nch
-            self.data.ref_channel = min(self.data.channel, ref_nch - 1)
-            if self.data.signal_full is not None or self.data.is_synthetic:
-                self.apply_processing()
-            self._log(
-                f"Reference for active sample only, ch {self.data.ref_channel} "
-                f"({self._fmt_elapsed(t_ref)}).")
-
-    # def load_demo(self):
-    #     """Synthetic CAM-like phasor demo (disabled in UI)."""
-    #     d = PhasorData()
-    #     d.load_synthetic()
-    #     self._activate_new_dataset(d)
-    #     self.lbl_ref.setText("(none — already calibrated)")
-    #     if self.cb_filter.currentText() == "pawflim":
-    #         self.cb_filter.setCurrentText("median")
-    #     self.apply_processing()
-    #     self._log(
-    #         "Synthetic CAM-like demo loaded "
-    #         "(background 0.4 ns / collagen 0.25 ns / vessels 2.0 ns).")
+        self._update_ref_preview()
+        self._mark_calibration_current()
+        self._log(
+            f"Calibration ready (g={self.ref_calibration.mean_g:.4f}, "
+            f"s={self.ref_calibration.mean_s:.4f}) — click Apply to preprocess samples.")
 
     # ---- multi-image management -------------------------------------------
     def _activate_new_dataset(self, d):
@@ -748,10 +1140,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.chk_multi.isChecked():
             self.datasets.append(d)
             self.active_idx = len(self.datasets) - 1
+        self._init_dataset_proc_settings(d)
         self.data = d
         self._restore_ui_for_active()
         if self.chk_multi.isChecked():
-            self._refresh_image_combo()
+            self._refresh_compare_list()
 
     @staticmethod
     def _compact_filename(path, fallback="(none)", max_len=30):
@@ -760,9 +1153,23 @@ class MainWindow(QtWidgets.QMainWindow):
             return name[: max_len - 1] + "…"
         return name
 
+    def _update_proc_active_label(self):
+        if not hasattr(self, "lbl_proc_active"):
+            return
+        multi = hasattr(self, "chk_multi") and self.chk_multi.isChecked() and len(self.datasets) > 1
+        if multi:
+            self.lbl_proc_active.setText("")
+            return
+        if self.data.signal_full is not None:
+            self.lbl_proc_active.setText(
+                self._compact_filename(self.data.sample_path, "(no sample)"))
+        else:
+            self.lbl_proc_active.setText("(no sample)")
+
     def _restore_ui_for_active(self):
         d = self.data
-        self.lbl_sample.setText(self._compact_filename(d.sample_path, "<synthetic demo>"))
+        self.lbl_sample.setText(self._compact_filename(d.sample_path, "(no sample)"))
+        self._update_proc_active_label()
         if self.chk_shared_ref.isChecked():
             ref = self.shared_ref_path
         else:
@@ -777,10 +1184,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_ref_channel_combo()
         self.sp_freq.setValue(d.frequency)
         self.sp_harm.setValue(d.harmonic)
+        self._load_proc_to_ui(d)
+        self._update_frame_control()
         if hasattr(self, "edit_group"):
             self.edit_group.blockSignals(True)
             self.edit_group.setText((d.group_name or "").strip())
             self.edit_group.blockSignals(False)
+        self._sync_sample_table_selection()
 
     def _update_ref_channel_combo(self):
         ref_path = self._effective_ref_path(self.data)
@@ -803,37 +1213,73 @@ class MainWindow(QtWidgets.QMainWindow):
         for w in self._multi_detail_widgets:
             w.setEnabled(enabled)
 
-    def _recompute_all_datasets(self):
-        """Re-run phasor pipeline on every loaded sample (e.g. after shared reference change)."""
-        targets = list(self.datasets) if self.chk_multi.isChecked() and self.datasets else []
-        if not targets:
-            self.apply_processing()
-            return
+    def _process_all_loaded_datasets(self, *, use_ui_settings=True):
+        """Re-run phasor pipeline on every loaded sample (caller may wrap in _run_busy)."""
+        if self.chk_multi.isChecked() and self.datasets:
+            targets = list(self.datasets)
+        else:
+            targets = [self.data]
         saved = self.data
         saved_idx = self.active_idx
         for d in targets:
-            if d.signal_full is None and not d.is_synthetic:
+            if d.signal_full is None:
                 continue
-            self._run_processing_on_dataset(d, use_ui_settings=False)
+            self._run_processing_on_dataset(d, use_ui_settings=use_ui_settings)
         if 0 <= saved_idx < len(self.datasets):
             self.data = self.datasets[saved_idx]
             self.active_idx = saved_idx
         else:
             self.data = saved
+
+    def _refresh_views_after_processing(self):
         self._restore_ui_for_active()
         self._refresh_compare_list()
+        self._refresh_compare_group_filter()
         self._update_phasor_display()
+        self.chk_overlay.blockSignals(True)
+        self.chk_overlay.setChecked(False)
+        self.chk_overlay.blockSignals(False)
         self.refresh_image()
+        if hasattr(self, "_update_metadata_panel"):
+            self._update_metadata_panel()
+
+    def _recompute_all_datasets(self):
+        """Re-run phasor pipeline on every loaded sample (e.g. after shared reference change)."""
+        try:
+            self._run_busy(
+                "Recomputing phasor maps…",
+                lambda: self._process_all_loaded_datasets(use_ui_settings=True),
+            )
+        except Exception as e:
+            self._log(f"Processing error: {e}")
+            QtWidgets.QMessageBox.critical(self, "Processing error", str(e))
+            return
+        self._refresh_views_after_processing()
 
     def _refresh_image_combo(self):
-        self.cb_image.blockSignals(True)
-        self.cb_image.clear()
-        for i, d in enumerate(self.datasets):
-            self.cb_image.addItem(f"{i + 1}: {dataset_display_label(d, i)}")
-        if 0 <= self.active_idx < len(self.datasets):
-            self.cb_image.setCurrentIndex(self.active_idx)
-        self.cb_image.blockSignals(False)
+        """Refresh sample table, dropdown, and overlay filters."""
         self._refresh_compare_list()
+        self._refresh_compare_group_filter()
+        self._refresh_sample_combo()
+        self._sync_sample_table_selection()
+
+    def _refresh_compare_group_filter(self):
+        if not hasattr(self, "cb_compare_group"):
+            return
+        current = self.cb_compare_group.currentText()
+        groups = sorted({
+            (d.group_name or "").strip()
+            for d in self.datasets
+            if (d.group_name or "").strip()
+        })
+        self.cb_compare_group.blockSignals(True)
+        self.cb_compare_group.clear()
+        self.cb_compare_group.addItem("All groups")
+        for g in groups:
+            self.cb_compare_group.addItem(g)
+        idx = self.cb_compare_group.findText(current)
+        self.cb_compare_group.setCurrentIndex(idx if idx >= 0 else 0)
+        self.cb_compare_group.blockSignals(False)
 
     def _apply_group_from_field(self):
         text = self.edit_group.text().strip() if hasattr(self, "edit_group") else ""
@@ -841,11 +1287,54 @@ class MainWindow(QtWidgets.QMainWindow):
             self.datasets[self.active_idx].group_name = text
         else:
             self.data.group_name = text
-        self._refresh_image_combo()
+        self._refresh_compare_list()
+        self._refresh_compare_group_filter()
         if self.data.real_cal is not None:
             self._update_phasor_display()
         if text:
             self._log(f"Group set to “{text}” for active sample.")
+
+    def _update_frame_control(self):
+        d = self.data
+        self.sp_frame.blockSignals(True)
+        if d.signal_full is None:
+            self.sp_frame.setEnabled(False)
+            self.sp_frame.setRange(-1, 0)
+            self.sp_frame.setValue(-1)
+        elif "T" in d.signal_full.dims and int(d.signal_full.sizes.get("T", 1)) > 1:
+            n = int(d.signal_full.sizes["T"])
+            self.sp_frame.setEnabled(True)
+            self.sp_frame.setRange(-1, n - 1)
+            self.sp_frame.setValue(int(getattr(d, "frame_index", -1)))
+        else:
+            self.sp_frame.setEnabled(False)
+            self.sp_frame.setValue(-1)
+        self.sp_frame.blockSignals(False)
+
+    def on_frame_change(self, value):
+        if self.data.sample_path:
+            if int(value) == int(getattr(self.data, "frame_index", -1)):
+                return
+            self.data.frame_index = int(value)
+            self._reload_active_sample()
+
+    def _reload_active_sample(self):
+        path = self.data.sample_path
+        if not path or not os.path.isfile(path):
+            return
+        ch = self.data.channel
+        frame = self.data.frame_index
+        try:
+            self._run_busy(
+                f"Reloading frame {frame} ({os.path.basename(path)})…",
+                lambda: self.data.load_sample(path, frame=frame),
+            )
+        except Exception as e:
+            self._log(f"Reload error: {e}")
+            QtWidgets.QMessageBox.critical(self, "Reload error", str(e))
+            return
+        self.data.channel = min(ch, max(0, self.data.n_channels - 1))
+        self.apply_processing()
 
     def _compare_show_item(self, row):
         return self.table_compare.item(row, 0)
@@ -858,11 +1347,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_compare_list(self):
         checked = {}
+        was_ready = {}
         for row in range(self.table_compare.rowCount()):
             idx = self._compare_dataset_index(row)
             it = self._compare_show_item(row)
             if idx >= 0 and it is not None:
                 checked[idx] = it.checkState() == Qt.CheckState.Checked
+            status_it = self.table_compare.item(row, 7)
+            if idx >= 0:
+                was_ready[idx] = status_it is not None and status_it.text() == "ready"
 
         self.table_compare.blockSignals(True)
         self.table_compare.setRowCount(len(self.datasets))
@@ -873,8 +1366,12 @@ class MainWindow(QtWidgets.QMainWindow):
             show.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             if ready:
                 show.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+                if i in checked and was_ready.get(i):
+                    show_checked = checked[i]
+                else:
+                    show_checked = True
                 show.setCheckState(
-                    Qt.CheckState.Checked if checked.get(i, True) else Qt.CheckState.Unchecked)
+                    Qt.CheckState.Checked if show_checked else Qt.CheckState.Unchecked)
             else:
                 show.setFlags(Qt.ItemFlag.ItemIsEnabled)
                 show.setCheckState(Qt.CheckState.Unchecked)
@@ -882,33 +1379,46 @@ class MainWindow(QtWidgets.QMainWindow):
 
             num = self._ro(str(i + 1))
             num.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            group = self._editable_group((d.group_name or "").strip())
             sample = self._ro(dataset_short_label(d, i))
             if i == self.active_idx:
                 sample.setFont(QtGui.QFont(sample.font().family(), sample.font().pointSize(),
                                            QtGui.QFont.Weight.Bold))
-                sample.setToolTip("Active image (dropdown) — used for segmentation")
-            status = self._ro("ready" if ready else "not computed")
+                sample.setToolTip("Selected — settings below apply to this sample")
+            group = self._editable_group((d.group_name or "").strip())
+            stash = getattr(d, "processing_settings", None) or {}
+            filt = self._ro(
+                str(stash.get("filter_mode", filter_label_for_dataset(self, d))))
+            min_n = self._ro(str(int(stash.get("intensity_min", 0))))
+            ref_lbl = self._ro(
+                self._effective_ref_label(d) if hasattr(self, "_effective_ref_label")
+                else "—")
+            status = self._ro("ready" if ready else "pending")
             if not ready:
                 status.setForeground(QtGui.QBrush(Qt.GlobalColor.gray))
 
             self.table_compare.setItem(i, 0, show)
             self.table_compare.setItem(i, 1, num)
-            self.table_compare.setItem(i, 2, group)
-            self.table_compare.setItem(i, 3, sample)
-            self.table_compare.setItem(i, 4, status)
+            self.table_compare.setItem(i, 2, sample)
+            self.table_compare.setItem(i, 3, group)
+            self.table_compare.setItem(i, 4, filt)
+            self.table_compare.setItem(i, 5, min_n)
+            self.table_compare.setItem(i, 6, ref_lbl)
+            self.table_compare.setItem(i, 7, status)
         self.table_compare.blockSignals(False)
         self._set_compare_controls_enabled(
             self.chk_multi.isChecked() and len(self.datasets) >= 2)
+        if hasattr(self, "_update_apply_buttons"):
+            self._update_apply_buttons()
 
     def _set_compare_controls_enabled(self, compare_available):
-        multi_on = self.chk_multi.isChecked() and len(self.datasets) >= 1
         cmp_on = compare_available and self.chk_compare.isChecked()
         self.chk_compare.setEnabled(compare_available)
         self.cb_compare_style.setEnabled(cmp_on)
-        self.table_compare.setEnabled(multi_on)
+        if hasattr(self, "table_compare"):
+            self.table_compare.setEnabled(len(self.datasets) > 1)
         for btn in getattr(self, "_compare_sel_buttons", ()):
             btn.setEnabled(cmp_on)
+        self._update_multi_strip()
 
     def _compare_set_all_checks(self, checked):
         state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
@@ -927,24 +1437,53 @@ class MainWindow(QtWidgets.QMainWindow):
     def _compare_select_none(self):
         self._compare_set_all_checks(False)
 
+    def _start_multi_phasor_view(self, *, select_all=True):
+        """Enable phasor overlay and show all ready samples (multi-image compare)."""
+        if not self.chk_multi.isChecked() or len(self.datasets) < 2:
+            return
+        if not self.chk_compare.isChecked():
+            self.chk_compare.blockSignals(True)
+            self.chk_compare.setChecked(True)
+            self.chk_compare.blockSignals(False)
+        self._set_compare_controls_enabled(True)
+        if select_all:
+            self._compare_set_all_checks(True)
+        else:
+            self._update_phasor_display()
+
     def _on_compare_table_changed(self, row, column):
-        if column == 2:
+        if column == 3:
             if 0 <= row < len(self.datasets):
-                item = self.table_compare.item(row, 2)
+                item = self.table_compare.item(row, 3)
                 text = item.text().strip() if item else ""
                 self.datasets[row].group_name = text
                 if row == self.active_idx and hasattr(self, "edit_group"):
                     self.edit_group.blockSignals(True)
                     self.edit_group.setText(text)
                     self.edit_group.blockSignals(False)
-                self._refresh_image_combo()
+                self._refresh_compare_group_filter()
                 self._update_phasor_display()
             return
         if column != 0:
             return
         self._on_compare_ui_changed()
 
+    def _on_sample_table_selection(self):
+        if self._table_sel_lock or len(self.datasets) <= 1:
+            return
+        sel = self.table_compare.selectionModel().selectedRows()
+        if not sel:
+            return
+        row = sel[0].row()
+        if row == self.active_idx:
+            return
+        self._activate_dataset(row)
+
     def _build_compare_layers(self):
+        group_sel = (
+            self.cb_compare_group.currentText()
+            if hasattr(self, "cb_compare_group") else "All groups"
+        )
         layers = []
         for row in range(self.table_compare.rowCount()):
             idx = self._compare_dataset_index(row)
@@ -952,6 +1491,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             show = self._compare_show_item(row)
             d = self.datasets[idx]
+            gname = (d.group_name or "").strip()
+            if group_sel != "All groups" and gname != group_sel:
+                continue
             layers.append({
                 "data": d,
                 "label": dataset_display_label(d, idx),
@@ -998,41 +1540,69 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_multi_detail_enabled(checked)
         if checked:
             # adopt the currently loaded image as the first slot (non-destructive)
-            has_image = self.data.signal_full is not None or self.data.is_synthetic
+            has_image = self.data.signal_full is not None
             if has_image and self.data not in self.datasets:
                 self.datasets.append(self.data)
                 self.active_idx = len(self.datasets) - 1
+            for d in self.datasets:
+                self._init_dataset_proc_settings(d)
             self._refresh_image_combo()
+            self._update_multi_strip()
+            if len(self.datasets) >= 2:
+                self._start_multi_phasor_view()
             self._log(
-                "Multi-image mode on — use the overlay table below calibration "
-                "(tick Shared reference to calibrate all samples with one file).")
+                "Multi-image mode — pick a sample in section 3, edit filters in "
+                "section 2, then Apply selected or Apply settings to all.")
         else:
+            self._update_multi_strip()
             self.chk_compare.blockSignals(True)
             self.chk_compare.setChecked(False)
             self.chk_compare.blockSignals(False)
             self._set_compare_controls_enabled(False)
             self._update_phasor_display()
             self._log("Multi-image mode off (current image stays active).")
+        self._update_apply_buttons()
 
-    def on_image_combo_change(self, idx):
+    def _activate_dataset(self, idx: int):
         if not (0 <= idx < len(self.datasets)):
             return
+        if per_sample_processing(self):
+            self._save_proc_from_ui(self.data)
         self.active_idx = idx
         self.data = self.datasets[idx]
         self._restore_ui_for_active()
         self._refresh_compare_list()
-        # redisplay this image's already-processed phasor without recomputing
         self._update_phasor_display()
         self.last_overlay = None
         self.cluster_stats = []
         if self.chk_live.isChecked() and self.mode == "cursor" and self.phasor.cursors \
                 and self.data.real_cal is not None:
-            self._compute_cursor()                  # repaint shared cursors on this image
+            self._compute_cursor()
         else:
             self._fill_table()
-            self.chk_overlay.blockSignals(True); self.chk_overlay.setChecked(False); self.chk_overlay.blockSignals(False)
+            self.chk_overlay.blockSignals(True)
+            self.chk_overlay.setChecked(False)
+            self.chk_overlay.blockSignals(False)
             self.refresh_image()
-        self._log(f"Switched to image {idx + 1}: {dataset_display_label(self.data, idx)}")
+        self._log(f"Selected sample {idx + 1}: {dataset_display_label(self.data, idx)}")
+        self.activateWindow()
+        self.raise_()
+
+    def apply_settings_to_all(self):
+        if len(self.datasets) <= 1:
+            QtWidgets.QMessageBox.information(
+                self, "Need multiple samples",
+                "Load at least two samples in multi-image mode first.")
+            return
+        self._save_proc_from_ui(self.data)
+        snap = capture_processing_from_ui(self)
+        for d in self.datasets:
+            d.processing_settings = dict(snap)
+        self._refresh_compare_list()
+        self._log(
+            f"Copied settings from {dataset_short_label(self.data, self.active_idx)} "
+            f"to all {len(self.datasets)} samples.")
+        self.apply_processing(scope="all")
 
     def remove_image(self):
         if not (0 <= self.active_idx < len(self.datasets)):
@@ -1046,13 +1616,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.active_idx = min(self.active_idx, len(self.datasets) - 1)
         self._refresh_image_combo()
-        self.on_image_combo_change(self.active_idx)
+        self._activate_dataset(self.active_idx)
 
     def on_channel_change(self, idx):
-        if self.data.signal_full is None and not self.data.is_synthetic:
+        if self.data.signal_full is None:
             return
         self.data.channel = max(0, idx)
-        self.apply_processing()
+        if self.data.real_cal is not None:
+            self.apply_processing()
+        else:
+            self._log(f"Sample channel {self.data.channel} — click Apply to preprocess.")
 
     def on_ref_channel_change(self, idx):
         if not self._effective_ref_path(self.data):
@@ -1061,63 +1634,65 @@ class MainWindow(QtWidgets.QMainWindow):
             ch = max(0, min(idx, self.shared_ref_n_channels - 1))
             self.shared_ref_channel = ch
             self._propagate_shared_reference()
-            if any(d.signal_full is not None or d.is_synthetic for d in self._all_datasets()):
-                self._recompute_all_datasets()
         else:
             self.data.ref_channel = max(0, min(idx, self.data.ref_n_channels - 1))
-            if self.data.signal_full is not None or self.data.is_synthetic:
-                self.apply_processing()
+        if self._effective_ref_file_path() and not self.chk_manual_cal.isChecked():
+            if self.ref_calibration.is_active:
+                self._recompute_reference_calibration()
+            else:
+                self._log("Reference channel changed — click Calibrate, then Apply.")
+                return
+        if self.data.signal_full is not None:
+            self.apply_processing()
 
     # ---- processing --------------------------------------------------------
-    def _processing_params(self, d):
-        mode = self.cb_filter.currentText()
-        if mode == "pawflim" and d.is_synthetic:
-            if d is self.data:
-                QtWidgets.QMessageBox.information(
-                    self, "pawFLIM",
-                    "pawFLIM needs a real TCSPC signal (multi-harmonic) and isn't available "
-                    "for the synthetic demo. Using 'median' instead.")
-                self.cb_filter.setCurrentText("median")
-            mode = "median"
-        return {
-            "ref_path": self._effective_ref_path(d),
-            "ref_lifetime": self.sp_reflt.value(),
-            "filter_mode": mode,
-            "median_size": self.sp_msize.value(),
-            "median_repeat": self.sp_mrep.value(),
-            "paw_sigma": self.sp_psigma.value(),
-            "paw_levels": self.sp_plevels.value(),
-            "intensity_min": float(self.sp_thr.value()),
-            "detect_harmonics": self.chk_detect_harm.isChecked(),
-        }
+    def _active_calibration(self):
+        if self.chk_manual_cal.isChecked():
+            self._apply_manual_calibration_fields()
+        return self.ref_calibration if self.ref_calibration.is_active else None
 
     def _run_processing_on_dataset(self, d, *, use_ui_settings=False):
-        if use_ui_settings:
-            d.harmonic = self.sp_harm.value()
-            d.frequency = self.sp_freq.value()
-            d.channel = max(0, self.cb_channel.currentIndex())
-        if self._effective_ref_path(d):
-            d.ref_channel = self._ref_channel_for_dataset(d)
-        d.apply_processing(**self._processing_params(d))
+        run_processing_on_dataset(self, d, use_ui_settings=use_ui_settings)
 
-    def apply_processing(self):
-        if self.data.signal_full is None and not self.data.is_synthetic:
+    def apply_processing(self, scope: str = "auto"):
+        if self.data.signal_full is None:
             QtWidgets.QMessageBox.information(self, "No data", "Load a sample first.")
             return
-        t0 = time.perf_counter()
+        multi = len(self.datasets) > 1
+        if scope == "auto":
+            scope = "active"
+        if per_sample_processing(self):
+            self._save_proc_from_ui(self.data)
+        self.data.pixel_size_um = self.sp_pixel_um.value() if hasattr(self, "sp_pixel_um") else 0.0
+        if self._effective_ref_file_path() and not self.chk_manual_cal.isChecked():
+            if not self.ref_calibration.is_active or (
+                os.path.normcase(self.ref_calibration.source_path or "")
+                != os.path.normcase(self._effective_ref_file_path())
+            ):
+                if not self._recompute_reference_calibration():
+                    return
         try:
-            self._run_processing_on_dataset(self.data, use_ui_settings=True)
+            if scope == "all" and multi:
+                _, elapsed = self._run_busy(
+                    "Preprocessing all samples…",
+                    lambda: self._process_all_loaded_datasets(use_ui_settings=True),
+                )
+            else:
+                _, elapsed = self._run_busy(
+                    "Preprocessing…",
+                    lambda: self._run_processing_on_dataset(self.data, use_ui_settings=True),
+                )
+        except CancelledError:
+            return
         except Exception as e:
             self._log(f"Processing error: {e}")
-            QtWidgets.QMessageBox.critical(self, "Processing error", repr(e)); return
-        elapsed = time.perf_counter() - t0
-        self._refresh_compare_list()
-        self._update_phasor_display()
-        self.chk_overlay.blockSignals(True); self.chk_overlay.setChecked(False); self.chk_overlay.blockSignals(False)
-        self.refresh_image()
-        if self._effective_ref_path(self.data):
+            QtWidgets.QMessageBox.critical(self, "Processing error", repr(e))
+            return
+        self._refresh_views_after_processing()
+        if self.ref_calibration.is_active:
             ch = self._ref_channel_for_dataset(self.data)
-            ref_note = f", shared ref ch {ch}" if self.chk_shared_ref.isChecked() else f", ref ch {ch}"
+            mode = "manual" if self.ref_calibration.use_manual else "file"
+            ref_note = f", cal ({mode}) ch {ch} g={self.ref_calibration.mean_g:.3f} s={self.ref_calibration.mean_s:.3f}"
         else:
             ref_note = ""
         st = getattr(self.data, "_intensity_stats", {})
@@ -1130,10 +1705,17 @@ class MainWindow(QtWidgets.QMainWindow):
                        f"({n_below} px removed)")
         else:
             int_msg = ""
+        n_valid = int(self.data.valid_mask().sum()) if self.data.real_cal is not None else 0
+        filt = filter_label_for_dataset(self, self.data)
+        scope_note = " (all samples)" if scope == "all" and multi else ""
         self._log(
-            f"Phasor recomputed — sample ch {self.data.channel}{ref_note}, "
-            f"filter={self.cb_filter.currentText()}, H={self.data.harmonic}{int_msg}  "
-            f"({self._fmt_elapsed(elapsed)})")
+            f"Phasor recomputed{scope_note} — sample ch {self.data.channel}{ref_note}, "
+            f"filter={filt}, H={self.data.harmonic}{int_msg}, "
+            f"{n_valid} valid px ({self._fmt_elapsed(elapsed)})")
+        if self.chk_multi.isChecked() and len(self.datasets) >= 2:
+            n_ready = sum(1 for d in self.datasets if d.real_cal is not None)
+            if n_ready >= 2:
+                self._start_multi_phasor_view()
 
     # ---- cursor actions ----------------------------------------------------
     def _refresh_active_cursor_combo(self, select_idx=None):
@@ -1162,6 +1744,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_radius_slider()
 
     def add_cursor(self):
+        if hasattr(self, "_push_cursor_undo"):
+            self._push_cursor_undo()
         r = self.sld_radius.value() * 0.001
         kind = "ellipse" if self.cb_cursor_shape.currentText() == "Ellipse" else "circle"
         aspect = self.sld_aspect.value() / 100.0
@@ -1173,6 +1757,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def remove_cursor(self):
         if self.mode != "cursor":
             return
+        if hasattr(self, "_push_cursor_undo"):
+            self._push_cursor_undo()
         if self.phasor.selected < 0:
             self._log("Choose a circle in Move, or click one on the phasor plot.")
             return
@@ -1318,13 +1904,38 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_phasor_click(self, g, s):
         if self.data.real_cal is None or self.data.work_frequency <= 0:
             return
+        self.phasor.set_click_marker(g, s)
         try:
             tp, tm, tn = lifetimes_at_phasor(g, s, self.data.work_frequency)
         except Exception as e:
             self._log(f"Phasor readout failed: {e}")
             return
+        self._highlight_phasor_on_image(g, s)
         self._log(
             f"Phasor click ({g:.3f}, {s:.3f}) → τφ={tp:.3f} ns, τmod={tm:.3f} ns, τn={tn:.3f} ns")
+
+    def _highlight_phasor_on_image(self, g, s):
+        """Mark nearest valid pixel to the clicked phasor on the image view."""
+        if self.data.real_cal is None:
+            return
+        valid = self.data.valid_mask()
+        if not np.any(valid):
+            return
+        gr = self.data.real_cal[valid]
+        gi = self.data.imag_cal[valid]
+        idx = int(np.argmin((gr - g) ** 2 + (gi - s) ** 2))
+        ys, xs = np.where(valid)
+        y, x = int(ys[idx]), int(xs[idx])
+        disp = self._photon_image_filtered()
+        if disp is not None:
+            log_scale = getattr(self, "chk_log_display", None) and self.chk_log_display.isChecked()
+            auto_c = not getattr(self, "chk_auto_contrast", None) or self.chk_auto_contrast.isChecked()
+            self.image.show_intensity(
+                disp, log_scale=log_scale, auto_contrast=auto_c,
+                title="Nearest pixel to phasor click")
+            self.image.ax.plot(x, y, "c+", ms=14, mew=2)
+            self.image.draw_idle()
+            self._draw_scale_bar()
 
     # ---- compute lifetimes + paint ----------------------------------------
     def compute_and_paint(self):
@@ -1466,7 +2077,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if choice == IMAGE_VIEW_ITEMS[0]:
             disp = self._photon_image_filtered()
             if disp is not None:
-                self.image.show_intensity(disp)
+                log_scale = getattr(self, "chk_log_display", None) and self.chk_log_display.isChecked()
+                auto_c = not getattr(self, "chk_auto_contrast", None) or self.chk_auto_contrast.isChecked()
+                title = "Photons (masked)"
+                self.image.show_intensity(
+                    disp, log_scale=log_scale, auto_contrast=auto_c, title=title)
+                self._draw_scale_bar()
             return
         tau_sources = {
             IMAGE_VIEW_ITEMS[1]: (self.data.tau_phi, "τφ phase (ns)"),
@@ -1485,6 +2101,18 @@ class MainWindow(QtWidgets.QMainWindow):
         vmin, vmax = self._robust_range(disp)
         self.image.show_map(disp, title=choice, cmap="turbo", label=cbar_label,
                             vmin=vmin, vmax=vmax)
+        self._draw_scale_bar()
+
+    def _draw_scale_bar(self):
+        um = self.sp_pixel_um.value() if hasattr(self, "sp_pixel_um") else 0.0
+        if um <= 0 and getattr(self.data, "pixel_size_um", 0) > 0:
+            um = self.data.pixel_size_um
+        if um > 0 and self.data.real_cal is not None:
+            h, w = self.data.real_cal.shape
+            bar_um = 10.0
+            bar_px = bar_um / um
+            if bar_px < w * 0.4:
+                self.image.draw_scale_bar(bar_px, label=f"{bar_um:g} µm")
 
     @staticmethod
     def _robust_range(arr):
@@ -1542,101 +2170,29 @@ class MainWindow(QtWidgets.QMainWindow):
         return "FF" + "".join(f"{int(round(255 * max(0.0, min(1.0, x)))):02X}" for x in c[:3])
 
     # ---- export ------------------------------------------------------------
-    def save_overlay(self):
-        if self.last_overlay is None: return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save overlay", "segmentation.png", "PNG (*.png)")
-        if path:
-            import matplotlib.pyplot as plt
-            plt.imsave(path, self.last_overlay); self._log(f"Saved overlay: {path}")
-
-    def save_phasor(self):
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save phasor", "phasor.png", "PNG (*.png)")
-        if path:
-            self.phasor.fig.savefig(path, dpi=200); self._log(f"Saved phasor: {path}")
-
-    def export_csv(self):
-        if not self.cluster_stats: return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export results", "clusters.csv", "CSV (*.csv)")
-        if not path: return
-        with open(path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["cluster", "label", "g", "s", "tau_phi_ns", "tau_mod_ns", "tau_normal_ns",
-                        "pixels", "area_percent", "frequency_MHz", "harmonic",
-                        "sample_channel", "ref_channel", "filter", "group", "sample", "reference"])
-            for st in self.cluster_stats:
-                w.writerow([st["idx"], st["label"], f"{st['g']:.5f}", f"{st['s']:.5f}",
-                            f"{st['tp']:.4f}", f"{st['tm']:.4f}", f"{st['tn']:.4f}",
-                            st["n"], f"{st['area']:.3f}",
-                            f"{self.data.work_frequency:.4f}", self.data.harmonic,
-                            self.data.channel,
-                            self.data.ref_channel if self.data.ref_path else "",
-                            self.cb_filter.currentText(),
-                            (self.data.group_name or "").strip(),
-                            os.path.basename(self.data.sample_path),
-                            os.path.basename(self._effective_ref_path() or "")])
-        self._log(f"Exported {path}")
-
-    def export_xlsx(self):
-        if not self.cluster_stats:
-            QtWidgets.QMessageBox.information(self, "Excel", "Nothing to export yet — compute clusters first.")
+    def export_all(self):
+        if self.data.signal_full is None:
+            QtWidgets.QMessageBox.information(
+                self, "Export", "Load a sample and click Apply before exporting.")
             return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Export results (Excel)", "clusters.xlsx", "Excel (*.xlsx)")
-        if not path:
+        default = self._dialog_dir("export_dir", self._dialog_dir("sample_dir"))
+        out = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Choose export folder", default)
+        if not out:
             return
+        self._settings.setValue("export_dir", out)
         try:
-            import openpyxl
-            from openpyxl.styles import Font, PatternFill, Alignment
-            from openpyxl.utils import get_column_letter
-        except ImportError:
-            QtWidgets.QMessageBox.warning(
-                self, "Missing dependency",
-                "Excel export needs openpyxl:\n\n    pip install openpyxl")
-            return
-        try:
-            import datetime
-            wb = openpyxl.Workbook()
-            ws = wb.active; ws.title = "Clusters"
-            headers = ["#", "Color", "Label (what you see)", "g", "s",
-                       "tau_phi (ns)", "tau_mod (ns)", "tau_normal (ns)",
-                       "Pixels", "Area %"]
-            ws.append(headers)
-            for c in ws[1]:
-                c.font = Font(bold=True); c.alignment = Alignment(horizontal="center")
-            for st in self.cluster_stats:
-                ws.append([st["idx"], "", st["label"],
-                           round(st["g"], 5), round(st["s"], 5),
-                           round(st["tp"], 4), round(st["tm"], 4), round(st["tn"], 4),
-                           int(st["n"]), round(st["area"], 3)])
-                ws.cell(row=ws.max_row, column=2).fill = PatternFill(
-                    "solid", fgColor=self._rgb_hex(st["color"]))
-            for i, w in enumerate([5, 8, 28, 10, 10, 12, 12, 14, 11, 9], start=1):
-                ws.column_dimensions[get_column_letter(i)].width = w
-            ws.freeze_panes = "A2"
-
-            meta = wb.create_sheet("Metadata")
-            meta.append(["Parameter", "Value"])
-            for c in meta[1]:
-                c.font = Font(bold=True)
-            for k, v in [
-                ("Sample", os.path.basename(self.data.sample_path)),
-                ("Group", (self.data.group_name or "").strip() or "(none)"),
-                ("Reference", os.path.basename(self.data.ref_path) if self.data.ref_path else ""),
-                ("Laser frequency (MHz)", round(self.data.frequency, 4)),
-                ("Working frequency (MHz)", round(self.data.work_frequency, 4)),
-                ("Harmonic", self.data.harmonic),
-                ("Sample channel", self.data.channel),
-                ("Reference channel", self.data.ref_channel if self.data.ref_path else ""),
-                ("Filter", self.cb_filter.currentText()),
-                ("Segmentation mode", self.mode),
-                ("Number of clusters", len(self.cluster_stats)),
-                ("Exported", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-            ]:
-                meta.append([k, v])
-            meta.column_dimensions["A"].width = 26
-            meta.column_dimensions["B"].width = 42
-            wb.save(path)
-            self._log(f"Exported {path}")
+            result = export_analysis_bundle(self, out)
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Excel export error", repr(e))
+            self._log(f"Export failed: {e}")
+            QtWidgets.QMessageBox.critical(self, "Export failed", str(e))
+            return
+        n = result["n_samples"]
+        nf = len(result["files"])
+        self._log(f"Exported {nf} file(s) for {n} sample(s) → {result['directory']}")
+        QtWidgets.QMessageBox.information(
+            self,
+            "Export complete",
+            f"Saved {nf} files for {n} sample(s) to:\n{result['directory']}",
+        )
 

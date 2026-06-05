@@ -1,3 +1,4 @@
+# Python bytecode / packaging
 __pycache__/
 *.py[cod]
 *$py.class
@@ -6,13 +7,36 @@ __pycache__/
 dist/
 build/
 *.egg
+
+# Test / coverage caches
+.pytest_cache/
+pytest-cache-files-*/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
 .venv/
 venv/
+env/
 .env
+
+# Editors / IDEs
 .idea/
 .vscode/
+
+# FLIM data files (don't commit large raw datasets)
 *.ptu
 *.tif
 *.tiff
+
+# OS cruft
 .DS_Store
 Thumbs.db
+
+# Local-only docs
+CODEBASE.md
