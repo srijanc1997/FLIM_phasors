@@ -2,7 +2,7 @@
 
 Interactive **phasor analysis and segmentation** for fluorescence lifetime imaging (FLIM). Works with general TCSPC data from PicoQuant and Imspector-style TIFF stacks.
 
-Built on [phasorpy](https://github.com/biopaul/phasorpy) with a PySide6 + matplotlib desktop UI.
+Built on [phasorpy](https://github.com/phasorpy/phasorpy) with a PySide6 + matplotlib desktop UI.
 
 ## Supported data
 
