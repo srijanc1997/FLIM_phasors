@@ -183,7 +183,7 @@ pytest
 
 **Published docs:** https://srijanc1997.github.io/FLIM_phasors/
 
-The site is built automatically on every push to `main` by the [docs workflow](.github/workflows/docs.yml).
+Publish to GitHub Pages manually: **Actions → docs → Run workflow** (see the [docs workflow](.github/workflows/docs.yml)).
 
 ### Build locally
 
@@ -199,11 +199,11 @@ Open `docs/_build/html/index.html` in a browser. For live reload while editing d
 python -m sphinx_autobuild docs docs/_build/html
 ```
 
-### First-time GitHub Pages setup
+### Publish to GitHub Pages
 
-1. Push these changes to `main`.
-2. On GitHub: **Settings → Pages → Build and deployment → Source** → choose **GitHub Actions**.
-3. After the `docs` workflow finishes, the site is live at the URL above (may take 1–2 minutes).
+1. On GitHub: **Settings → Pages → Build and deployment → Source** → choose **GitHub Actions** (once).
+2. Go to **Actions → docs → Run workflow** on `main` when you want to update the live site.
+3. After the run finishes, the site is at the URL above (may take 1–2 minutes).
 
 ## License
 
