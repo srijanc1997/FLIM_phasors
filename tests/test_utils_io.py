@@ -93,3 +93,36 @@ def test_dataset_display_name_override():
     assert dataset_phasor_legend_label(d, include_group=True) == "control · Sample A"
 
 
+def test_build_session_dict_calibration_filter():
+    """build_session_dict must not reference an undefined dataset variable."""
+    from types import SimpleNamespace
+
+    from flim_phasors.data import PhasorData
+    from flim_phasors.export_bundle import build_session_dict
+
+    data = PhasorData()
+    data.sample_path = "/tmp/sample.ptu"
+    win = SimpleNamespace(
+        data=data,
+        phasor=SimpleNamespace(cursors=[]),
+        mode="cursor",
+        active_idx=0,
+        ref_calibration=SimpleNamespace(
+            mean_g=0.1, mean_s=0.2, use_manual=False, manual_g=0.0, manual_s=0.0,
+        ),
+        shared_ref_path="",
+        shared_ref_channel=0,
+        sp_freq=SimpleNamespace(value=lambda: 80.0),
+        sp_harm=SimpleNamespace(value=lambda: 1),
+        sp_reflt=SimpleNamespace(value=lambda: 4.0),
+        sp_thr=SimpleNamespace(value=lambda: 10),
+        cb_filter=SimpleNamespace(currentText=lambda: "median"),
+        chk_detect_harm=SimpleNamespace(isChecked=lambda: True),
+        chk_shared_ref=SimpleNamespace(isChecked=lambda: True),
+    )
+    win._all_datasets = lambda: [data]
+
+    session = build_session_dict(win)
+    assert session["calibration"]["filter"] == "median"
+
+

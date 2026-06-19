@@ -2496,7 +2496,8 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         if m.sum() < 10:
             QtWidgets.QMessageBox.information(self, "GMM", "Not enough valid pixels."); return
         try:
-            fit, n_clusters, sigma = self._run_busy("Fitting GMM…", self._fit_gmm_worker)
+            (fit, n_clusters, sigma), _elapsed = self._run_busy(
+                "Fitting GMM…", self._fit_gmm_worker)
         except CancelledError:
             return
         except Exception as e:

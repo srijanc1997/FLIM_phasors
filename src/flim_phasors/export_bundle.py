@@ -243,7 +243,7 @@ def build_session_dict(win) -> dict:
             "frequency_MHz": win.sp_freq.value(),
             "harmonic": win.sp_harm.value(),
             "reference_lifetime_ns": win.sp_reflt.value(),
-            "filter": _filter_for_export(win, d),
+            "filter": _filter_for_export(win, win.data),
             "min_photons": win.sp_thr.value(),
             "harmonic_mask": win.chk_detect_harm.isChecked() if hasattr(win, "chk_detect_harm") else True,
             "reference_path": getattr(win, "shared_ref_path", "") or getattr(win.data, "ref_path", ""),
