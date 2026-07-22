@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from flim_phasors.data import PhasorData
 from flim_phasors.export_bundle import (
@@ -111,6 +112,7 @@ def test_export_sample_maps_writes_npz_and_brightfield(tmp_path: Path):
 
 def test_export_analysis_bundle_multi_sample_clusters(tmp_path: Path):
     """Multi-sample Export all writes shared CSV/XLSX/session plus per-sample dirs."""
+    pytest.importorskip("openpyxl")
     d1 = _make_dataset("s1", g0=0.35, s0=0.28)
     d2 = _make_dataset("s2", g0=0.45, s0=0.32)
     win = _fake_win([d1, d2], mode="cursor")
@@ -147,6 +149,7 @@ def test_export_analysis_bundle_multi_sample_clusters(tmp_path: Path):
 
 def test_export_rewrites_same_excel_and_clears_sample_dir(tmp_path: Path):
     """Re-export overwrites analysis.xlsx and removes stale files in sample dirs."""
+    pytest.importorskip("openpyxl")
     d = _make_dataset("cellA")
     win = _fake_win([d])
     export_analysis_bundle(win, tmp_path)
