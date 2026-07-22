@@ -170,7 +170,11 @@ def missing_paths_message(session: dict) -> list[str]:
     original sample and reference files are still reachable at those paths;
     this check is typically run right after :func:`load_session_json` so the
     GUI can warn the user and let them re-point missing files before
-    attempting to reload each sample.
+    attempting to reload each sample. Checks each sample's own
+    ``reference_path`` (the effective reference for that sample, whether
+    shared or per-sample) in addition to the sample path itself, since a
+    session not using a shared reference keeps a distinct reference file
+    per sample.
 
     Args:
         session: Parsed session dictionary.
@@ -179,11 +183,17 @@ def missing_paths_message(session: dict) -> list[str]:
         List of missing absolute or relative paths (may be empty).
     """
     missing = []
+    seen = set()
     for row in session.get("samples", []):
         p = row.get("sample_path", "")
-        if p and not os.path.isfile(p):
+        if p and p not in seen and not os.path.isfile(p):
             missing.append(p)
+        seen.add(p)
+        ref = row.get("reference_path", "")
+        if ref and ref not in seen and not os.path.isfile(ref):
+            missing.append(ref)
+        seen.add(ref)
     ref = (session.get("calibration") or {}).get("reference_path") or session.get("shared_reference_path")
-    if ref and not os.path.isfile(ref):
+    if ref and ref not in seen and not os.path.isfile(ref):
         missing.append(ref)
     return missing

@@ -161,8 +161,7 @@ class PhasorData:
                 try:
                     step = float(c[1] - c[0])
                     if step > 0:
-                        if ax == "X":
-                            self.pixel_size_um = step
+                        self.pixel_size_um = step
                         return  # stop after first positive axis step
                 except (TypeError, ValueError):
                     pass

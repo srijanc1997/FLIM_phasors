@@ -48,18 +48,23 @@ def categorical_rgb(i):
 def categorical_name(i):
     """Human-readable label for cluster/cursor index (matches ring color).
 
-    Indexing wraps modulo the length of :data:`CATEGORICAL_NAMES`, using the
-    same cyclic scheme as :func:`categorical_rgb`, so a cursor's color swatch
-    and its text label always refer to the same entry even when there are
-    more clusters than named colors.
+    Indexing wraps modulo the length of the phasorpy categorical palette,
+    the same cyclic scheme :func:`categorical_rgb` uses, so a cursor's color
+    swatch and its text label always refer to the same palette entry. Named
+    colors only cover the first :data:`CATEGORICAL_NAMES` entries; indices
+    beyond that fall back to a generic ``"color N"`` label rather than
+    wrapping back to a name that no longer matches the swatch.
 
     Args:
         i: Zero-based cluster or cursor index.
 
     Returns:
-        A color name string from :data:`~flim_phasors.constants.CATEGORICAL_NAMES`.
+        A color name string, or ``"color N"`` past the named entries.
     """
-    return CATEGORICAL_NAMES[i % len(CATEGORICAL_NAMES)]
+    idx = i % len(CATEGORICAL)
+    if idx < len(CATEGORICAL_NAMES):
+        return CATEGORICAL_NAMES[idx]
+    return f"color {idx + 1}"
 
 
 def reduce_signal(sig, channel):

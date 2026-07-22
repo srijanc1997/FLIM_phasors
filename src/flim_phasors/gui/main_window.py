@@ -3349,7 +3349,9 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
         Pops the active dataset out of ``self.datasets`` and logs which
         sample was removed. If the list becomes empty, clears the active
-        index and refreshes the (now empty) sample combo. Otherwise clamps
+        index, resets ``self.data`` to a blank dataset, and refreshes the
+        (now empty) sample combo, image panel, and phasor plot so the UI
+        actually returns to a "no sample loaded" state. Otherwise clamps
         the active index into bounds and activates the resulting sample so
         the UI always has a valid selection.
         """
@@ -3360,7 +3362,12 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._log(f"Removed sample: {name}")
         if not self.datasets:
             self.active_idx = -1
+            self.data = PhasorData()
             self._refresh_image_combo()
+            self._restore_ui_for_active()
+            self._refresh_compare_list()
+            self.refresh_image()
+            self._update_phasor_display()
             return
         self.active_idx = min(self.active_idx, len(self.datasets) - 1)
         self._refresh_image_combo()

@@ -53,7 +53,10 @@ def _filter_for_export(win, d) -> str:
         from flim_phasors.gui.processing import filter_label_for_dataset
         return filter_label_for_dataset(win, d)
     except Exception:
-        return getattr(win, "cb_filter", None) and win.cb_filter.currentText() or "median"
+        cb = getattr(win, "cb_filter", None)
+        if cb is not None:
+            return cb.currentText()
+        return "median"
 
 
 def _safe_name(text: str, max_len: int = 80) -> str:
@@ -102,25 +105,26 @@ def _sample_stem(d, index: int = 0) -> str:
 def _sample_folder_name(d, index: int) -> str:
     """Build a unique subfolder name for one exported sample.
 
-    When a sample belongs to a group, the folder is named
-    ``{group}__{stem}`` so samples sharing a group sort and scan together in
-    a file browser. Ungrouped samples are prefixed with their 1-based export
-    index (``01_``, ``02_``, ...) instead, which both keeps folder names
-    unique when two samples share a display name and preserves the order
-    they appeared in during export.
+    Every folder is prefixed with the sample's 1-based export index so
+    folder names are always unique, even when two samples share a display
+    name (e.g. two channels of the same file with no custom name). When a
+    sample belongs to a group, the group name is inserted before the index
+    (``{group}__{index}_{stem}``) so samples sharing a group still sort and
+    scan together in a file browser.
 
     Args:
         d: ``PhasorData`` with optional ``group_name`` and path metadata.
         index: Zero-based sample index in the session.
 
     Returns:
-        Sanitized folder name, optionally prefixed with group name.
+        Sanitized folder name, always unique per export index.
     """
     base = _sample_stem(d, index)
     group = (getattr(d, "group_name", "") or "").strip()
+    indexed = f"{index + 1:02d}_{base}"
     if group:
-        return _safe_name(f"{group}__{base}")
-    return _safe_name(f"{index + 1:02d}_{base}")
+        return _safe_name(f"{group}__{indexed}")
+    return _safe_name(indexed)
 
 
 def _clear_dir(path: Path) -> None:
@@ -585,10 +589,13 @@ def _cursor_masks_for_dataset(d, cursors) -> np.ndarray | None:
     masks = []
     for c in cursors:
         if c.get("kind") == "ellipse":
+            radius_minor = c.get("radius_minor")
+            if radius_minor is None:
+                radius_minor = c["radius"] * 0.65
             mk = mask_from_elliptic_cursor(
                 g, s, [c["center_real"]], [c["center_imag"]],
                 radius=[c["radius"]],
-                radius_minor=[c.get("radius_minor", c["radius"] * 0.65)],
+                radius_minor=[radius_minor],
                 angle=[c.get("angle", 0.0)],
             )
         else:
