@@ -38,6 +38,8 @@ def calibration_to_dict(cal: ReferenceCalibration, *, ui_extra: dict | None = No
         "manual_mean": cal.manual_mean,
         "values_ready": cal.values_ready,
     }
+    if cal.harmonic_gs:
+        d["harmonic_gs"] = [[float(g), float(s)] for g, s in cal.harmonic_gs]
     if ui_extra:
         d["ui"] = ui_extra
     return d
@@ -53,6 +55,10 @@ def calibration_from_dict(data: dict) -> ReferenceCalibration:
         Populated :class:`~flim_phasors.calibration.ReferenceCalibration` without
         loaded phasor maps (histogram not restored from JSON).
     """
+    harmonic_gs = None
+    raw_gs = data.get("harmonic_gs")
+    if isinstance(raw_gs, list) and raw_gs:
+        harmonic_gs = [(float(pair[0]), float(pair[1])) for pair in raw_gs]
     cal = ReferenceCalibration(
         source_path=str(data.get("source_path", "")),
         channel=int(data.get("channel", 0)),
@@ -61,6 +67,7 @@ def calibration_from_dict(data: dict) -> ReferenceCalibration:
         mean_g=float(data.get("mean_g", 0.0)),
         mean_s=float(data.get("mean_s", 0.0)),
         mean_intensity=float(data.get("mean_intensity", 1.0)),
+        harmonic_gs=harmonic_gs,
         use_manual=bool(data.get("use_manual", False)),
         manual_g=float(data.get("manual_g", 0.0)),
         manual_s=float(data.get("manual_s", 0.0)),

@@ -162,6 +162,15 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         row_s.addWidget(ch_lbl)
         row_s.addWidget(self.cb_channel)
         sl.addLayout(row_s)
+        self.chk_fast_load = QtWidgets.QCheckBox("Fast load (single channel)")
+        self.chk_fast_load.setToolTip(
+            "Decode only the selected channel to save memory and time.\n"
+            "Best for multi-channel files. Switching channel re-decodes the file.")
+        self.chk_fast_load.setChecked(
+            self._settings.value("fast_load", False, type=bool)
+            if hasattr(self, "_settings") else False)
+        self.chk_fast_load.toggled.connect(self._on_fast_load_toggled)
+        sl.addWidget(self.chk_fast_load)
         self.lbl_sample = QtWidgets.QLabel("(no sample)")
         self.lbl_sample.setStyleSheet(_lbl_file)
         self.lbl_sample.setWordWrap(True)
@@ -198,6 +207,16 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         io_row.addWidget(sample_col, 1)
         io_row.addWidget(ref_col, 1)
         io_main.addLayout(io_row)
+        self.btn_calibrate = QtWidgets.QPushButton("Recalibrate")
+        self.btn_calibrate.setToolTip(
+            "Optional: reference g/s are computed automatically when you pick a "
+            "reference and when you Apply. Use this to force a re-decode / refresh "
+            "the reference preview without processing samples.")
+        self.btn_calibrate.clicked.connect(self.calibrate_reference)
+        row_cal_io = QtWidgets.QHBoxLayout()
+        row_cal_io.addWidget(self.btn_calibrate)
+        row_cal_io.addStretch(1)
+        io_main.addLayout(row_cal_io)
         self.txt_log = QtWidgets.QPlainTextEdit()
         self.txt_log.setObjectName("activity_log")
         self.txt_log.setReadOnly(True)
@@ -217,7 +236,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         proc_active_l.addWidget(QtWidgets.QLabel("Active sample"))
         self.cb_sample = QtWidgets.QComboBox()
         self.cb_sample.setToolTip(
-            "Sample shown in the plots and used for Calibrate / Apply below.")
+            "Sample shown in the plots and used for Apply below.")
         self.cb_sample.currentIndexChanged.connect(self._on_sample_combo_change)
         proc_active_l.addWidget(self.cb_sample, 1)
         self.lbl_proc_active = QtWidgets.QLabel("")
@@ -340,23 +359,21 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.edit_ref_g.setEnabled(False)
         self.edit_ref_s.setEnabled(False)
         row_cal_apply = QtWidgets.QHBoxLayout()
-        self.btn_calibrate = QtWidgets.QPushButton("Calibrate")
-        self.btn_calibrate.setToolTip(
-            "Compute reference g/s from the file chosen under Reference (no sample processing).")
-        self.btn_calibrate.clicked.connect(self.calibrate_reference)
         self.btn_apply = QtWidgets.QPushButton("Apply")
         self.btn_apply.clicked.connect(lambda: self.apply_processing(scope="active"))
         self.btn_apply_all = QtWidgets.QPushButton("Apply all")
         self.btn_apply_all.setToolTip(
-            "Preprocess every loaded sample. In multi-image mode each sample uses "
-            "its own saved filter settings.")
+            "Preprocess every loaded sample using the filter and threshold "
+            "settings currently shown on the Setup tab.")
         self.btn_apply_all.clicked.connect(lambda: self.apply_processing(scope="all"))
         self.btn_apply_all.setVisible(False)
-        row_cal_apply.addWidget(self.btn_calibrate)
         row_cal_apply.addWidget(self.btn_apply, 1)
         row_cal_apply.addWidget(self.btn_apply_all, 1)
         prg.addLayout(row_cal_apply, 10, 0, 1, 4)
         self.sp_harm.valueChanged.connect(self._on_harm_or_ref_setting_changed)
+        self.cb_filter.currentTextChanged.connect(self._on_harm_or_ref_setting_changed)
+        self.sp_reflt.valueChanged.connect(self._on_ref_lifetime_or_freq_changed)
+        self.sp_freq.valueChanged.connect(self._on_ref_lifetime_or_freq_changed)
         proc_vl.addWidget(self.proc_inner)
         setup_l.addWidget(self.gb_proc)
         setup_l.addStretch(1)
@@ -609,8 +626,16 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             "Ellipse scale for phasorpy phasor_cluster_gmm (95% contour at 2.0).")
         gbl.addWidget(self.edit_gmm_sigma, 2, 1)
         b_fit = QtWidgets.QPushButton("Fit GMM"); b_fit.clicked.connect(self.fit_gmm)
+        b_fit.setToolTip("Fit GMM on the active sample and paint (remembered per image).")
+        b_fit_all = QtWidgets.QPushButton("Fit all")
+        b_fit_all.setToolTip(
+            "Fit GMM on every loaded sample with the current k/σ, keep results per image, "
+            "then Export all to save them together.")
+        b_fit_all.clicked.connect(self.fit_gmm_all)
         b_clr_gmm = QtWidgets.QPushButton("Clear"); b_clr_gmm.clicked.connect(self.clear_gmm)
-        gbl.addWidget(b_fit, 2, 2); gbl.addWidget(b_clr_gmm, 2, 3)
+        gbl.addWidget(b_fit, 2, 2)
+        gbl.addWidget(b_fit_all, 3, 2)
+        gbl.addWidget(b_clr_gmm, 2, 3)
         self.gmm_box.setVisible(False); ml.addWidget(self.gmm_box)
         analyze_l.addWidget(gb_mode)
 
@@ -630,7 +655,8 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         al.addLayout(row_paint)
         self.btn_export = QtWidgets.QPushButton("Export all…")
         self.btn_export.setToolTip(
-            "Save a folder with phasor plot, maps for every sample, tables, session JSON, and Excel (if openpyxl).")
+            "Save one folder for the whole session: each sample's maps, remembered GMM/paint "
+            "results, tables, analysis.xlsx, and session.json.")
         self.btn_export.clicked.connect(self.export_all)
         al.addWidget(self.btn_export)
         analyze_l.addWidget(self.gb_act)
@@ -679,12 +705,15 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.cb_image_view = QtWidgets.QComboBox()
         self.cb_image_view.addItems(list(IMAGE_VIEW_ITEMS))
         self.cb_image_view.setToolTip(
-            "Pixel maps from Apply settings. Use Photons (masked/raw) for intensity; "
-            "τ maps need Apply. LIF files use LAS X photon counts when available.")
-        self.cb_image_view.currentIndexChanged.connect(self.refresh_image)
+            "Pixel maps from Apply settings. "
+            "Photons (masked) hides pixels below Min N / invalid phasors; "
+            "Brightfield (all photons) shows the full intensity including filtered-out pixels. "
+            "τ maps need Apply. Selecting a view turns Overlay off so the map is visible.")
+        self.cb_image_view.currentIndexChanged.connect(self._on_image_view_changed)
         row_img_view.addWidget(self.cb_image_view, 1)
         rv.addLayout(row_img_view)
         self.image = ImageCanvas(self)
+        self.image.imageClicked.connect(self._on_image_click)
         self.image_toolbar = NavigationToolbar(self.image, self)
         self.image_toolbar.setObjectName("mpl_toolbar")
         rv.addWidget(self.image_toolbar)
@@ -707,7 +736,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
         self.status = self.statusBar()
         self._log(
-            "Ready — load sample(s), choose Reference, Calibrate, then Apply to preprocess.")
+            "Ready — load sample(s), choose Reference, then Apply (calibration is automatic).")
 
     def _log(self, message, update_status=True):
         """Append a timestamped line to the Files log and optionally the status bar."""
@@ -1074,6 +1103,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         loaded = []
         t_decode = 0.0
         frame = int(self.sp_frame.value()) if hasattr(self, "sp_frame") else -1
+        load_ch = self.cb_channel.currentIndex() if self.chk_fast_load.isChecked() else None
         for i, (path, lif_key) in enumerate(jobs):
             d = PhasorData()
             label = os.path.basename(path)
@@ -1089,7 +1119,8 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
                 else:
                     (shape, nch), elapsed = self._run_busy(
                         f"Decoding {i + 1}/{n}: {label}…",
-                        lambda p=path, ds=d, fr=frame: ds.load_sample(p, frame=fr),
+                        lambda p=path, ds=d, fr=frame, lc=load_ch: ds.load_sample(
+                            p, frame=fr, load_channel=lc),
                     )
                 t_decode += elapsed
                 loaded.append((d, path, shape, nch, lif_key))
@@ -1143,11 +1174,11 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self._log(
                 f"{len(loaded)} sample(s) loaded ({self._fmt_elapsed(t_decode + t_preview)}) — "
                 f"uncalibrated preview ({n_valid} valid px). "
-                "Calibrate + Apply for reference-corrected maps.")
+                "Choose a Reference and Apply for reference-corrected maps.")
         else:
             self._log(
                 f"{len(loaded)} sample(s) decoded ({self._fmt_elapsed(t_decode)}) — "
-                "choose Reference, Calibrate, then Apply.")
+                "choose Reference, then Apply (calibration is automatic).")
 
     def _effective_ref_path(self, d=None):
         """Return the reference file path for a dataset (shared or per-sample)."""
@@ -1205,8 +1236,12 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             return self.shared_ref_path
         if self.data.ref_path:
             return self.data.ref_path
-        # Reference… may run before samples load — keep the last picked path.
-        return self.shared_ref_path or ""
+        # Per-sample mode: only fall back to the last picked path before any
+        # sample is loaded (Reference… can be chosen first). Once a sample is
+        # loaded its own (possibly empty) ref_path is authoritative.
+        if not dataset_has_sample(self.data):
+            return self.shared_ref_path or ""
+        return ""
 
     def _calibration_ready_for_apply(self) -> bool:
         """True when Apply can run without decoding the reference file again."""
@@ -1238,6 +1273,12 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         cal._maps = None
         self.ref_calibration = cal
         self.ref_calibration.use_manual = self.chk_manual_cal.isChecked()
+        # Keep ref-channel combo in sync (auto-calibrate path used to skip this).
+        self.shared_ref_n_channels = max(1, int(cal.n_channels))
+        self.shared_ref_channel = min(self.shared_ref_channel, self.shared_ref_n_channels - 1)
+        self.data.ref_n_channels = self.shared_ref_n_channels
+        self._propagate_shared_reference()
+        self._update_ref_channel_combo()
         if self.chk_manual_cal.isChecked():
             self._apply_manual_calibration_fields()
         else:
@@ -1246,8 +1287,12 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._update_ref_preview()
         self._mark_calibration_current()
         self._ensure_compare_overlay_off()
+        gs_note = ""
+        if cal.harmonic_gs and len(cal.harmonic_gs) > 1:
+            parts = [f"H{i + 1}=({g:.4f},{s:.4f})" for i, (g, s) in enumerate(cal.harmonic_gs)]
+            gs_note = " [" + "; ".join(parts) + "]"
         self._log(
-            f"Reference g/s stored (g={cal.mean_g:.4f}, s={cal.mean_s:.4f}) "
+            f"Reference g/s stored (g={cal.mean_g:.4f}, s={cal.mean_s:.4f}){gs_note} "
             f"— scalar calibration; reference file not kept in RAM "
             f"({self._fmt_elapsed(elapsed)}).")
         return True
@@ -1280,10 +1325,19 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         if not cal.is_active:
             self.lbl_cal_display.setText("(uncalibrated — load a reference file)")
             return
-        src = "manual g,s" if cal.use_manual else os.path.basename(cal.source_path or "")
+        if cal.use_manual:
+            src = "Manual g/s"
+            chan = ""
+        else:
+            src = os.path.basename(cal.source_path or "") or "reference"
+            chan = f"  |  ch {cal.channel}"
+        gs = f"g={cal.mean_g:.4f}, s={cal.mean_s:.4f}"
+        if cal.harmonic_gs and len(cal.harmonic_gs) > 1:
+            g2, s2 = cal.harmonic_gs[1]
+            gs += f" · H2 g={g2:.4f}, s={s2:.4f}"
         self.lbl_cal_display.setText(
-            f"{src}  |  g={cal.mean_g:.4f}, s={cal.mean_s:.4f}  |  "
-            f"τ_ref={self.sp_reflt.value():.2f} ns  |  ch {cal.channel}")
+            f"Calibrated · {src}  |  {gs}  |  "
+            f"τ_ref={self.sp_reflt.value():.2f} ns{chan}")
 
     def _on_manual_cal_toggled(self, checked):
         """Enable manual g/s entry and recompute file-based calibration when off."""
@@ -1328,6 +1382,13 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._log(
             f"Manual g/s set — g={g:.4f}, s={s:.4f}. "
             "Click Apply to preprocess sample(s) with this calibration.")
+
+    def _on_ref_lifetime_or_freq_changed(self, *_args):
+        """Refresh calibration label/preview: Ref τ and laser frequency change
+        the target phasor position but not the stored reference g/s."""
+        if self.ref_calibration.is_active:
+            self._update_calibration_display()
+            self._update_ref_preview()
 
     def _on_harm_or_ref_setting_changed(self, *_args):
         """Harmonic/filter changes need a fresh Calibrate before Apply."""
@@ -1379,8 +1440,15 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             return
         self._set_reference_path(path)
 
-    def _set_reference_path(self, path: str):
-        """Store reference path only; decode on Calibrate or automatically on Apply."""
+    def _set_reference_path(self, path: str, *, auto: bool = True):
+        """Store the reference path and (by default) calibrate automatically.
+
+        Args:
+            path: Reference file path.
+            auto: When True, decode the reference and compute g/s immediately so
+                no separate Calibrate click is needed. Set False from the manual
+                Calibrate button, which performs its own decode.
+        """
         norm_new = os.path.normcase(path or "")
         norm_old = os.path.normcase(self.ref_calibration.source_path or "")
         if norm_new and norm_old and norm_new != norm_old and not self.chk_manual_cal.isChecked():
@@ -1392,12 +1460,31 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._propagate_shared_reference()
         self.shared_ref_n_channels = max(1, self.shared_ref_n_channels)
         self._update_ref_channel_combo()
-        if self.ref_calibration.values_ready:
-            self._update_calibration_display()
+        self._log(f"Reference file selected: {os.path.basename(path)}.")
+        if auto and path and not self.chk_manual_cal.isChecked():
+            self._auto_calibrate_reference()
         else:
-            self.lbl_cal_display.setText(
-                f"{os.path.basename(path)} selected — click Calibrate to compute g/s.")
-        self._log(f"Reference file selected: {os.path.basename(path)} (not decoded yet).")
+            self._update_calibration_display()
+
+    def _auto_calibrate_reference(self) -> bool:
+        """Compute reference g/s on demand, without an explicit Calibrate click.
+
+        Decodes the reference once when a file is selected and g/s are not
+        current (first use, or after a harmonic/channel change invalidated them).
+
+        Returns:
+            True when calibration is ready to Apply (or intentionally
+            uncalibrated because no reference is selected); False if a reference
+            is selected but could not be decoded.
+        """
+        if self.chk_manual_cal.isChecked():
+            self._apply_manual_calibration_fields()
+            return self.ref_calibration.is_active
+        if not self._effective_ref_file_path():
+            return True
+        if self.ref_calibration.values_ready:
+            return True
+        return self._recompute_reference_calibration()
 
     def calibrate_reference(self):
         """Decode reference and compute g/s (does not preprocess samples)."""
@@ -1413,7 +1500,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
                 return
             if not is_supported_flim_path(path):
                 return
-            self._set_reference_path(path)
+            self._set_reference_path(path, auto=False)
         if self.chk_manual_cal.isChecked():
             self._apply_manual_calibration_fields()
             self.ref_calibration.use_manual = True
@@ -1429,9 +1516,10 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             return
         ref_nch = max(1, int(self.ref_calibration.n_channels))
         self.shared_ref_n_channels = ref_nch
+        # Keep the reference channel the user selected; only clamp to valid range.
+        # (Do not force it to the sample channel — the calibration was computed
+        # with the selected reference channel and the UI must stay consistent.)
         self.shared_ref_channel = min(self.shared_ref_channel, ref_nch - 1)
-        if dataset_has_sample(self.data) and self.data.signal_full is not None:
-            self.shared_ref_channel = min(self.data.channel, ref_nch - 1)
         self.data.ref_n_channels = ref_nch
         self._propagate_shared_reference()
         self._update_ref_channel_combo()
@@ -1732,17 +1820,17 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         """Enable frame spinbox when the active sample has a time stack."""
         d = self.data
         self.sp_frame.blockSignals(True)
-        if d.signal_full is None:
-            self.sp_frame.setEnabled(False)
-            self.sp_frame.setRange(-1, 0)
-            self.sp_frame.setValue(-1)
-        elif "T" in d.signal_full.dims and int(d.signal_full.sizes.get("T", 1)) > 1:
-            n = int(d.signal_full.sizes["T"])
+        n = int(getattr(d, "n_frames", 1) or 1)
+        # Prefer metadata stored at load — T is usually summed away during decode.
+        if d.signal_full is not None and "T" in d.signal_full.dims:
+            n = max(n, int(d.signal_full.sizes.get("T", 1)))
+        if dataset_has_sample(d) and n > 1:
             self.sp_frame.setEnabled(True)
             self.sp_frame.setRange(-1, n - 1)
             self.sp_frame.setValue(int(getattr(d, "frame_index", -1)))
         else:
             self.sp_frame.setEnabled(False)
+            self.sp_frame.setRange(-1, 0)
             self.sp_frame.setValue(-1)
         self.sp_frame.blockSignals(False)
 
@@ -1763,10 +1851,11 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             return
         ch = self.data.channel
         frame = self.data.frame_index
+        lc = ch if self.chk_fast_load.isChecked() else None
         try:
             self._run_busy(
                 f"Reloading frame {frame} ({os.path.basename(path)})…",
-                lambda: self.data.load_sample(path, frame=frame),
+                lambda: self.data.load_sample(path, frame=frame, load_channel=lc),
             )
         except Exception as e:
             self._log(f"Reload error: {e}")
@@ -2079,26 +2168,70 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             return
         if per_sample_processing(self):
             self._save_proc_from_ui(self.data)
+        if 0 <= self.active_idx < len(self.datasets):
+            self._stash_segmentation_to_dataset(self.datasets[self.active_idx])
         self.active_idx = idx
         self.data = self.datasets[idx]
         self._restore_ui_for_active()
         self._refresh_compare_list()
         self._update_multi_strip()
         self._update_phasor_display()
-        self.last_overlay = None
-        self.cluster_stats = []
-        if self.chk_live.isChecked() and self.mode == "cursor" and self.phasor.cursors \
-                and self.data.real_cal is not None:
+        self._restore_segmentation_from_dataset(self.data)
+        # Live cursor refresh only when this sample has no stored segmentation yet
+        if (
+            self.chk_live.isChecked()
+            and self.mode == "cursor"
+            and self.phasor.cursors
+            and self.data.real_cal is not None
+            and not getattr(self.data, "cluster_stats", None)
+        ):
             self._compute_cursor()
-        else:
-            self._fill_table()
-            self.chk_overlay.blockSignals(True)
-            self.chk_overlay.setChecked(False)
-            self.chk_overlay.blockSignals(False)
-            self.refresh_image()
         self._log(f"Selected sample {idx + 1}: {dataset_display_label(self.data, idx)}")
         self.activateWindow()
         self.raise_()
+
+    def _stash_segmentation_to_dataset(self, d=None):
+        """Remember GMM fit, cluster table, and overlay on a sample dataset."""
+        d = self.data if d is None else d
+        if d is None:
+            return
+        d.gmm_fit = getattr(self, "_gmm_fit", None)
+        d.cluster_stats = [dict(st) for st in (self.cluster_stats or [])]
+        if self.last_overlay is None:
+            d.last_overlay = None
+        else:
+            d.last_overlay = np.asarray(self.last_overlay).copy()
+
+    def _clear_segmentation_on_dataset(self, d):
+        """Drop stored GMM / paint results for one sample (e.g. after Apply)."""
+        if d is None:
+            return
+        d.gmm_fit = None
+        d.cluster_stats = []
+        d.last_overlay = None
+
+    def _restore_segmentation_from_dataset(self, d=None):
+        """Restore GMM ellipses, table, and overlay from a sample's stash."""
+        d = self.data if d is None else d
+        fit = getattr(d, "gmm_fit", None) if d is not None else None
+        if fit is not None:
+            self._gmm_fit = fit
+            n = len(fit[0])
+            colors = [categorical_rgb(k) for k in range(n)]
+            self.phasor.show_gmm_ellipses(*fit, colors)
+        else:
+            self.phasor.clear_gmm()
+            if hasattr(self, "_gmm_fit"):
+                del self._gmm_fit
+        self.cluster_stats = [dict(st) for st in (getattr(d, "cluster_stats", None) or [])]
+        overlay = getattr(d, "last_overlay", None) if d is not None else None
+        self.last_overlay = None if overlay is None else np.asarray(overlay).copy()
+        self._fill_table()
+        has_overlay = self.last_overlay is not None
+        self.chk_overlay.blockSignals(True)
+        self.chk_overlay.setChecked(has_overlay)
+        self.chk_overlay.blockSignals(False)
+        self.refresh_image()
 
     def apply_settings_to_all(self):
         """Copy active sample's processing settings to all datasets and Apply all."""
@@ -2133,14 +2266,63 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._activate_dataset(self.active_idx)
 
     def on_channel_change(self, idx):
-        """Switch sample channel and reprocess if maps already exist."""
+        """Switch sample channel and reprocess if maps already exist.
+
+        In fast-load mode only one channel is in memory, so selecting a
+        different channel re-decodes just that channel.
+        """
         if self.data.signal_full is None:
             return
-        self.data.channel = max(0, idx)
+        new_ch = max(0, idx)
+        if new_ch == self.data.channel:
+            return
+        self.data.channel = new_ch
+        loaded = getattr(self.data, "fast_loaded_channel", None)
+        if loaded is not None and new_ch != loaded:
+            self._reload_sample_channel(new_ch)
+            return
         if self.data.real_cal is not None:
             self.apply_processing()
         else:
             self._log(f"Sample channel {self.data.channel} — click Apply to preprocess.")
+
+    def _reload_sample_channel(self, new_ch):
+        """Re-decode only ``new_ch`` for the active sample (fast-load mode)."""
+        path = self.data.sample_path
+        if not path or not os.path.isfile(path):
+            return
+        frame = self.data.frame_index
+        had_maps = self.data.real_cal is not None
+        try:
+            self._run_busy(
+                f"Loading channel {new_ch} ({os.path.basename(path)})…",
+                lambda: self.data.load_sample(path, frame=frame, load_channel=new_ch),
+            )
+        except Exception as e:
+            self._log(f"Channel load error: {e}")
+            QtWidgets.QMessageBox.critical(self, "Channel load error", str(e))
+            return
+        if had_maps:
+            self.apply_processing()
+        else:
+            try:
+                self._process_uncalibrated_preview([self.data])
+            except Exception:
+                pass
+            self.refresh_image()
+            self._log(f"Channel {new_ch} decoded — click Apply to preprocess.")
+
+    def _on_fast_load_toggled(self, checked):
+        """Persist the fast-load preference and explain the trade-off."""
+        self._settings.setValue("fast_load", bool(checked))
+        if checked:
+            self._log(
+                "Fast load on — only the selected channel is decoded "
+                "(switching channel re-decodes the file).")
+        else:
+            self._log(
+                "Fast load off — all channels are decoded and kept "
+                "for instant channel switching.")
 
     def on_ref_channel_change(self, idx):
         """Change reference channel and invalidate stored g/s until Calibrate."""
@@ -2157,7 +2339,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self.ref_calibration._maps = None
             self._update_calibration_display()
             self._update_calibration_stale_style()
-            self._log("Reference channel changed — click Calibrate to update g/s, then Apply.")
+            self._log("Reference channel changed — g/s will be recomputed automatically on Apply.")
             return
 
     # ---- processing --------------------------------------------------------
@@ -2191,15 +2373,22 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             scope = "active"
         if per_sample_processing(self):
             self._save_proc_from_ui(self.data)
+            if scope == "all":
+                snap = capture_processing_from_ui(self)
+                for d in self.datasets:
+                    d.processing_settings = dict(snap)
         self.data.pixel_size_um = self.sp_pixel_um.value() if hasattr(self, "sp_pixel_um") else 0.0
         if not self._calibration_ready_for_apply():
-            QtWidgets.QMessageBox.information(
-                self,
-                "Calibration",
-                "A reference file is selected but g/s are not set yet.\n"
-                "Click Calibrate (decodes the reference once) or Load cal…, then Apply.",
-            )
-            return
+            # Auto-calibrate: decode the reference once and compute g/s, then
+            # continue — no separate Calibrate click required.
+            if not self._auto_calibrate_reference() or not self._calibration_ready_for_apply():
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Calibration",
+                    "Set a reference first: choose a reference file, or enable "
+                    "Manual ref phasor and click Set g/s.",
+                )
+                return
         try:
             if scope == "all" and multi:
                 _, elapsed = self._run_busy(
@@ -2217,6 +2406,22 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self._log(f"Processing error: {e}")
             QtWidgets.QMessageBox.critical(self, "Processing error", repr(e))
             return
+        # Maps changed — drop stale per-sample GMM / paint results
+        if scope == "all" and multi:
+            for d in self.datasets:
+                self._clear_segmentation_on_dataset(d)
+            if hasattr(self, "_gmm_fit"):
+                del self._gmm_fit
+            self.last_overlay = None
+            self.cluster_stats = []
+            self.phasor.clear_gmm()
+        else:
+            self._clear_segmentation_on_dataset(self.data)
+            if hasattr(self, "_gmm_fit"):
+                del self._gmm_fit
+            self.last_overlay = None
+            self.cluster_stats = []
+            self.phasor.clear_gmm()
         self._refresh_views_after_processing()
         if self.ref_calibration.is_active:
             ch = self._ref_channel_for_dataset(self.data)
@@ -2336,9 +2541,13 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             del self._gmm_fit
         self.last_overlay = None
         self.cluster_stats = []
+        self._clear_segmentation_on_dataset(self.data)
         self._fill_table()
+        self.chk_overlay.blockSignals(True)
+        self.chk_overlay.setChecked(False)
+        self.chk_overlay.blockSignals(False)
         self.refresh_image()
-        self._log("GMM fit cleared.")
+        self._log("GMM cleared.")
 
     def _sync_radius_controls(self, r: float):
         """Set slider and spinbox to the selected cursor's radius without signals."""
@@ -2508,6 +2717,57 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         colors = [categorical_rgb(k) for k in range(n)]
         self.phasor.show_gmm_ellipses(*self._gmm_fit, colors)
         self._compute_gmm()
+        self._stash_segmentation_to_dataset(self.data)
+        return
+
+    def fit_gmm_all(self):
+        """Fit GMM on every loaded sample and keep results per image for Export all."""
+        if not HAVE_SKLEARN:
+            QtWidgets.QMessageBox.warning(self, "Missing dependency", "pip install scikit-learn")
+            return
+        if not self.rb_gmm.isChecked():
+            self.rb_gmm.setChecked(True)
+        datasets = self._all_datasets() if hasattr(self, "_all_datasets") else [self.data]
+        targets = [
+            (i, d) for i, d in enumerate(datasets)
+            if d.real_cal is not None and int(d.valid_mask().sum()) >= 10
+        ]
+        if not targets:
+            QtWidgets.QMessageBox.information(
+                self, "GMM", "Load data and click Apply on samples first.")
+            return
+        self._stash_segmentation_to_dataset(self.data)
+        saved_data = self.data
+        saved_idx = self.active_idx
+        ok = 0
+        errors = []
+        for i, d in targets:
+            self.data = d
+            self.active_idx = i
+            try:
+                (fit, n_clusters, sigma), _elapsed = self._run_busy(
+                    f"Fitting GMM ({i + 1}/{len(datasets)})…", self._fit_gmm_worker)
+            except CancelledError:
+                break
+            except Exception as e:
+                errors.append(f"{dataset_short_label(d, i)}: {e}")
+                continue
+            self._gmm_fit = fit
+            self._compute_gmm()
+            self._stash_segmentation_to_dataset(d)
+            ok += 1
+            self._log(
+                f"GMM on {dataset_short_label(d, i)}: {n_clusters} cluster(s), σ={sigma:.1f}.")
+        self.data = saved_data
+        self.active_idx = saved_idx
+        self._restore_ui_for_active()
+        self._update_phasor_display()
+        self._restore_segmentation_from_dataset(self.data)
+        self._log(f"GMM fitted on {ok} sample(s). Use Export all… to save them together.")
+        if errors:
+            QtWidgets.QMessageBox.warning(
+                self, "GMM (partial)",
+                f"Fitted {ok} sample(s). Failures:\n" + "\n".join(errors[:8]))
         return
 
     def _on_phasor_click(self, g, s):
@@ -2524,6 +2784,34 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._log(
             f"Phasor click ({g:.3f}, {s:.3f}) → τφ={tp:.3f} ns, τmod={tm:.3f} ns, τn={tn:.3f} ns")
 
+    def _on_image_click(self, y, x):
+        """Mark the phasor point for a clicked image pixel and log lifetimes."""
+        if self.data.real_cal is None or self.data.work_frequency <= 0:
+            self._log("Image click — run Apply first to compute phasors.")
+            return
+        valid = self.data.valid_mask()
+        h, w = valid.shape
+        if y < 0 or x < 0 or y >= h or x >= w:
+            return
+        if not valid[y, x]:
+            self._log(f"Image click ({x}, {y}) — pixel masked (below threshold).")
+            return
+        g = float(self.data.real_cal[y, x])
+        s = float(self.data.imag_cal[y, x])
+        if not np.isfinite(g) or not np.isfinite(s):
+            self._log(f"Image click ({x}, {y}) — no valid phasor at this pixel.")
+            return
+        self.phasor.set_click_marker(g, s)
+        self.image.set_click_marker(y, x)
+        try:
+            tp, tm, tn = lifetimes_at_phasor(g, s, self.data.work_frequency)
+        except Exception as e:
+            self._log(f"Image readout failed: {e}")
+            return
+        self._log(
+            f"Image click ({x}, {y}) → phasor ({g:.3f}, {s:.3f}), "
+            f"τφ={tp:.3f} ns, τmod={tm:.3f} ns, τn={tn:.3f} ns")
+
     def _highlight_phasor_on_image(self, g, s):
         """Mark nearest valid pixel to the clicked phasor on the image view."""
         if self.data.real_cal is None:
@@ -2536,16 +2824,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         idx = int(np.argmin((gr - g) ** 2 + (gi - s) ** 2))
         ys, xs = np.where(valid)
         y, x = int(ys[idx]), int(xs[idx])
-        disp = self._photon_image_filtered()
-        if disp is not None:
-            log_scale = getattr(self, "chk_log_display", None) and self.chk_log_display.isChecked()
-            auto_c = not getattr(self, "chk_auto_contrast", None) or self.chk_auto_contrast.isChecked()
-            self.image.show_intensity(
-                disp, log_scale=log_scale, auto_contrast=auto_c,
-                title="Nearest pixel to phasor click")
-            self.image.ax.plot(x, y, "c+", ms=14, mew=2)
-            self.image.draw_idle()
-            self._draw_scale_bar()
+        self.image.set_click_marker(y, x)
 
     # ---- compute lifetimes + paint ----------------------------------------
     def compute_and_paint(self):
@@ -2613,6 +2892,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
                                            area=100.0 * n / total_valid))
         self._paint(masks, colors)
         self._fill_table()
+        self._stash_segmentation_to_dataset(self.data)
 
     def _compute_gmm(self):
         """Label pixels by GMM components and paint cluster segmentation."""
@@ -2640,6 +2920,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
                                            area=100.0 * n / total_valid))
         self._paint(masks, colors)
         self._fill_table()
+        self._stash_segmentation_to_dataset(self.data)
 
     def _phasor_valid_mask(self):
         """Return the boolean mask of pixels included in the phasor plot."""
@@ -2680,6 +2961,14 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.last_overlay = np.clip(np.asarray(overlay), 0, 1)
         self.chk_overlay.setChecked(True); self.refresh_image()
 
+    def _on_image_view_changed(self):
+        """Show the selected View map; turn Overlay off so it is not hidden."""
+        if hasattr(self, "chk_overlay") and self.chk_overlay.isChecked():
+            self.chk_overlay.blockSignals(True)
+            self.chk_overlay.setChecked(False)
+            self.chk_overlay.blockSignals(False)
+        self.refresh_image()
+
     def refresh_image(self):
         """Show segmentation overlay or the selected base image view."""
         if self.chk_overlay.isChecked() and self.last_overlay is not None:
@@ -2693,7 +2982,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self._show_base_image()
 
     def _show_base_image(self):
-        """Render the view selected above the image (masked like the phasor plot)."""
+        """Render the view selected above the image."""
         choice = (
             self.cb_image_view.currentText()
             if hasattr(self, "cb_image_view")
@@ -2704,8 +2993,8 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
                 disp = self._photon_image_filtered()
                 title = "Photons (masked)"
             else:
-                disp = self.data.mean_raw
-                title = "Photons (raw)"
+                disp = self.data.intensity_brightfield()
+                title = "Brightfield (all photons)"
             if disp is not None:
                 log_scale = getattr(self, "chk_log_display", None) and self.chk_log_display.isChecked()
                 auto_c = not getattr(self, "chk_auto_contrast", None) or self.chk_auto_contrast.isChecked()

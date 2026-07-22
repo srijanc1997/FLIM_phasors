@@ -14,8 +14,31 @@ from dataclasses import dataclass, field
 import numpy as np
 from phasorpy.phasor import phasor_from_signal
 
-from flim_phasors.io import load_flim_signal
+from flim_phasors.io import flim_channel_count, load_flim_signal
 from flim_phasors.utils import reduce_signal, to_2d
+
+
+def _weighted_gs(rmean, rreal, rimag) -> tuple[float, float, float]:
+    """Intensity-weighted mean g/s (phasorpy ``phasor_center`` / mean method)."""
+    rmean = np.asarray(rmean, dtype=float)
+    rreal = np.asarray(rreal, dtype=float)
+    rimag = np.asarray(rimag, dtype=float)
+    finite = np.isfinite(rreal) & np.isfinite(rimag) & np.isfinite(rmean)
+    if not np.any(finite):
+        return 0.0, 0.0, 1.0
+    weights = np.clip(rmean[finite], 0.0, None)
+    wsum = float(weights.sum())
+    if wsum > 0:
+        return (
+            float(np.average(rreal[finite], weights=weights)),
+            float(np.average(rimag[finite], weights=weights)),
+            float(np.mean(rmean[finite])),
+        )
+    return (
+        float(np.mean(rreal[finite])),
+        float(np.mean(rimag[finite])),
+        1.0,
+    )
 
 
 @dataclass
@@ -32,9 +55,10 @@ class ReferenceCalibration:
         channel: Emission channel index used when building reference maps.
         n_channels: Number of channels in the reference file.
         harmonic: Harmonic index used for phasor transform (1 = fundamental).
-        mean_g: Spatial mean of reference g after ``set_maps``.
-        mean_s: Spatial mean of reference s after ``set_maps``.
+        mean_g: Spatial mean of reference g after ``set_maps`` (first harmonic).
+        mean_s: Spatial mean of reference s after ``set_maps`` (first harmonic).
         mean_intensity: Spatial mean of reference photon counts.
+        harmonic_gs: Optional per-harmonic ``(g, s)`` pairs for PAW-FLIM.
         use_manual: When True, ``manual_g`` / ``manual_s`` override file maps.
         manual_g: User-entered reference g for uniform calibration.
         manual_s: User-entered reference s for uniform calibration.
@@ -49,6 +73,7 @@ class ReferenceCalibration:
     mean_g: float = 0.0
     mean_s: float = 0.0
     mean_intensity: float = 1.0
+    harmonic_gs: list[tuple[float, float]] | None = None
     use_manual: bool = False
     manual_g: float = 0.0
     manual_s: float = 0.0
@@ -87,14 +112,36 @@ class ReferenceCalibration:
         rreal = to_2d(np.asarray(rreal, dtype=float))
         rimag = to_2d(np.asarray(rimag, dtype=float))
         self._maps = (rmean, rreal, rimag)
-        finite = np.isfinite(rreal) & np.isfinite(rimag)
-        if np.any(finite):
-            self.mean_g = float(np.nanmean(rreal[finite]))
-            self.mean_s = float(np.nanmean(rimag[finite]))
-            self.mean_intensity = float(np.nanmean(rmean[finite]))
-        else:
-            self.mean_g = self.mean_s = 0.0
-            self.mean_intensity = 1.0
+        self.mean_g, self.mean_s, self.mean_intensity = _weighted_gs(rmean, rreal, rimag)
+        self.harmonic_gs = [(self.mean_g, self.mean_s)]
+        self.values_ready = True
+
+    def set_harmonic_means(self, rmean, rreal, rimag):
+        """Store per-harmonic weighted mean g/s (PAW-FLIM dual-harmonic path).
+
+        Does not keep full spatial maps in RAM. ``mean_g`` / ``mean_s`` are set
+        from the first harmonic.
+
+        Args:
+            rmean: Reference intensity map ``(Y, X)``.
+            rreal: Reference g with leading harmonic axis ``(n_harm, Y, X)``.
+            rimag: Reference s with leading harmonic axis ``(n_harm, Y, X)``.
+        """
+        rmean = to_2d(np.asarray(rmean, dtype=float))
+        rreal = np.asarray(rreal, dtype=float)
+        rimag = np.asarray(rimag, dtype=float)
+        if rreal.ndim != 3 or rimag.ndim != 3:
+            raise ValueError(
+                f"Expected harmonic g/s with shape (n, Y, X); got {rreal.shape}, {rimag.shape}")
+        if rreal.shape != rimag.shape:
+            raise ValueError(f"g/s harmonic shapes differ: {rreal.shape} vs {rimag.shape}")
+        self._maps = None
+        self.harmonic_gs = []
+        for i in range(rreal.shape[0]):
+            g, s, inten = _weighted_gs(rmean, rreal[i], rimag[i])
+            self.harmonic_gs.append((g, s))
+            if i == 0:
+                self.mean_g, self.mean_s, self.mean_intensity = g, s, inten
         self.values_ready = True
 
     def maps_for_shape(self, shape: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -105,12 +152,29 @@ class ReferenceCalibration:
         fields are built from ``mean_g``, ``mean_s``, and ``mean_intensity``.
         Stored spatial maps are returned unchanged when their shape matches.
 
+        For dual-harmonic sample arrays ``shape=(n_harm, Y, X)``, returns
+        ``rmean`` of shape ``(Y, X)`` and ``rreal``/``rimag`` of shape
+        ``(n_harm, Y, X)`` — the layout ``phasor_calibrate`` requires.
+
         Args:
-            shape: Target spatial shape ``(height, width)`` of the sample maps.
+            shape: Sample ``real`` array shape: ``(Y, X)`` or ``(n_harm, Y, X)``.
 
         Returns:
-            Tuple ``(rmean, rreal, rimag)`` of float arrays with shape ``shape``.
+            Tuple ``(rmean, rreal, rimag)`` shaped for ``phasor_calibrate``.
         """
+        # Dual-harmonic PAW-FLIM: real/imag are (n_harm, Y, X); mean must stay (Y, X).
+        if len(shape) == 3:
+            n_harm, *spatial = shape
+            spatial = tuple(spatial)
+            rmean, rreal_2d, rimag_2d = self._scalar_or_spatial_2d(spatial)
+            rreal, rimag = self._expand_gs_to_harmonics(
+                n_harm, spatial, rreal_2d, rimag_2d)
+            return rmean, rreal, rimag
+
+        return self._scalar_or_spatial_2d(shape)
+
+    def _scalar_or_spatial_2d(self, shape: tuple[int, ...]):
+        """Build or return 2-D reference maps for a spatial ``shape``."""
         if self.use_manual:
             g = float(self.manual_g)
             s = float(self.manual_s)
@@ -121,7 +185,6 @@ class ReferenceCalibration:
                 np.full(shape, s, dtype=float),
             )
         if self._maps is None:
-            # Saved g/s only (Load cal JSON, session metadata) — uniform reference field.
             return (
                 np.full(shape, float(self.mean_intensity), dtype=float),
                 np.full(shape, float(self.mean_g), dtype=float),
@@ -130,11 +193,36 @@ class ReferenceCalibration:
         rmean, rreal, rimag = self._maps
         if rreal.shape == shape:
             return rmean, rreal, rimag
-        # Broadcast scalar means if stored maps differ (e.g. after resize)
         return (
             np.full(shape, self.mean_intensity, dtype=float),
             np.full(shape, self.mean_g, dtype=float),
             np.full(shape, self.mean_s, dtype=float),
+        )
+
+    def _expand_gs_to_harmonics(self, n_harm, spatial, rreal_2d, rimag_2d):
+        """Stack per-harmonic g/s planes for multi-harmonic ``phasor_calibrate``."""
+        if self.use_manual:
+            g = float(self.manual_g)
+            s = float(self.manual_s)
+            return (
+                np.stack([np.full(spatial, g, dtype=float) for _ in range(n_harm)]),
+                np.stack([np.full(spatial, s, dtype=float) for _ in range(n_harm)]),
+            )
+        gs = self.harmonic_gs
+        if gs and len(gs) >= n_harm:
+            return (
+                np.stack([np.full(spatial, g, dtype=float) for g, _ in gs[:n_harm]]),
+                np.stack([np.full(spatial, s, dtype=float) for _, s in gs[:n_harm]]),
+            )
+        # Fallback: broadcast primary (or 2-D map) to every harmonic plane.
+        if rreal_2d.shape == spatial:
+            return (
+                np.broadcast_to(rreal_2d, (n_harm, *spatial)).copy(),
+                np.broadcast_to(rimag_2d, (n_harm, *spatial)).copy(),
+            )
+        return (
+            np.stack([np.full(spatial, float(self.mean_g)) for _ in range(n_harm)]),
+            np.stack([np.full(spatial, float(self.mean_s)) for _ in range(n_harm)]),
         )
 
     def clear(self):
@@ -144,6 +232,7 @@ class ReferenceCalibration:
         self._maps = None
         self.mean_g = self.mean_s = 0.0
         self.mean_intensity = 1.0
+        self.harmonic_gs = None
         self.use_manual = False
         self.values_ready = False
 
@@ -157,14 +246,14 @@ def compute_reference_phasor(
 
     Loads the reference TCSPC stack, reduces to one channel, transforms along
     the time axis (``axis="H"``) with ``phasor_from_signal``, and stores 2-D
-    mean/g/s maps in a ``ReferenceCalibration``. The raw signal is released
-    after transform to limit memory use.
+    mean/g/s maps (or per-harmonic scalars for PAW-FLIM) in a
+    ``ReferenceCalibration``. The raw signal is released after transform to
+    limit memory use.
 
     Args:
         ref_path: Path to the reference FLIM container (e.g. .lif, .ptu).
         channel: Emission channel index to use after multi-channel reduction.
-        harmonic: Single harmonic index or list (e.g. ``[1, 2]`` for dual-harmonic);
-            only the first harmonic's g/s maps are stored when a list is given.
+        harmonic: Single harmonic index or list (e.g. ``[1, 2]`` for dual-harmonic).
 
     Returns:
         Populated ``ReferenceCalibration`` with ``values_ready`` True.
@@ -174,9 +263,16 @@ def compute_reference_phasor(
         harm = int(harmonic)
     else:
         harm = list(harmonic)
-    sig = load_flim_signal(ref_path, channel=None, frame=-1, dtype=np.uint32)
-    n_channels = int(sig.sizes["C"]) if "C" in sig.dims else 1
-    rsig = reduce_signal(sig, int(channel))
+    # The reference only ever uses one channel, so decode just that one to keep
+    # peak memory and binning cost low (the reference histogram is discarded below).
+    n_channels = flim_channel_count(ref_path)
+    ch = int(channel)
+    if n_channels:
+        ch = min(ch, n_channels - 1)
+    sig = load_flim_signal(ref_path, channel=ch, frame=-1, dtype=np.uint32)
+    if not n_channels:
+        n_channels = int(sig.sizes["C"]) if "C" in getattr(sig, "dims", ()) else 1
+    rsig = reduce_signal(sig, 0)
     del sig
     rmean, rreal, rimag = phasor_from_signal(rsig, axis="H", harmonic=harm)
     del rsig
@@ -187,7 +283,8 @@ def compute_reference_phasor(
         harmonic=harm if isinstance(harm, int) else harm[0],
     )
     if isinstance(harm, list):
-        cal.set_maps(to_2d(rmean), to_2d(rreal[0]), to_2d(rimag[0]))
+        # Keep per-harmonic scalars (needed for correct PAW-FLIM calibration).
+        cal.set_harmonic_means(rmean, rreal, rimag)
     else:
         cal.set_maps(rmean, rreal, rimag)
     return cal

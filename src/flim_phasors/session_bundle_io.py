@@ -76,13 +76,17 @@ def _maps_from_dataset(d: PhasorData) -> dict[str, np.ndarray]:
         d: Processed :class:`~flim_phasors.data.PhasorData` instance.
 
     Returns:
-        Dict mapping :data:`MAP_KEYS` names to float64 arrays.
+        Dict mapping :data:`MAP_KEYS` names to float64 arrays, plus optional
+        ``last_overlay`` when segmentation was painted for this sample.
     """
     out: dict[str, np.ndarray] = {}
     for key in MAP_KEYS:
         arr = getattr(d, key, None)
         if arr is not None:
             out[key] = np.asarray(arr, dtype=np.float64)
+    overlay = getattr(d, "last_overlay", None)
+    if overlay is not None:
+        out["last_overlay"] = np.clip(np.asarray(overlay, dtype=np.float64), 0, 1)
     return out
 
 
@@ -96,6 +100,8 @@ def _apply_maps_to_dataset(d: PhasorData, maps: dict[str, np.ndarray]) -> None:
     for key in MAP_KEYS:
         if key in maps:
             setattr(d, key, np.asarray(maps[key], dtype=np.float64))
+    if "last_overlay" in maps:
+        d.last_overlay = np.asarray(maps["last_overlay"], dtype=np.float64)
     if d.real_cal is not None:
         d._shape_hint = tuple(int(x) for x in d.real_cal.shape)
 
@@ -135,6 +141,8 @@ def _sample_meta_row(win, d: PhasorData, index: int, maps_file: str) -> dict:
         "intensity_stats": dict(st),
         "maps_file": maps_file,
         "computed": d.real_cal is not None,
+        "gmm_fit": _serialize_gmm_fit(getattr(d, "gmm_fit", None)),
+        "cluster_stats": _serialize_cluster_stats(getattr(d, "cluster_stats", None) or []),
     }
 
 
@@ -377,6 +385,8 @@ def dataset_from_bundle_sample(meta: dict, maps: dict[str, np.ndarray]) -> Phaso
     d.ref_n_channels = max(1, int(meta.get("reference_n_channels", 1)))
     d.processing_settings = dict(meta.get("processing_settings") or {})
     d._intensity_stats = dict(meta.get("intensity_stats") or {})
+    d.gmm_fit = _deserialize_gmm_fit(meta.get("gmm_fit"))
+    d.cluster_stats = _deserialize_cluster_stats(meta.get("cluster_stats") or [])
     _apply_maps_to_dataset(d, maps)
     d.maps_calibrated = bool(meta.get("maps_calibrated", True))
     return d
@@ -408,6 +418,10 @@ def save_session_bundle(win, path: str | Path) -> dict:
 
     if hasattr(win, "_save_proc_from_ui"):
         win._save_proc_from_ui(win.data)
+    if hasattr(win, "_stash_segmentation_to_dataset"):
+        win._stash_segmentation_to_dataset(win.data)
+        # Also stash any other loaded samples that share window state only for active;
+        # each dataset already holds its own gmm_fit/cluster_stats/overlay.
 
     manifest = build_bundle_manifest(win)
     overlay = getattr(win, "last_overlay", None)
@@ -549,6 +563,9 @@ def apply_session_bundle_to_window(win, loaded: dict) -> None:
         restore_cursors_to_phasor(win, manifest["cursors"])
 
     gmm_fit = loaded.get("gmm_fit")
+    active_d = win.data
+    if getattr(active_d, "gmm_fit", None) is not None:
+        gmm_fit = active_d.gmm_fit
     if gmm_fit is not None:
         win._gmm_fit = gmm_fit
         n = len(gmm_fit[0])
@@ -567,8 +584,11 @@ def apply_session_bundle_to_window(win, loaded: dict) -> None:
     if hasattr(win, "sp_pixel_um"):
         win.sp_pixel_um.setValue(float(ui.get("manual_pixel_um", 0.0)))
 
-    win.cluster_stats = list(loaded.get("cluster_stats") or [])
-    win.last_overlay = loaded.get("overlay")
+    stored_stats = list(getattr(active_d, "cluster_stats", None) or [])
+    win.cluster_stats = stored_stats if stored_stats else list(loaded.get("cluster_stats") or [])
+    win.last_overlay = getattr(active_d, "last_overlay", None)
+    if win.last_overlay is None:
+        win.last_overlay = loaded.get("overlay")
 
     if hasattr(win, "chk_compare"):
         win.chk_compare.blockSignals(True)

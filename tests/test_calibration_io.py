@@ -75,6 +75,35 @@ def test_maps_for_shape_scalar_fallback():
     assert rmean[0, 0] == 100.0
 
 
+def test_maps_for_shape_dual_harmonic_pawflim():
+    """PAW-FLIM needs mean (Y,X) and g/s (n_harm,Y,X) — not a 3-D mean."""
+    import numpy as np
+    from phasorpy.lifetime import phasor_calibrate
+
+    cal = ReferenceCalibration(
+        mean_g=0.50,
+        mean_s=0.40,
+        mean_intensity=100.0,
+        harmonic_gs=[(0.50, 0.40), (0.20, 0.25)],
+        values_ready=True,
+    )
+    Y, X = 16, 16
+    rmean, rreal, rimag = cal.maps_for_shape((2, Y, X))
+    assert rmean.shape == (Y, X)
+    assert rreal.shape == (2, Y, X)
+    assert rimag.shape == (2, Y, X)
+    assert rreal[0, 0, 0] == 0.50
+    assert rreal[1, 0, 0] == 0.20
+
+    sample_real = np.full((2, Y, X), 0.3)
+    sample_imag = np.full((2, Y, X), 0.2)
+    out_r, out_i = phasor_calibrate(
+        sample_real, sample_imag, rmean, rreal, rimag,
+        frequency=80.0, lifetime=4.0, harmonic=[1, 2],
+    )
+    assert out_r.shape == (2, Y, X)
+
+
 def test_memory_est_empty():
     """Empty PhasorData reports zero estimated RAM usage."""
     from flim_phasors.data import PhasorData

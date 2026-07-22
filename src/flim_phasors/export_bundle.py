@@ -1,9 +1,9 @@
 """Export a complete FLIM phasor analysis folder for sharing and archiving.
 
-Writes phasor plots, per-sample lifetime and photon maps, GMM cluster masks,
-CSV/Excel tables (g, s, τ_φ, τ_m, τ_n, cluster areas), and ``session.json``
-with calibration settings, cursor geometry, and sample metadata. Expects a
-GUI ``MainWindow`` instance for live plot state and processing labels.
+Writes phasor plots, per-sample lifetime and photon maps (PNG + ``maps.npz``),
+cluster masks, CSV/Excel tables (g, s, τ_φ, τ_m, τ_n, cluster areas), and
+``session.json`` with calibration, cursors, GMM fit, and cluster stats.
+Expects a GUI ``MainWindow`` instance for live plot state and processing labels.
 """
 
 from __future__ import annotations
@@ -18,7 +18,18 @@ from pathlib import Path
 import numpy as np
 
 from flim_phasors import __version__
-from flim_phasors.utils import dataset_display_label, dataset_short_label
+from flim_phasors.analysis import label_pixels_by_gmm, lifetimes_at_phasor
+from flim_phasors.session_bundle_io import (
+    MAP_KEYS,
+    _maps_from_dataset,
+    _serialize_cluster_stats,
+    _serialize_gmm_fit,
+)
+from flim_phasors.utils import (
+    categorical_name,
+    categorical_rgb,
+    dataset_display_label,
+)
 
 
 def _filter_for_export(win, d) -> str:
@@ -54,6 +65,27 @@ def _safe_name(text: str, max_len: int = 80) -> str:
     return text[:max_len] or "sample"
 
 
+def _sample_stem(d, index: int = 0) -> str:
+    """Return a filesystem-safe stem for the analyzed sample file.
+
+    Uses ``display_name`` or the sample path basename (without extension).
+
+    Args:
+        d: ``PhasorData`` with path / display metadata.
+        index: Zero-based index used when no path is available.
+
+    Returns:
+        Sanitized stem suitable as a filename prefix.
+    """
+    display = (getattr(d, "display_name", "") or "").strip()
+    if display:
+        return _safe_name(Path(display).stem)
+    path = getattr(d, "sample_path", None) or ""
+    if path:
+        return _safe_name(Path(path).stem)
+    return _safe_name(f"sample_{index + 1:02d}")
+
+
 def _sample_folder_name(d, index: int) -> str:
     """Build a unique subfolder name for one exported sample.
 
@@ -64,11 +96,32 @@ def _sample_folder_name(d, index: int) -> str:
     Returns:
         Sanitized folder name, optionally prefixed with group name.
     """
-    base = dataset_short_label(d, index)
+    base = _sample_stem(d, index)
     group = (getattr(d, "group_name", "") or "").strip()
     if group:
         return _safe_name(f"{group}__{base}")
     return _safe_name(f"{index + 1:02d}_{base}")
+
+
+def _clear_dir(path: Path) -> None:
+    """Remove all files in ``path`` (keeps subdirectories).
+
+    Used so re-exporting the same session overwrites cleanly instead of leaving
+    leftover images from older naming schemes.
+    """
+    if not path.is_dir():
+        return
+    for child in path.iterdir():
+        if child.is_file():
+            try:
+                child.unlink()
+            except OSError:
+                pass
+
+
+def _session_excel_path(out: Path) -> Path:
+    """Stable Excel path for a session export folder (always rewritten)."""
+    return out / "analysis.xlsx"
 
 
 def _write_map_png(path: Path, arr, *, cmap="viridis", vmin=None, vmax=None):
@@ -123,6 +176,66 @@ def _write_photon_png(path: Path, arr):
     masked = np.ma.masked_invalid(data)
     plt.imsave(path, masked, cmap="gray", vmin=lo, vmax=hi)
     return True
+
+
+def _write_map_fig_with_colorbar(
+    path: Path,
+    arr,
+    *,
+    title: str,
+    cmap: str = "viridis",
+    label: str = "ns",
+) -> bool:
+    """Write a τ (or similar) map figure PNG including a colorbar.
+
+    Args:
+        path: Output ``.png`` path (e.g. ``tau_mod_ns_fig.png``).
+        arr: 2-D numeric array.
+        title: Axes title.
+        cmap: Matplotlib colormap name.
+        label: Colorbar label.
+
+    Returns:
+        False when no finite values exist; True after successful write.
+    """
+    import matplotlib.pyplot as plt
+
+    data = np.asarray(arr, dtype=float)
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        return False
+    lo, hi = np.percentile(finite, [2, 98])
+    if hi <= lo:
+        hi = lo + 1.0
+    masked = np.ma.masked_invalid(data)
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=150)
+    im = ax.imshow(masked, cmap=cmap, vmin=lo, vmax=hi)
+    ax.set_title(title, fontsize=10)
+    ax.axis("off")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label(label)
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _write_maps_npz(sample_dir: Path, d, *, prefix: str) -> str | None:
+    """Write quantitative phasor/lifetime arrays as ``{prefix}_maps.npz``.
+
+    Args:
+        sample_dir: Per-sample export directory.
+        d: Processed ``PhasorData``.
+        prefix: Sample filename stem used in the output basename.
+
+    Returns:
+        Basename when at least one array is written, else ``None``.
+    """
+    maps = _maps_from_dataset(d)
+    if not maps:
+        return None
+    name = f"{prefix}_maps.npz"
+    np.savez_compressed(sample_dir / name, **maps)
+    return name
 
 
 def cluster_rows_for_dataset(win, d, stats):
@@ -206,7 +319,7 @@ def build_session_dict(win) -> dict:
 
     Captures app and phasorpy versions, segmentation mode, shared reference
     settings, manual/scalar calibration g/s, per-sample metadata, active index,
-    and phasor cursor geometry (circles and ellipses).
+    phasor cursor geometry, GMM fit, and active cluster statistics.
 
     Args:
         win: Main window instance (``MainWindow``).
@@ -257,6 +370,9 @@ def build_session_dict(win) -> dict:
         "samples": [sample_metadata_row(win, d, i) for i, d in enumerate(datasets)],
         "active_sample_index": getattr(win, "active_idx", -1),
         "cursors": cursors,
+        "gmm_fit": _serialize_gmm_fit(getattr(win, "_gmm_fit", None)),
+        "cluster_stats": _serialize_cluster_stats(getattr(win, "cluster_stats", [])),
+        "maps_npz_keys": list(MAP_KEYS),
     }
 
 
@@ -295,18 +411,17 @@ def write_samples_summary(path: Path, rows: list[dict]):
 def write_excel_bundle(path: Path, win, all_cluster_rows: list[dict], sample_rows: list[dict]):
     """Write a multi-sheet Excel workbook with summary, samples, and clusters.
 
-    Cluster label cells are filled with GUI cluster colors when available.
+    Cluster label cells are filled with categorical colors by cluster index.
     Requires ``openpyxl``; callers should catch ``ImportError``.
 
     Args:
         path: Destination ``.xlsx`` path.
-        win: Main window for export metadata and color lookup.
+        win: Main window for export metadata.
         all_cluster_rows: Combined cluster CSV rows (may be empty).
         sample_rows: Per-sample metadata rows for the Samples sheet.
     """
     import openpyxl
-    from openpyxl.styles import Alignment, Font, PatternFill
-    from openpyxl.utils import get_column_letter
+    from openpyxl.styles import Font, PatternFill
 
     wb = openpyxl.Workbook()
     summary = wb.active
@@ -344,83 +459,258 @@ def write_excel_bundle(path: Path, win, all_cluster_rows: list[dict], sample_row
         for row in all_cluster_rows:
             ws_cl.append([row[h] for h in headers])
 
-    if all_cluster_rows and hasattr(win, "_rgb_hex"):
-        for i, row in enumerate(all_cluster_rows, start=2):
-            color = None
-            for st in getattr(win, "cluster_stats", []):
-                if st["idx"] == row.get("cluster") and st["label"] == row.get("label"):
-                    color = st.get("color")
-                    break
-            if color is not None:
-                col_idx = headers.index("label") + 1
+        if hasattr(win, "_rgb_hex"):
+            col_idx = headers.index("label") + 1
+            for i, row in enumerate(all_cluster_rows, start=2):
+                try:
+                    k = int(row.get("cluster", 1)) - 1
+                except (TypeError, ValueError):
+                    k = 0
+                color = categorical_rgb(max(0, k))
                 ws_cl.cell(row=i, column=col_idx).fill = PatternFill(
                     "solid", fgColor=win._rgb_hex(color))
 
     wb.save(path)
 
 
-def export_sample_maps(sample_dir: Path, d):
-    """Write standard lifetime and photon PNG maps for one ``PhasorData`` sample.
+def _cursor_masks_for_dataset(d, cursors) -> np.ndarray | None:
+    """Boolean masks for phasor cursors on one dataset.
 
-    Exports thresholded photons, τ_φ, τ_m, and τ_n when arrays are present.
+    Args:
+        d: ``PhasorData`` with calibrated g/s.
+        cursors: Iterable of cursor dicts from the phasor canvas.
+
+    Returns:
+        Stacked boolean array ``(n_cursors, H, W)``, or ``None`` if unavailable.
+    """
+    from phasorpy.cursor import mask_from_circular_cursor, mask_from_elliptic_cursor
+
+    if not cursors or d.real_cal is None:
+        return None
+    g, s = d.real_cal, d.imag_cal
+    valid = d.valid_mask()
+    masks = []
+    for c in cursors:
+        if c.get("kind") == "ellipse":
+            mk = mask_from_elliptic_cursor(
+                g, s, [c["center_real"]], [c["center_imag"]],
+                radius=[c["radius"]],
+                radius_minor=[c.get("radius_minor", c["radius"] * 0.65)],
+                angle=[c.get("angle", 0.0)],
+            )
+        else:
+            mk = mask_from_circular_cursor(
+                g, s, [c["center_real"]], [c["center_imag"]], radius=[c["radius"]])
+        if mk.ndim == 3:
+            mk = mk[0]
+        masks.append(mk & valid)
+    return np.stack(masks) if masks else None
+
+
+def cluster_stats_and_masks_for_dataset(win, d, *, is_active: bool = False):
+    """Compute cluster statistics and boolean masks for one sample.
+
+    Prefers results stored on the dataset (``d.gmm_fit`` / ``d.cluster_stats``)
+    so Export all can save every sample's remembered GMM after switching images.
+    Falls back to the active window fit/cursors when a sample has no stash.
+
+    Args:
+        win: Main window (mode, cursors, GMM fit, optional active stats).
+        d: Computed ``PhasorData``.
+        is_active: True when ``d`` is the GUI active sample.
+
+    Returns:
+        Tuple ``(stats, masks)`` where ``stats`` is a list of cluster dicts and
+        ``masks`` is ``(n, H, W)`` bool array or ``None``.
+    """
+    if d.real_cal is None:
+        return [], None
+
+    g, s = d.real_cal, d.imag_cal
+    valid = d.valid_mask()
+    total_valid = max(int(valid.sum()), 1)
+    freq = float(d.work_frequency)
+
+    stored_fit = getattr(d, "gmm_fit", None)
+    stored_stats = list(getattr(d, "cluster_stats", None) or [])
+
+    if stored_fit is not None:
+        cr, ci, rm, _ri, _ang = stored_fit
+        labelmap = label_pixels_by_gmm(g, s, cr, ci, rm)
+        n_comp = len(cr)
+        masks = np.stack([(labelmap == k) & valid for k in range(n_comp)])
+        if stored_stats:
+            return stored_stats, masks
+        stats = []
+        for k in range(n_comp):
+            cg, cs = float(cr[k]), float(ci[k])
+            mk = masks[k]
+            tp, tm, tn = lifetimes_at_phasor(cg, cs, freq)
+            n = int(mk.sum())
+            stats.append(dict(
+                idx=k + 1, color=categorical_rgb(k), label=categorical_name(k),
+                tp=tp, tm=tm, tn=tn, g=cg, s=cs, n=n,
+                area=100.0 * n / total_valid,
+            ))
+        return stats, masks
+
+    mode = getattr(win, "mode", "cursor")
+    if mode == "gmm" and hasattr(win, "_gmm_fit") and win._gmm_fit is not None:
+        cr, ci, rm, _ri, _ang = win._gmm_fit
+        labelmap = label_pixels_by_gmm(g, s, cr, ci, rm)
+        n_comp = len(cr)
+        masks = np.stack([(labelmap == k) & valid for k in range(n_comp)])
+        if is_active and getattr(win, "cluster_stats", None):
+            return list(win.cluster_stats), masks
+        stats = []
+        for k in range(n_comp):
+            cg, cs = float(cr[k]), float(ci[k])
+            mk = masks[k]
+            tp, tm, tn = lifetimes_at_phasor(cg, cs, freq)
+            n = int(mk.sum())
+            stats.append(dict(
+                idx=k + 1, color=categorical_rgb(k), label=categorical_name(k),
+                tp=tp, tm=tm, tn=tn, g=cg, s=cs, n=n,
+                area=100.0 * n / total_valid,
+            ))
+        return stats, masks
+
+    if stored_stats and mode == "cursor":
+        cursors = getattr(getattr(win, "phasor", None), "cursors", None) or []
+        masks = _cursor_masks_for_dataset(d, cursors)
+        return stored_stats, masks
+
+    cursors = getattr(getattr(win, "phasor", None), "cursors", None) or []
+    masks = _cursor_masks_for_dataset(d, cursors)
+    if masks is None:
+        if is_active and getattr(win, "cluster_stats", None):
+            return list(win.cluster_stats), None
+        return [], None
+
+    if is_active and getattr(win, "cluster_stats", None):
+        return list(win.cluster_stats), masks
+
+    stats = []
+    for k, c in enumerate(cursors):
+        mk = masks[k]
+        n = int(mk.sum())
+        if n > 0:
+            cg = float(np.nanmean(g[mk]))
+            cs = float(np.nanmean(s[mk]))
+            tp, tm, tn = lifetimes_at_phasor(cg, cs, freq)
+        else:
+            cg = cs = tp = tm = tn = float("nan")
+        stats.append(dict(
+            idx=k + 1,
+            color=c.get("color", categorical_rgb(k)),
+            label=c.get("label", categorical_name(k)),
+            tp=tp, tm=tm, tn=tn, g=cg, s=cs, n=n,
+            area=100.0 * n / total_valid,
+        ))
+    return stats, masks
+
+
+def _export_cluster_masks(
+    sample_dir: Path, masks: np.ndarray, written: list[str], *, prefix: str,
+):
+    """Write ``{prefix}_mask_01.png`` … grayscale masks for each cluster.
+
+    Args:
+        sample_dir: Per-sample export subdirectory.
+        masks: Boolean array ``(n, H, W)``.
+        written: Mutable list of output paths appended in place.
+        prefix: Sample filename stem.
+    """
+    import matplotlib.pyplot as plt
+
+    for k in range(masks.shape[0]):
+        name = f"{prefix}_mask_{k + 1:02d}.png"
+        path = sample_dir / name
+        plt.imsave(path, masks[k].astype(np.uint8) * 255, cmap="gray", vmin=0, vmax=255)
+        written.append(str(path))
+
+
+def export_sample_maps(sample_dir: Path, d, *, prefix: str | None = None, index: int = 0):
+    """Write lifetime/photon PNGs, colorbar pairs, and ``maps.npz`` for one sample.
+
+    Each heatmap and brightfield is saved twice: without colorbar (raster) and
+    with colorbar (``*_colorbar.png``). Filenames are prefixed with the analyzed
+    sample stem.
 
     Args:
         sample_dir: Directory created under ``samples/`` in the bundle.
         d: Processed ``PhasorData`` with lifetime maps.
+        prefix: Optional filename stem; derived from ``d`` when omitted.
+        index: Sample index used when deriving the stem.
 
     Returns:
         List of basenames of maps successfully written.
     """
-    maps = [
-        ("photons.png", d.mean_thr if d.mean_thr is not None else d.mean_raw, "photon"),
-        ("tau_phi_ns.png", d.tau_phi, "viridis"),
-        ("tau_mod_ns.png", d.tau_mod, "viridis"),
-        ("tau_normal_ns.png", d.tau_normal, "viridis"),
-    ]
+    prefix = prefix or _sample_stem(d, index)
     written = []
-    for name, arr, style in maps:
+
+    npz_name = _write_maps_npz(sample_dir, d, prefix=prefix)
+    if npz_name:
+        written.append(npz_name)
+
+    # Masked / thresholded photons (no colorbar + colorbar)
+    thr = d.mean_thr if d.mean_thr is not None else d.mean_raw
+    if thr is not None:
+        name = f"{prefix}_photons.png"
+        if _write_photon_png(sample_dir / name, thr):
+            written.append(name)
+        cbar_name = f"{prefix}_photons_colorbar.png"
+        if _write_map_fig_with_colorbar(
+            sample_dir / cbar_name, thr, title=f"{prefix} photons (masked)",
+            cmap="gray", label="counts",
+        ):
+            written.append(cbar_name)
+
+    # Brightfield: full intensity including below Min N (no colorbar + colorbar)
+    bright = None
+    if hasattr(d, "intensity_brightfield"):
+        bright = d.intensity_brightfield()
+    if bright is None:
+        bright = d.mean_raw
+    if bright is not None:
+        name = f"{prefix}_brightfield.png"
+        if _write_photon_png(sample_dir / name, bright):
+            written.append(name)
+        cbar_name = f"{prefix}_brightfield_colorbar.png"
+        if _write_map_fig_with_colorbar(
+            sample_dir / cbar_name, bright, title=f"{prefix} brightfield",
+            cmap="gray", label="counts",
+        ):
+            written.append(cbar_name)
+
+    tau_maps = [
+        ("tau_phi_ns", d.tau_phi, "τφ (ns)"),
+        ("tau_mod_ns", d.tau_mod, "τmod (ns)"),
+        ("tau_normal_ns", d.tau_normal, "τ normal (ns)"),
+    ]
+    for stem, arr, title in tau_maps:
         if arr is None:
             continue
-        path = sample_dir / name
-        ok = _write_photon_png(path, arr) if style == "photon" else _write_map_png(path, arr, cmap=style)
-        if ok:
-            written.append(name)
+        raster = f"{prefix}_{stem}.png"
+        if _write_map_png(sample_dir / raster, arr, cmap="viridis"):
+            written.append(raster)
+        cbar_name = f"{prefix}_{stem}_colorbar.png"
+        if _write_map_fig_with_colorbar(
+            sample_dir / cbar_name, arr, title=f"{prefix} {title}",
+            cmap="viridis", label=title,
+        ):
+            written.append(cbar_name)
+
     return written
-
-
-def _export_gmm_masks(sample_dir: Path, d, gmm_fit, written: list[str]):
-    """Write per-cluster GMM ellipse masks as grayscale PNG files.
-
-    Uses elliptic regions from the active GMM fit intersected with the sample
-    valid phasor mask.
-
-    Args:
-        sample_dir: Per-sample export subdirectory.
-        d: ``PhasorData`` with calibrated g/s maps.
-        gmm_fit: GMM parameter tuple from the GUI fit.
-        written: Mutable list of output paths appended in place.
-    """
-    from flim_phasors.analysis import masks_from_gmm_ellipses
-
-    if d.real_cal is None:
-        return
-    valid = d.valid_mask()
-    masks = masks_from_gmm_ellipses(d.real_cal, d.imag_cal, gmm_fit, valid)
-    import matplotlib.pyplot as plt
-
-    for k in range(masks.shape[0]):
-        path = sample_dir / f"gmm_mask_{k + 1:02d}.png"
-        plt.imsave(path, masks[k].astype(np.uint8) * 255, cmap="gray", vmin=0, vmax=255)
-        written.append(str(path))
 
 
 def export_analysis_bundle(win, out_dir: str | Path) -> dict:
     """Write a complete FLIM phasor analysis export folder.
 
     Creates phasor figure exports (PNG/PDF/SVG), active segmentation overlay,
-    per-sample map subfolders, CSV tables, optional Excel workbook, session
-    JSON, and a README describing contents. Lazy-loads samples that have paths
-    but no decoded histogram yet.
+    per-sample map subfolders (PNG + ``maps.npz`` + masks), CSV tables for all
+    computed samples, optional Excel workbook, session JSON (including GMM and
+    cluster stats), and a README describing contents.
 
     Args:
         win: ``MainWindow`` with phasor canvas, cluster stats, and datasets.
@@ -439,70 +729,123 @@ def export_analysis_bundle(win, out_dir: str | Path) -> dict:
     datasets = win._all_datasets() if hasattr(win, "_all_datasets") else [win.data]
     datasets = [
         d for d in datasets
-        if d.sample_path or d.signal_full is not None
+        if d.sample_path or d.signal_full is not None or d.real_cal is not None
     ]
     if not datasets:
         raise ValueError("No loaded sample to export.")
     for d in datasets:
-        if d.signal_full is None and d.sample_path:
-            d.ensure_loaded(frame=getattr(d, "frame_index", -1))
+        if d.signal_full is None and d.sample_path and hasattr(d, "ensure_loaded"):
+            try:
+                d.ensure_loaded(frame=getattr(d, "frame_index", -1))
+            except Exception:
+                pass
 
-    # Phasor plot (current view)
-    phasor_path = out / "phasor_plot.png"
-    win.phasor.fig.savefig(phasor_path, dpi=200, bbox_inches="tight")
-    written.append(str(phasor_path))
-    for ext, fmt in (("phasor_plot.pdf", "pdf"), ("phasor_plot.svg", "svg")):
+    active = getattr(win, "data", None)
+    active_stem = _sample_stem(active, getattr(win, "active_idx", 0) or 0) if active else "session"
+
+    # Phasor plot named for the active sample (overwrite on re-export)
+    if hasattr(win, "phasor") and getattr(win.phasor, "fig", None) is not None:
+        for obsolete in ("phasor_plot.png", "phasor_plot.pdf", "phasor_plot.svg"):
+            old = out / obsolete
+            if old.is_file():
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        for ext, fmt in (
+            (f"{active_stem}_phasor.png", "png"),
+            (f"{active_stem}_phasor.pdf", "pdf"),
+            (f"{active_stem}_phasor.svg", "svg"),
+        ):
+            try:
+                p = out / ext
+                kwargs = {"bbox_inches": "tight"}
+                if fmt == "png":
+                    kwargs["dpi"] = 200
+                else:
+                    kwargs["format"] = fmt
+                win.phasor.fig.savefig(p, **kwargs)
+                written.append(str(p))
+            except Exception:
+                pass
+
+    # Active segmentation overlay (root) + per-sample overlays
+    if hasattr(win, "_stash_segmentation_to_dataset"):
         try:
-            p = out / ext
-            win.phasor.fig.savefig(p, format=fmt, bbox_inches="tight")
-            written.append(str(p))
+            win._stash_segmentation_to_dataset(win.data)
         except Exception:
             pass
 
-    # Active segmentation overlay
     if getattr(win, "last_overlay", None) is not None:
         import matplotlib.pyplot as plt
 
-        seg_path = out / "segmentation_active.png"
+        old = out / "segmentation_active.png"
+        if old.is_file():
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        seg_path = out / f"{active_stem}_segmentation.png"
         plt.imsave(seg_path, np.clip(np.asarray(win.last_overlay), 0, 1))
         written.append(str(seg_path))
 
-    # Per-sample subfolders
+    # Per-sample subfolders (cleared so re-exports do not accumulate duplicates)
     sample_rows = []
-    active = win.data
+    all_cluster_rows: list[dict] = []
+    samples_root = out / "samples"
+    samples_root.mkdir(parents=True, exist_ok=True)
+
     for i, d in enumerate(datasets):
         sample_rows.append(sample_metadata_row(win, d, i))
         if d.real_cal is None:
             continue
-        sub = out / "samples" / _sample_folder_name(d, i)
+        prefix = _sample_stem(d, i)
+        sub = samples_root / _sample_folder_name(d, i)
         sub.mkdir(parents=True, exist_ok=True)
-        maps = export_sample_maps(sub, d)
+        _clear_dir(sub)
+        maps = export_sample_maps(sub, d, prefix=prefix, index=i)
         written.extend(str(sub / m) for m in maps)
-        if getattr(win, "mode", "") == "gmm" and hasattr(win, "_gmm_fit") and d is active:
-            _export_gmm_masks(sub, d, win._gmm_fit, written)
 
-    # Tables
+        is_active = d is active
+        stats, masks = cluster_stats_and_masks_for_dataset(win, d, is_active=is_active)
+        if stats:
+            rows = cluster_rows_for_dataset(win, d, stats)
+            all_cluster_rows.extend(rows)
+            csv_name = f"{prefix}_clusters.csv"
+            write_clusters_csv(sub / csv_name, rows)
+            written.append(str(sub / csv_name))
+        if masks is not None and masks.size:
+            _export_cluster_masks(sub, masks, written, prefix=prefix)
+        overlay = getattr(d, "last_overlay", None)
+        if overlay is not None:
+            import matplotlib.pyplot as plt
+            seg_name = f"{prefix}_segmentation.png"
+            plt.imsave(sub / seg_name, np.clip(np.asarray(overlay), 0, 1))
+            written.append(str(sub / seg_name))
+
+    # Tables (always overwrite)
     write_samples_summary(out / "samples_summary.csv", sample_rows)
     written.append(str(out / "samples_summary.csv"))
-
-    all_cluster_rows = []
-    active = win.data
-    if getattr(win, "cluster_stats", None):
-        all_cluster_rows.extend(cluster_rows_for_dataset(win, active, win.cluster_stats))
 
     if all_cluster_rows:
         write_clusters_csv(out / "clusters.csv", all_cluster_rows)
         written.append(str(out / "clusters.csv"))
 
-    # Excel workbook (optional)
-    xlsx_path = out / "analysis_results.xlsx"
+    # One Excel workbook for the session — rewritten on every export
+    xlsx_path = _session_excel_path(out)
+    old_xlsx = out / "analysis_results.xlsx"
+    if old_xlsx.is_file() and old_xlsx != xlsx_path:
+        try:
+            old_xlsx.unlink()
+        except OSError:
+            pass
+    openpyxl_note = ""
     try:
         write_excel_bundle(xlsx_path, win, all_cluster_rows, sample_rows)
         written.append(str(xlsx_path))
     except ImportError:
-        (out / "README_export.txt").write_text(
-            "Install openpyxl for Excel export: pip install openpyxl\n",
-            encoding="utf-8",
+        openpyxl_note = (
+            "\nNote: Install openpyxl for Excel export: pip install openpyxl\n"
         )
 
     # Session JSON
@@ -513,18 +856,32 @@ def export_analysis_bundle(win, out_dir: str | Path) -> dict:
     )
     written.append(str(session_path))
 
+    keys_line = ", ".join(MAP_KEYS)
     readme = out / "README_export.txt"
     readme.write_text(
         f"FLIM Phasors export ({__version__})\n"
-        f"Generated: {datetime.now().isoformat(timespec='seconds')}\n\n"
+        f"Generated: {datetime.now().isoformat(timespec='seconds')}\n"
+        f"{openpyxl_note}\n"
         "Contents:\n"
-        "  phasor_plot.png          — phasor plot as shown in the app\n"
-        "  segmentation_active.png — segmentation overlay (active sample, if painted)\n"
-        "  samples/               — per-sample lifetime and photon maps\n"
-        "  samples_summary.csv    — metadata for all loaded samples\n"
-        "  clusters.csv           — cluster stats (active sample, after Paint)\n"
-        "  analysis_results.xlsx  — summary workbook (if openpyxl installed)\n"
-        "  session.json           — settings, paths, cursor positions\n",
+        f"  {active_stem}_phasor.png/.pdf/.svg — phasor plot (active sample)\n"
+        f"  {active_stem}_segmentation.png     — paint overlay (if present)\n"
+        "  samples_summary.csv               — metadata for all loaded samples\n"
+        "  clusters.csv                      — cluster stats for all samples\n"
+        "  analysis.xlsx                     — one workbook for this session\n"
+        "                                      (rewritten on each Export all)\n"
+        "  session.json                      — settings, cursors, GMM, stats\n"
+        "  samples/<name>/                   — per-sample outputs (cleared &\n"
+        "                                      rewritten on each export):\n"
+        "    <file>_maps.npz                 — quantitative arrays:\n"
+        f"                                     {keys_line}\n"
+        "    <file>_photons.png              — masked intensity (no colorbar)\n"
+        "    <file>_photons_colorbar.png     — masked intensity + colorbar\n"
+        "    <file>_brightfield.png          — all photons (no colorbar)\n"
+        "    <file>_brightfield_colorbar.png — all photons + colorbar\n"
+        "    <file>_tau_*_ns.png             — lifetime map (no colorbar)\n"
+        "    <file>_tau_*_ns_colorbar.png    — lifetime map + colorbar\n"
+        "    <file>_clusters.csv             — cluster table for this sample\n"
+        "    <file>_mask_XX.png              — cursor or GMM masks\n",
         encoding="utf-8",
     )
     written.append(str(readme))

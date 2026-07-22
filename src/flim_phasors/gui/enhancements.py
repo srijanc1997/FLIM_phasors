@@ -687,6 +687,8 @@ class EnhancementsMixin:
 
                 frequency_mhz=self.sp_freq.value(),
 
+                harmonic=int(self.sp_harm.value()),
+
             )
 
 

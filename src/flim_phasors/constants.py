@@ -41,7 +41,7 @@ FILTER_MODES = (
 
 IMAGE_VIEW_ITEMS = (
     "Photons (masked)",
-    "Photons (raw)",
+    "Brightfield (all photons)",
     "τφ phase (ns)",
     "τmod (ns)",
     "τ normal (ns)",

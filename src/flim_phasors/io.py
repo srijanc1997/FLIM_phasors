@@ -60,12 +60,62 @@ def is_supported_flim_path(path: str) -> bool:
     return file_extension(path) in (".ptu", ".tif", ".tiff") or is_lif_path(path)
 
 
+def flim_channel_count(path: str) -> int | None:
+    """Return the number of emission channels without decoding the histogram.
+
+    Reads only the file header/metadata, which is cheap compared to decoding the
+    full TCSPC stack. Used to populate the channel selector before a fast
+    single-channel load.
+
+    Args:
+        path: Path to a ``.ptu`` or ``.tif``/``.tiff`` file.
+
+    Returns:
+        Channel count, or ``None`` when it cannot be determined cheaply
+        (e.g. Imspector TIFF, which must be opened to learn its shape).
+    """
+    ext = file_extension(path)
+    if ext == ".ptu":
+        try:
+            import ptufile
+
+            with ptufile.PtuFile(path) as ptu:
+                return max(1, int(ptu.number_channels))
+        except Exception:
+            return None
+    return None
+
+
+def flim_frame_count(path: str) -> int | None:
+    """Return the number of time frames without fully decoding the histogram.
+
+    Args:
+        path: Path to a ``.ptu`` or ``.tif``/``.tiff`` file.
+
+    Returns:
+        Frame count (≥1), or ``None`` when unknown.
+    """
+    ext = file_extension(path)
+    if ext == ".ptu":
+        try:
+            import ptufile
+
+            with ptufile.PtuFile(path) as ptu:
+                n = int(getattr(ptu, "number_images", 0) or 0)
+                return max(1, n) if n else 1
+        except Exception:
+            return None
+    return None
+
+
 def load_flim_signal(path: str, *, channel=None, frame=-1, dtype=np.uint32):
     """Load a TCSPC histogram stack from PicoQuant or Imspector files.
 
     Args:
         path: Path to a ``.ptu`` or ``.tif``/``.tiff`` file.
-        channel: Emission channel for PTU files (``None`` keeps all channels).
+        channel: Emission channel to decode (``None`` keeps all channels). For
+            PTU files a single channel is decoded directly, which lowers peak
+            memory and binning cost; for TIFF the ``C`` axis is sliced after read.
         frame: Frame index for multi-frame stacks; ``-1`` sums all frames.
         dtype: Target integer dtype for histogram counts.
 
@@ -84,6 +134,8 @@ def load_flim_signal(path: str, *, channel=None, frame=-1, dtype=np.uint32):
         sig = signal_from_imspector_tiff(path)
         if dtype is not None:
             sig = sig.astype(dtype)
+        if channel is not None and "C" in sig.dims:
+            sig = sig.isel(C=int(min(channel, sig.sizes["C"] - 1)))
         if "T" in sig.dims:
             if frame == -1 and sig.sizes.get("T", 1) > 1:
                 sig = sig.sum("T")

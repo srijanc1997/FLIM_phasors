@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from phasorpy.lifetime import phasor_semicircle
+from phasorpy.lifetime import phasor_from_lifetime, phasor_semicircle
 
 
 class RefPreviewCanvas(FigureCanvas):
@@ -55,15 +55,45 @@ class RefPreviewCanvas(FigureCanvas):
             return float(cal.manual_g), float(cal.manual_s)
         return float(cal.mean_g), float(cal.mean_s)
 
-    def show_calibration(self, cal, *, ref_lifetime_ns: float = 4.0, frequency_mhz: float = 80.0):
-        """Draw reference phasor cloud and mean position on the semicircle.
+    def _target_gs(self, ref_lifetime_ns: float, frequency_mhz: float, harmonic: int):
+        """Return the theoretical single-exponential phasor for the reference dye.
+
+        This is where the measured reference is moved to by ``phasor_calibrate``.
+
+        Args:
+            ref_lifetime_ns: Known reference lifetime in ns.
+            frequency_mhz: Laser modulation frequency in MHz.
+            harmonic: Harmonic index the reference g/s were computed at.
+
+        Returns:
+            Tuple ``(g, s)`` of the target phasor, or ``(nan, nan)`` if invalid.
+        """
+        try:
+            if ref_lifetime_ns <= 0 or frequency_mhz <= 0:
+                return float("nan"), float("nan")
+            tg, ts = phasor_from_lifetime(
+                float(frequency_mhz) * max(1, int(harmonic)), float(ref_lifetime_ns))
+            return float(tg), float(ts)
+        except Exception:
+            return float("nan"), float("nan")
+
+    def show_calibration(
+        self, cal, *, ref_lifetime_ns: float = 4.0, frequency_mhz: float = 80.0,
+        harmonic: int = 1,
+    ):
+        """Draw the measured reference phasor and its calibration target.
+
+        The red ``+`` is the raw (uncalibrated) reference position; the green ``o``
+        is where a single-exponential dye of lifetime ``ref_lifetime_ns`` sits on
+        the semicircle — i.e. where calibration moves the reference to. A dashed
+        arrow between them visualises the correction.
 
         Args:
             cal: Calibration object, or ``None`` when inactive.
-            ref_lifetime_ns: Reserved for future τ marker on semicircle.
-            frequency_mhz: Reserved for future τ marker on semicircle.
+            ref_lifetime_ns: Known reference lifetime in ns (target marker).
+            frequency_mhz: Laser modulation frequency in MHz (target marker).
+            harmonic: Harmonic index the reference g/s were computed at.
         """
-        del ref_lifetime_ns, frequency_mhz  # reserved for future τ marker on semicircle
         self.ax.clear()
         g, s = phasor_semicircle(101)
         self.ax.plot(g, s, "k-", lw=0.8, alpha=0.5)
@@ -82,16 +112,30 @@ class RefPreviewCanvas(FigureCanvas):
                     self.ax.scatter(
                         gr[::step], sr[::step],
                         s=2, alpha=0.3, c="steelblue", rasterized=True, zorder=2)
-            if np.isfinite(rg) and np.isfinite(rs):
-                self.ax.plot(rg, rs, "r+", ms=12, mew=2, zorder=5)
+            tg, ts = self._target_gs(ref_lifetime_ns, frequency_mhz, harmonic)
+            measured_ok = np.isfinite(rg) and np.isfinite(rs)
+            target_ok = np.isfinite(tg) and np.isfinite(ts)
+            if measured_ok and target_ok:
+                self.ax.annotate(
+                    "", xy=(tg, ts), xytext=(rg, rs),
+                    arrowprops=dict(arrowstyle="->", color="gray", lw=0.8,
+                                    linestyle="--", alpha=0.8), zorder=4)
+            if target_ok:
+                self.ax.plot(tg, ts, "o", ms=7, mfc="none", mec="green",
+                             mew=1.5, zorder=5,
+                             label=f"target τ={ref_lifetime_ns:.2f} ns")
+            if measured_ok:
+                self.ax.plot(rg, rs, "r+", ms=12, mew=2, zorder=6)
                 self.ax.annotate(
                     f"g={rg:.3f}\ns={rs:.3f}",
                     (rg, rs),
                     fontsize=7,
                     xytext=(5, 5),
                     textcoords="offset points",
-                    zorder=6,
+                    zorder=7,
                 )
+            if target_ok:
+                self.ax.legend(loc="upper right", fontsize=6, framealpha=0.6)
         self._style_axes(rg, rs)
         self.fig.tight_layout()
         self.draw()

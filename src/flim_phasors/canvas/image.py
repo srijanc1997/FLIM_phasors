@@ -6,10 +6,13 @@ images, scalar maps, overlays, and scale bars.
 import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from PySide6.QtCore import Signal
 
 
 class ImageCanvas(FigureCanvas):
     """Matplotlib canvas for FLIM intensity images and derived scalar maps."""
+
+    imageClicked = Signal(int, int)  # row y, column x in image pixel coordinates
 
     def __init__(self, parent=None):
         """Initialize an empty image canvas with axes hidden.
@@ -24,6 +27,9 @@ class ImageCanvas(FigureCanvas):
         self.ax.axis("off")
         self._im = None
         self._cbar = None
+        self._click_marker = None
+        self._click_marker_artist = None
+        self.mpl_connect("button_press_event", self._on_press)
 
     def _reset_ax(self):
         """Rebuild the axes from scratch so any previous colorbar is dropped."""
@@ -86,7 +92,45 @@ class ImageCanvas(FigureCanvas):
         self._last_intensity = arr
         if title:
             self.ax.set_title(title, fontsize=9)
+        self._redraw_click_marker()
         self.draw_idle()
+
+    def set_click_marker(self, y: int | None, x: int | None):
+        """Show or clear a crosshair at image pixel ``(y, x)``.
+
+        Args:
+            y: Row index, or ``None`` to clear the marker.
+            x: Column index, or ``None`` to clear the marker.
+        """
+        if y is None or x is None:
+            self._click_marker = None
+        else:
+            self._click_marker = (int(y), int(x))
+        self._redraw_click_marker()
+
+    def _redraw_click_marker(self):
+        """Draw the stored click crosshair on the current image axes."""
+        if self._click_marker_artist is not None:
+            try:
+                self._click_marker_artist.remove()
+            except (ValueError, AttributeError):
+                pass
+            self._click_marker_artist = None
+        if self._click_marker is not None and self._im is not None:
+            y, x = self._click_marker
+            (self._click_marker_artist,) = self.ax.plot(
+                x, y, "c+", ms=14, mew=2, zorder=20)
+        self.draw_idle()
+
+    def _on_press(self, event):
+        """Emit :attr:`imageClicked` for left-clicks inside the image axes."""
+        if event.inaxes != self.ax or event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        y = int(round(event.ydata))
+        x = int(round(event.xdata))
+        self.imageClicked.emit(y, x)
 
     def show_map(self, arr, title, cmap="viridis", label="ns", vmin=None, vmax=None):
         """Display a per-pixel scalar map with a colorbar.
@@ -105,6 +149,7 @@ class ImageCanvas(FigureCanvas):
         self._im = self.ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax)
         self._cbar = self.fig.colorbar(self._im, ax=self.ax, fraction=0.046, pad=0.04)
         self._cbar.set_label(label)
+        self._redraw_click_marker()
         self.draw_idle()
 
     def show_overlay(self, overlay, title=None):
@@ -116,6 +161,7 @@ class ImageCanvas(FigureCanvas):
         """
         self._reset_ax()
         self._im = self.ax.imshow(overlay)
+        self._redraw_click_marker()
         self.draw_idle()
 
     def draw_scale_bar(self, bar_pixels: float, *, label: str = "10 µm"):
@@ -164,4 +210,5 @@ class ImageCanvas(FigureCanvas):
         else:
             self._reset_ax()
             self._im = self.ax.imshow(overlay)
+        self._redraw_click_marker()
         self.draw_idle()

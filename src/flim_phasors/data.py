@@ -25,7 +25,7 @@ from phasorpy.lifetime import (
 )
 from phasorpy.phasor import phasor_from_signal
 
-from flim_phasors.io import load_flim_signal
+from flim_phasors.io import flim_channel_count, flim_frame_count, load_flim_signal
 from flim_phasors.lif_io import load_lif_phasor_maps
 from flim_phasors.utils import photon_count_from_signal, reduce_signal, to_2d
 
@@ -48,6 +48,8 @@ class PhasorData:
         self.signal_full = None
         self.n_channels = 1
         self.channel = 0
+        self.fast_loaded_channel = None  # channel index when only one was decoded
+        self.n_frames = 1
         self.frequency = 80.0
         self.harmonic = 1
         self.mean_raw = None
@@ -76,6 +78,10 @@ class PhasorData:
         self._lif_base_mean = None
         self._lif_base_real = None
         self._lif_base_imag = None
+        # Per-sample segmentation (remembered when switching multi-image samples)
+        self.gmm_fit = None
+        self.cluster_stats = []
+        self.last_overlay = None
 
     def ensure_loaded(self, frame=None):
         """Load sample data lazily if not already in memory.
@@ -101,7 +107,8 @@ class PhasorData:
             raise ValueError("No sample path to load.")
         if self.load_source == "lif_phasor":
             return self.load_lif_phasor(self.sample_path, self.lif_image_key or None)
-        return self.load_sample(self.sample_path, frame=frame)
+        return self.load_sample(
+            self.sample_path, frame=frame, load_channel=self.fast_loaded_channel)
 
     @property
     def has_loaded_maps(self) -> bool:
@@ -189,7 +196,7 @@ class PhasorData:
     #     self.frame_index = int(frame)
     #     self.n_channels = max(1, int(n_channels))
     #     self.frequency = float(frequency)
-    def load_sample(self, path, frame=None):
+    def load_sample(self, path, frame=None, load_channel=None):
         """Decode a FLIM file into an in-memory TCSPC histogram (no phasor yet).
 
         Sets ``signal_full``, channel count, modulation frequency, and spatial
@@ -199,6 +206,10 @@ class PhasorData:
         Args:
             path: Path to the sample FLIM file.
             frame: Time frame index (-1 = last/single frame).
+            load_channel: When ``None`` (default) all channels are decoded and
+                kept so channel switching is instant. When an int, only that
+                channel is decoded ("fast load"), lowering memory and decode
+                cost; switching channels then requires a re-decode.
 
         Returns:
             Tuple ``(spatial_shape, n_channels)``.
@@ -207,13 +218,35 @@ class PhasorData:
             frame = int(getattr(self, "frame_index", -1))
         else:
             self.frame_index = int(frame)
-        sig = load_flim_signal(path, channel=None, frame=self.frame_index, dtype=np.uint32)
-        self.signal_full = sig
+        # Probe frame count before decode (T is often summed away during load).
+        n_frames = flim_frame_count(path)
+        if load_channel is None:
+            sig = load_flim_signal(path, channel=None, frame=self.frame_index, dtype=np.uint32)
+            self.signal_full = sig
+            self.n_channels = int(sig.sizes["C"]) if "C" in sig.dims else 1
+            self.channel = 0
+            self.fast_loaded_channel = None
+        else:
+            true_nch = flim_channel_count(path)
+            lc = max(0, int(load_channel))
+            if true_nch:
+                lc = min(lc, true_nch - 1)
+            sig = load_flim_signal(path, channel=lc, frame=self.frame_index, dtype=np.uint32)
+            if "C" in getattr(sig, "dims", ()):
+                # TIFF path may retain a length-1 C axis after slicing.
+                true_nch = true_nch or int(sig.sizes["C"])
+                if sig.sizes["C"] > 1:
+                    sig = sig.isel(C=min(lc, sig.sizes["C"] - 1))
+            self.signal_full = sig
+            self.n_channels = max(1, int(true_nch or 1), lc + 1)
+            self.channel = lc
+            self.fast_loaded_channel = lc
+        if n_frames is None and "T" in getattr(sig, "dims", ()):
+            n_frames = int(sig.sizes.get("T", 1))
+        self.n_frames = max(1, int(n_frames or 1))
         self.sample_path = path
-        self.n_channels = int(sig.sizes["C"]) if "C" in sig.dims else 1
-        self.channel = 0
         self.frequency = float(sig.attrs.get("frequency", 80.0))
-        red = reduce_signal(sig, 0)
+        red = reduce_signal(sig, self.channel)
         yx = [s for d, s in zip(red.dims, red.shape) if d != "H"]
         shape = tuple(yx) if len(yx) == 2 else (red.shape[0], red.shape[1])
         self._shape_hint = shape
@@ -254,10 +287,6 @@ class PhasorData:
         """
         shape = real.shape
         rmean, rreal, rimag = ref_cal.maps_for_shape(shape)
-        if isinstance(harmonic, (list, tuple)):
-            return phasor_calibrate(
-                real, imag, rmean, rreal, rimag,
-                frequency=frequency, lifetime=float(lifetime), harmonic=harmonic)
         return phasor_calibrate(
             real, imag, rmean, rreal, rimag,
             frequency=frequency, lifetime=float(lifetime), harmonic=harmonic)
@@ -429,8 +458,9 @@ class PhasorData:
         if filter_mode == "pawflim":
             harmonics = [H, 2 * H]
             sig = self._sample_channel_signal()
-            photon_count = photon_count_from_signal(sig)
             mean, real, imag = phasor_from_signal(sig, axis="H", harmonic=harmonics)
+            # Derive photon counts from phasor mean (avoids a second full H-sum).
+            photon_count = self._photon_count_from_mean(mean, sig)
             if ref_calibration is not None and ref_calibration.is_active:
                 real, imag = self._apply_reference_calibration(
                     real, imag, mean, ref_calibration,
@@ -451,9 +481,9 @@ class PhasorData:
             elif filter_mode == "signal gaussian" and median_size >= 1:
                 sig = signal_filter_gaussian(
                     sig, size=int(median_size), repeat=int(median_repeat))
-            photon_count = photon_count_from_signal(sig)
             mean, real, imag = phasor_from_signal(sig, axis="H", harmonic=H)
             mean, real, imag = to_2d(mean), to_2d(real), to_2d(imag)
+            photon_count = self._photon_count_from_mean(mean, sig)
             if ref_calibration is not None and ref_calibration.is_active:
                 real, imag = self._apply_reference_calibration(
                     real, imag, mean, ref_calibration,
@@ -472,6 +502,33 @@ class PhasorData:
             intensity_min=float(intensity_min),
             detect_harmonics=bool(detect_harmonics),
         )
+
+    @staticmethod
+    def _photon_count_from_mean(mean, sig):
+        """Convert phasorpy mean intensity to total photons per pixel (mean × n_bins)."""
+        mean2 = to_2d(np.asarray(mean, dtype=float))
+        if hasattr(sig, "sizes") and "H" in getattr(sig, "dims", ()):
+            n_h = int(sig.sizes["H"])
+        else:
+            arr = np.asarray(sig)
+            n_h = int(arr.shape[-1]) if arr.ndim >= 1 else 1
+        return mean2 * float(max(n_h, 1))
+
+    def intensity_brightfield(self):
+        """Full intensity image including pixels below the Min N threshold.
+
+        Prefers the original LIF / photon intensity map when available; otherwise
+        uses ``mean_raw`` (photon counts before threshold masking). Does not
+        apply the phasor valid-pixel mask.
+
+        Returns:
+            2-D float array, or ``None`` if no intensity has been computed.
+        """
+        if self._lif_base_mean is not None:
+            return np.asarray(self._lif_base_mean, dtype=float)
+        if self.mean_raw is not None:
+            return np.asarray(self.mean_raw, dtype=float)
+        return None
 
     @property
     def work_frequency(self):
@@ -505,7 +562,15 @@ class PhasorData:
         raw = np.asarray(self.mean_raw, dtype=float)
         finite = raw[np.isfinite(raw)]
         if finite.size == 0:
-            return {"threshold": threshold, "masked_pct": 100.0}
+            return {
+                "threshold": threshold,
+                "min": 0.0,
+                "median": 0.0,
+                "max": 0.0,
+                "n_pixels": 0,
+                "n_below": 0,
+                "masked_pct": 100.0,
+            }
         n_pixels = int(finite.size)
         n_below = int(np.sum(finite < threshold)) if threshold > 0 else 0
         masked_pct = 100.0 * n_below / n_pixels if n_pixels else 0.0
