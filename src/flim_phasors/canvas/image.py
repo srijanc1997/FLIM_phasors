@@ -1,11 +1,16 @@
 """FLIM image and lifetime-map display canvas.
 
 Provides :class:`ImageCanvas`, a Qt-embedded matplotlib figure for intensity
-images, scalar maps, overlays, and scale bars.
+images, scalar maps, overlays, and scale bars. Reuses the existing
+``AxesImage`` (and colorbar) when shape and view kind match, avoiding a full
+``fig.clear()`` on every refresh.
 """
+from __future__ import annotations
+
 import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.patches import Rectangle
 from PySide6.QtCore import Signal
 
 
@@ -27,6 +32,8 @@ class ImageCanvas(FigureCanvas):
         self.ax.axis("off")
         self._im = None
         self._cbar = None
+        self._view_kind = None  # "intensity" | "map" | "overlay"
+        self._scale_artists: list = []
         self._click_marker = None
         self._click_marker_artist = None
         self.mpl_connect("button_press_event", self._on_press)
@@ -36,7 +43,80 @@ class ImageCanvas(FigureCanvas):
         self.fig.clear()
         self.ax = self.fig.add_subplot(111)
         self.ax.axis("off")
+        self._im = None
         self._cbar = None
+        self._view_kind = None
+        self._scale_artists = []
+        self._click_marker_artist = None
+
+    def _clear_scale_bar(self):
+        """Remove any previously drawn scale-bar artists."""
+        for art in self._scale_artists:
+            try:
+                art.remove()
+            except (ValueError, AttributeError):
+                pass
+        self._scale_artists = []
+
+    def _array_shape2d(self, arr) -> tuple[int, int]:
+        """Return ``(H, W)`` for a display array (ignoring channel axis)."""
+        a = np.asarray(arr)
+        if a.ndim >= 2:
+            return int(a.shape[0]), int(a.shape[1])
+        return 0, 0
+
+    def _can_reuse(self, kind: str, arr, *, with_cbar: bool) -> bool:
+        """Return whether the current AxesImage can be updated in place."""
+        if self._im is None or self._view_kind != kind:
+            return False
+        cur = self._im.get_array()
+        if cur is None:
+            return False
+        if self._array_shape2d(cur) != self._array_shape2d(arr):
+            return False
+        has_cbar = self._cbar is not None
+        return has_cbar == with_cbar
+
+    def _set_or_create_image(
+        self,
+        arr,
+        *,
+        kind: str,
+        cmap,
+        vmin,
+        vmax,
+        with_cbar: bool,
+        cbar_label: str | None = None,
+        title: str | None = None,
+    ):
+        """Update existing image artist or rebuild axes when needed."""
+        self._clear_scale_bar()
+        if self._can_reuse(kind, arr, with_cbar=with_cbar):
+            self._im.set_data(arr)
+            if vmin is not None and vmax is not None:
+                self._im.set_clim(vmin, vmax)
+            if cmap is not None:
+                self._im.set_cmap(cmap)
+            if self._cbar is not None and cbar_label is not None:
+                self._cbar.update_normal(self._im)
+                self._cbar.set_label(cbar_label)
+            if title:
+                self.ax.set_title(title, fontsize=9)
+            else:
+                self.ax.set_title("")
+            self._view_kind = kind
+            return
+
+        self._reset_ax()
+        self._im = self.ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax)
+        self._view_kind = kind
+        if with_cbar:
+            self._cbar = self.fig.colorbar(
+                self._im, ax=self.ax, fraction=0.046, pad=0.04)
+            if cbar_label:
+                self._cbar.set_label(cbar_label)
+        if title:
+            self.ax.set_title(title, fontsize=9)
 
     def show_intensity(
         self,
@@ -51,7 +131,7 @@ class ImageCanvas(FigureCanvas):
         """Show a photon-count intensity image.
 
         NaN values are masked and shown dark. Contrast limits are derived from
-        finite pixels only.
+        finite pixels only. Reuses the existing image artist when possible.
 
         Args:
             mean: 2-D (or squeezable) intensity array.
@@ -61,7 +141,6 @@ class ImageCanvas(FigureCanvas):
             auto_contrast: When ``True``, use 2nd–98th percentile for limits.
             title: Optional axes title.
         """
-        self._reset_ax()
         arr = np.squeeze(np.asarray(mean, dtype=float))
         while arr.ndim > 2:
             arr = arr[0]
@@ -88,10 +167,11 @@ class ImageCanvas(FigureCanvas):
         if vmax <= vmin:
             vmax = vmin + 1.0
         masked = np.ma.masked_invalid(display)
-        self._im = self.ax.imshow(masked, cmap="gray", vmin=vmin, vmax=vmax)
+        self._set_or_create_image(
+            masked, kind="intensity", cmap="gray", vmin=vmin, vmax=vmax,
+            with_cbar=False, title=title,
+        )
         self._last_intensity = arr
-        if title:
-            self.ax.set_title(title, fontsize=9)
         self._redraw_click_marker()
         self.draw_idle()
 
@@ -136,19 +216,21 @@ class ImageCanvas(FigureCanvas):
         """Display a per-pixel scalar map with a colorbar.
 
         Typical use: apparent lifetime (τ) or other derived quantity maps.
+        Reuses the existing image + colorbar when shape matches.
 
         Args:
             arr: 2-D scalar array to display.
-            title: Axes title (stored but not always shown when axis is off).
+            title: Axes title.
             cmap: Matplotlib colormap name.
             label: Colorbar axis label.
             vmin: Optional lower color scale limit.
             vmax: Optional upper color scale limit.
         """
-        self._reset_ax()
-        self._im = self.ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax)
-        self._cbar = self.fig.colorbar(self._im, ax=self.ax, fraction=0.046, pad=0.04)
-        self._cbar.set_label(label)
+        data = np.asarray(arr, dtype=float)
+        self._set_or_create_image(
+            data, kind="map", cmap=cmap, vmin=vmin, vmax=vmax,
+            with_cbar=True, cbar_label=label, title=title,
+        )
         self._redraw_click_marker()
         self.draw_idle()
 
@@ -157,15 +239,20 @@ class ImageCanvas(FigureCanvas):
 
         Args:
             overlay: Image array accepted by ``Axes.imshow``.
-            title: Optional axes title (currently unused; reserved for future use).
+            title: Optional axes title.
         """
-        self._reset_ax()
-        self._im = self.ax.imshow(overlay)
+        self._set_or_create_image(
+            overlay, kind="overlay", cmap=None, vmin=None, vmax=None,
+            with_cbar=False, title=title,
+        )
         self._redraw_click_marker()
         self.draw_idle()
 
     def draw_scale_bar(self, bar_pixels: float, *, label: str = "10 µm"):
         """Draw a horizontal scale bar on the current image.
+
+        Previous scale-bar artists are removed first so reuse-based redraws
+        do not stack bars.
 
         Args:
             bar_pixels: Bar width in image pixel units.
@@ -173,26 +260,20 @@ class ImageCanvas(FigureCanvas):
         """
         if self._im is None:
             return
-        from matplotlib.patches import Rectangle
+        self._clear_scale_bar()
         h, w = self._im.get_array().shape[:2]
         x0 = w * 0.05
         y0 = h * 0.92
-        rect = Rectangle((x0, y0), bar_pixels, max(2, h * 0.01), fc="white", ec="black", lw=0.8)
+        rect = Rectangle(
+            (x0, y0), bar_pixels, max(2, h * 0.01),
+            fc="white", ec="black", lw=0.8)
         self.ax.add_patch(rect)
-        self.ax.text(x0 + bar_pixels / 2, y0 - h * 0.03, label, color="white",
-                     ha="center", va="top", fontsize=8,
-                     bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.6))
+        txt = self.ax.text(
+            x0 + bar_pixels / 2, y0 - h * 0.03, label, color="white",
+            ha="center", va="top", fontsize=8,
+            bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.6))
+        self._scale_artists = [rect, txt]
         self.draw_idle()
-
-    # --- unused (focused cleanup): uncomment if needed ---
-    # def show_click_marker(self, shape, y: int, x: int, *, title: str = ""):
-    #     """Overlay a crosshair at (y,x) on the current intensity view."""
-    #     disp = getattr(self, "_last_intensity", None)
-    #     if disp is None:
-    #         return
-    #     self.show_intensity(disp, title=title or "Phasor click")
-    #     self.ax.plot(x, y, "c+", ms=14, mew=2)
-    #     self.draw_idle()
 
     def update_overlay(self, overlay, title=None):
         """Fast path for live overlay updates via ``AxesImage.set_data``.
@@ -201,14 +282,15 @@ class ImageCanvas(FigureCanvas):
 
         Args:
             overlay: New overlay array.
-            title: Optional title (reserved; not applied on fast path).
+            title: Optional title.
         """
-        arr = None if self._im is None else self._im.get_array()
-        if (self._cbar is None and self._im is not None and arr is not None
-                and tuple(arr.shape) == tuple(overlay.shape)):
+        if self._can_reuse("overlay", overlay, with_cbar=False):
+            self._clear_scale_bar()
             self._im.set_data(overlay)
+            if title:
+                self.ax.set_title(title, fontsize=9)
         else:
-            self._reset_ax()
-            self._im = self.ax.imshow(overlay)
+            self.show_overlay(overlay, title=title)
+            return
         self._redraw_click_marker()
         self.draw_idle()

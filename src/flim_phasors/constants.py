@@ -7,6 +7,10 @@ colors, and supported FLIM file-type filters used across the GUI and I/O layers.
 
 COMPARE_CMAPS = ("Blues", "Oranges", "Greens", "Purples", "Reds", "Greys")
 COMPARE_SCATTER_MAX = 8000
+# Cap points fed into the single-view phasor hist2d (shape preserved; much faster).
+PHASOR_HIST_MAX_POINTS = 250_000
+PHASOR_HIST_BINS = 256
+PHASOR_HIST_CACHE_MAX = 12
 COMPARE_STYLE_MAP = {
     "Full density (overlay)": "cloud",
     "Subsample scatter": "scatter",

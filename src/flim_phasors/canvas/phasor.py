@@ -12,7 +12,13 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.patches import Circle, Ellipse
 from PySide6.QtCore import Signal
 from phasorpy.lifetime import phasor_from_lifetime, phasor_semicircle
-from flim_phasors.constants import COMPARE_CMAPS, COMPARE_SCATTER_MAX
+from flim_phasors.constants import (
+    COMPARE_CMAPS,
+    COMPARE_SCATTER_MAX,
+    PHASOR_HIST_BINS,
+    PHASOR_HIST_CACHE_MAX,
+    PHASOR_HIST_MAX_POINTS,
+)
 from flim_phasors.data import PhasorData
 from flim_phasors.utils import (
     categorical_name,
@@ -65,6 +71,18 @@ def _subsample_phasor_points(g, s, max_points=COMPARE_SCATTER_MAX):
     return g[idx], s[idx]
 
 
+def _phasor_map_key(d) -> tuple:
+    """Stable cache key for a dataset's calibrated phasor maps."""
+    if d is None or d.real_cal is None or d.imag_cal is None:
+        return (id(d), None, None, None)
+    return (
+        id(d),
+        id(d.real_cal),
+        id(d.imag_cal),
+        tuple(d.real_cal.shape),
+    )
+
+
 class PhasorCanvas(FigureCanvas):
     """Matplotlib canvas for interactive phasor histograms and segmentation cursors.
 
@@ -98,7 +116,10 @@ class PhasorCanvas(FigureCanvas):
         self._dragging = False
         self._gmm_artists = []
         self._click_marker = None
+        self._click_marker_artist = None
         self._image_highlight = None
+        # Cached 2-D histograms: key -> (counts, xedges, yedges)
+        self._hist_cache: dict = {}
         self._init_axes()
         self.mpl_connect("button_press_event", self.on_press)
         self.mpl_connect("button_release_event", self.on_release)
@@ -108,6 +129,7 @@ class PhasorCanvas(FigureCanvas):
     def _init_axes(self):
         """Clear and configure the phasor axes with the universal semicircle."""
         self.ax.clear()
+        self._click_marker_artist = None
         self.ax.set_xlabel("g")
         self.ax.set_ylabel("s")
         g_uni, s_uni = phasor_semicircle(201)
@@ -180,17 +202,64 @@ class PhasorCanvas(FigureCanvas):
             self.ax.plot(gg, ss, "k.", ms=4)
             self.ax.annotate(f"{tau}ns", (gg, ss), fontsize=7, alpha=0.7)
 
+    def _store_hist_cache(self, key, value):
+        """Insert a histogram into the LRU-ish cache (bounded size)."""
+        self._hist_cache[key] = value
+        while len(self._hist_cache) > PHASOR_HIST_CACHE_MAX:
+            # dict preserves insertion order (Py3.7+)
+            self._hist_cache.pop(next(iter(self._hist_cache)))
+
+    def _histogram2d_cached(self, d, *, bins: int, key_prefix: str):
+        """Return ``(counts, xedges, yedges)`` for valid phasor pixels.
+
+        Results are cached by map identity so repeated redraws (cursor moves,
+        click markers) skip re-binning. Large clouds are subsampled before
+        binning to keep hist2d cheap.
+        """
+        key = (key_prefix, bins, _phasor_map_key(d))
+        cached = self._hist_cache.get(key)
+        if cached is not None:
+            # Refresh LRU order
+            self._hist_cache.pop(key)
+            self._store_hist_cache(key, cached)
+            return cached
+
+        g, s = d.real_cal, d.imag_cal
+        m = d.valid_mask()
+        if m.sum() == 0:
+            empty = (
+                np.zeros((bins, bins), dtype=float),
+                np.linspace(0, 1.05, bins + 1),
+                np.linspace(0, 0.75, bins + 1),
+            )
+            self._store_hist_cache(key, empty)
+            return empty
+
+        gv = g[m].ravel()
+        sv = s[m].ravel()
+        gv, sv = _subsample_phasor_points(gv, sv, max_points=PHASOR_HIST_MAX_POINTS)
+        counts, xedges, yedges = np.histogram2d(
+            gv, sv, bins=bins, range=[[0, 1.05], [0, 0.75]])
+        # Match hist2d(cmin=1): hide empty bins
+        counts = counts.astype(float)
+        counts[counts < 1] = np.nan
+        value = (counts, xedges, yedges)
+        self._store_hist_cache(key, value)
+        return value
+
     def _draw_single_cloud(self, d):
         """Render a single-dataset phasor density histogram (turbo colormap).
 
         Args:
             d: :class:`~flim_phasors.data.PhasorData` with calibrated maps.
         """
-        g, s = d.real_cal, d.imag_cal
-        m = d.valid_mask()
-        if m.sum() > 0:
-            self.ax.hist2d(g[m].ravel(), s[m].ravel(), bins=256,
-                           range=[[0, 1.05], [0, 0.75]], cmap="turbo", cmin=1)
+        counts, xedges, yedges = self._histogram2d_cached(
+            d, bins=PHASOR_HIST_BINS, key_prefix="single")
+        if not np.any(np.isfinite(counts)):
+            return
+        self.ax.pcolormesh(
+            xedges, yedges, counts.T, cmap="turbo", shading="auto",
+            rasterized=True)
 
     def _draw_layer_cloud(self, d, color_idx):
         """Render one compare-layer density cloud with a distinct colormap.
@@ -199,15 +268,16 @@ class PhasorCanvas(FigureCanvas):
             d: Dataset for this layer.
             color_idx: Index into :data:`~flim_phasors.constants.COMPARE_CMAPS`.
         """
-        g, s = d.real_cal, d.imag_cal
-        m = d.valid_mask()
-        if m.sum() == 0:
+        counts, xedges, yedges = self._histogram2d_cached(
+            d, bins=200, key_prefix=f"cmp{color_idx}")
+        if not np.any(np.isfinite(counts)):
             return
-        _, _, _, im = self.ax.hist2d(
-            g[m].ravel(), s[m].ravel(), bins=200,
-            range=[[0, 1.05], [0, 0.75]],
-            cmap=COMPARE_CMAPS[color_idx % len(COMPARE_CMAPS)], cmin=1)
-        im.set_alpha(0.38)
+        im = self.ax.pcolormesh(
+            xedges, yedges, counts.T,
+            cmap=COMPARE_CMAPS[color_idx % len(COMPARE_CMAPS)],
+            shading="auto", rasterized=True, alpha=0.38)
+        im.set_zorder(1)
+
 
     def _draw_layer_scatter(self, d, color, label):
         """Render subsampled scatter points for one compare layer.
@@ -286,13 +356,25 @@ class PhasorCanvas(FigureCanvas):
             self._draw_compare_legend(visible_layers, style)
 
         self._redraw_cursors()
-        if self._click_marker is not None:
-            self.ax.plot(
-                self._click_marker[0], self._click_marker[1],
-                "wx", ms=10, mew=2, zorder=20)
+        self._redraw_click_marker(draw=False)
         self.ax.set_xlim(0, 1.05)
         self.ax.set_ylim(0, 0.75)
         self.draw_idle()
+
+    def _redraw_click_marker(self, *, draw: bool = True):
+        """Draw or clear the phasor click crosshair without rebuilding the hist."""
+        if self._click_marker_artist is not None:
+            try:
+                self._click_marker_artist.remove()
+            except (ValueError, AttributeError):
+                pass
+            self._click_marker_artist = None
+        if self._click_marker is not None:
+            (self._click_marker_artist,) = self.ax.plot(
+                self._click_marker[0], self._click_marker[1],
+                "wx", ms=10, mew=2, zorder=20)
+        if draw:
+            self.draw_idle()
 
     def _remove_legend(self):
         """Remove the current axes legend if one exists."""
@@ -375,6 +457,8 @@ class PhasorCanvas(FigureCanvas):
     def set_click_marker(self, g: float | None, s: float | None):
         """Show or clear a crosshair at a phasor click position.
 
+        Updates only the marker artist (does not rebuild the density histogram).
+
         Args:
             g: Real coordinate, or ``None`` to clear the marker.
             s: Imaginary coordinate, or ``None`` to clear the marker.
@@ -383,7 +467,7 @@ class PhasorCanvas(FigureCanvas):
             self._click_marker = None
         else:
             self._click_marker = (float(g), float(s))
-        self.redraw_hist()
+        self._redraw_click_marker(draw=True)
 
     def add_cursor(self, radius=0.05, *, kind="circle", radius_minor=None, angle=0.0,
                    emit_changed=True):
