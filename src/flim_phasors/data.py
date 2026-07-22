@@ -27,7 +27,7 @@ from phasorpy.phasor import phasor_from_signal
 
 from flim_phasors.io import flim_channel_count, flim_frame_count, load_flim_signal
 from flim_phasors.lif_io import load_lif_phasor_maps
-from flim_phasors.utils import photon_count_from_signal, reduce_signal, to_2d
+from flim_phasors.utils import reduce_signal, to_2d
 
 
 class PhasorData:
@@ -238,11 +238,18 @@ class PhasorData:
                 if sig.sizes["C"] > 1:
                     sig = sig.isel(C=min(lc, sig.sizes["C"] - 1))
             self.signal_full = sig
-            self.n_channels = max(1, int(true_nch or 1), lc + 1)
+            self.n_channels = max(
+                1,
+                int(true_nch or 1),
+                int((getattr(sig, "attrs", {}) or {}).get("n_channels", 0) or 0),
+                lc + 1,
+            )
             self.channel = lc
             self.fast_loaded_channel = lc
         if n_frames is None and "T" in getattr(sig, "dims", ()):
             n_frames = int(sig.sizes.get("T", 1))
+        if n_frames is None:
+            n_frames = (getattr(sig, "attrs", {}) or {}).get("n_frames")
         self.n_frames = max(1, int(n_frames or 1))
         self.sample_path = path
         self.frequency = float(sig.attrs.get("frequency", 80.0))

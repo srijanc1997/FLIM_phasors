@@ -164,8 +164,9 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         sl.addLayout(row_s)
         self.chk_fast_load = QtWidgets.QCheckBox("Fast load (single channel)")
         self.chk_fast_load.setToolTip(
-            "Decode only the selected channel to save memory and time.\n"
-            "Best for multi-channel files. Switching channel re-decodes the file.")
+            "Decode only the selected channel (big RAM win for multi-channel PTU).\n"
+            "TIFF still reads the whole file, then keeps one channel.\n"
+            "Switching channel re-decodes. Use when you only need one detector.")
         self.chk_fast_load.setChecked(
             self._settings.value("fast_load", False, type=bool)
             if hasattr(self, "_settings") else False)
@@ -1175,10 +1176,43 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
                 f"{len(loaded)} sample(s) loaded ({self._fmt_elapsed(t_decode + t_preview)}) — "
                 f"uncalibrated preview ({n_valid} valid px). "
                 "Choose a Reference and Apply for reference-corrected maps.")
+            st = getattr(self.data, "_intensity_stats", {}) or {}
+            self._warn_if_empty_phasor(n_valid, st, after_load=True)
         else:
             self._log(
                 f"{len(loaded)} sample(s) decoded ({self._fmt_elapsed(t_decode)}) — "
                 "choose Reference, then Apply (calibration is automatic).")
+
+    def _warn_if_empty_phasor(self, n_valid: int, stats: dict | None = None, *, after_load: bool = False):
+        """Alert when the image/phasor is empty (wrong channel or too-high Min N)."""
+        stats = stats or {}
+        max_ph = float(stats.get("max", -1))
+        if n_valid > 0 and max_ph != 0:
+            return
+        ch = getattr(self.data, "channel", 0)
+        nch = getattr(self.data, "n_channels", 1)
+        thr = float(stats.get("threshold", 0) or 0)
+        if max_ph == 0:
+            msg = (
+                f"Channel {ch} has no photons (counts are all zero).\n\n"
+                "Try another sample channel — with Fast load, switching channel "
+                "re-decodes that channel only."
+            )
+            if nch > 1:
+                msg += f"\nThis file reports {nch} channels."
+        elif thr > 0:
+            msg = (
+                f"No valid pixels after Apply (Min N = {thr:.0f}).\n\n"
+                "Lower Min N, or check that the selected channel has enough photons."
+            )
+        else:
+            msg = (
+                "No valid phasor pixels.\n\n"
+                "Check sample channel, reference calibration, and filter settings."
+            )
+        title = "Empty image" if after_load else "Empty phasor"
+        QtWidgets.QMessageBox.warning(self, title, msg)
+        self._log(f"Warning: {msg.splitlines()[0]}")
 
     def _effective_ref_path(self, d=None):
         """Return the reference file path for a dataset (shared or per-sample)."""
@@ -2429,13 +2463,13 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             ref_note = f", cal ({mode}) ch {ch} g={self.ref_calibration.mean_g:.3f} s={self.ref_calibration.mean_s:.3f}"
         else:
             ref_note = ""
-        st = getattr(self.data, "_intensity_stats", {})
-        if st:
+        st = getattr(self.data, "_intensity_stats", {}) or {}
+        if st and "min" in st and "max" in st:
             self.lbl_photon_range.setText(
                 f"Image photon counts: {st['min']:.0f} – {st['max']:.0f} "
-                f"(median {st['median']:.0f})")
-            n_below = int(round(st["masked_pct"] * st.get("n_pixels", 0) / 100.0))
-            int_msg = (f" | min photons ≥ {st['threshold']:.0f} "
+                f"(median {st.get('median', 0):.0f})")
+            n_below = int(round(st.get("masked_pct", 0) * st.get("n_pixels", 0) / 100.0))
+            int_msg = (f" | min photons ≥ {st.get('threshold', 0):.0f} "
                        f"({n_below} px removed)")
         else:
             int_msg = ""
@@ -2446,6 +2480,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             f"Phasor recomputed{scope_note} — sample ch {self.data.channel}{ref_note}, "
             f"filter={filt}, H={self.data.harmonic}{int_msg}, "
             f"{n_valid} valid px ({self._fmt_elapsed(elapsed)})")
+        self._warn_if_empty_phasor(n_valid, st)
 
     # ---- cursor actions ----------------------------------------------------
     def _refresh_active_cursor_combo(self, select_idx=None):

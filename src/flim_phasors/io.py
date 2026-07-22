@@ -134,12 +134,23 @@ def load_flim_signal(path: str, *, channel=None, frame=-1, dtype=np.uint32):
         sig = signal_from_imspector_tiff(path)
         if dtype is not None:
             sig = sig.astype(dtype)
-        if channel is not None and "C" in sig.dims:
-            sig = sig.isel(C=int(min(channel, sig.sizes["C"] - 1)))
+        if "C" in sig.dims:
+            # Record true channel count before optional single-channel slice
+            # (fast-load still reads the whole TIFF, but keeps the combo accurate).
+            sig.attrs = dict(sig.attrs or {})
+            sig.attrs["n_channels"] = int(sig.sizes["C"])
+            if channel is not None:
+                sig = sig.isel(C=int(min(channel, sig.sizes["C"] - 1)))
         if "T" in sig.dims:
             if frame == -1 and sig.sizes.get("T", 1) > 1:
+                n_t = int(sig.sizes["T"])
+                sig.attrs = dict(sig.attrs or {})
+                sig.attrs["n_frames"] = n_t
                 sig = sig.sum("T")
             elif frame is not None and frame >= 0:
+                n_t = int(sig.sizes["T"])
+                sig.attrs = dict(sig.attrs or {})
+                sig.attrs["n_frames"] = n_t
                 sig = sig.isel(T=int(min(frame, sig.sizes["T"] - 1)))
             else:
                 sig = sig.squeeze("T", drop=True)
