@@ -35,6 +35,13 @@ from flim_phasors.utils import (
 def _filter_for_export(win, d) -> str:
     """Resolve the human-readable filter label for one dataset in the export.
 
+    Prefers the per-sample filter recorded during processing (via
+    :func:`~flim_phasors.gui.processing.filter_label_for_dataset`) so that
+    exports remain accurate for samples with per-sample filter overrides,
+    even if the active combo box currently shows a different sample's
+    setting. Falls back to the live combo box text only if that lookup
+    raises, which keeps export generation from failing outright.
+
     Args:
         win: Main window with processing UI state.
         d: ``PhasorData`` instance for the sample.
@@ -51,6 +58,12 @@ def _filter_for_export(win, d) -> str:
 
 def _safe_name(text: str, max_len: int = 80) -> str:
     """Sanitize a string for use as a filesystem folder or file name.
+
+    Replaces characters that are illegal in Windows paths (``<>:"/\\|?*``)
+    with underscores, collapses runs of whitespace to a single underscore,
+    and truncates to ``max_len`` so deeply nested export trees stay within
+    path-length limits. An empty or all-sanitized input falls back to
+    ``"sample"`` rather than producing an empty path segment.
 
     Args:
         text: Raw label or path fragment.
@@ -89,6 +102,13 @@ def _sample_stem(d, index: int = 0) -> str:
 def _sample_folder_name(d, index: int) -> str:
     """Build a unique subfolder name for one exported sample.
 
+    When a sample belongs to a group, the folder is named
+    ``{group}__{stem}`` so samples sharing a group sort and scan together in
+    a file browser. Ungrouped samples are prefixed with their 1-based export
+    index (``01_``, ``02_``, ...) instead, which both keeps folder names
+    unique when two samples share a display name and preserves the order
+    they appeared in during export.
+
     Args:
         d: ``PhasorData`` with optional ``group_name`` and path metadata.
         index: Zero-based sample index in the session.
@@ -120,12 +140,32 @@ def _clear_dir(path: Path) -> None:
 
 
 def _session_excel_path(out: Path) -> Path:
-    """Stable Excel path for a session export folder (always rewritten)."""
+    """Return the fixed Excel workbook path for a session export folder.
+
+    Using one stable filename (rather than one named after the active sample)
+    means re-running Export all overwrites the previous workbook instead of
+    accumulating a new file per export, and any legacy ``analysis_results.xlsx``
+    from an older naming scheme can be detected and removed.
+
+    Args:
+        out: Root export directory for the session.
+
+    Returns:
+        Path ``out / "analysis.xlsx"``.
+    """
     return out / "analysis.xlsx"
 
 
 def _write_map_png(path: Path, arr, *, cmap="viridis", vmin=None, vmax=None):
     """Write a false-color map PNG with robust percentile scaling.
+
+    NaN pixels (masked/invalid) are excluded from both the percentile
+    computation and the rendered image via a masked array, so a small number
+    of outlier bright/dark pixels does not wash out the visible dynamic
+    range of the rest of the map. The PNG is written at native array
+    resolution with no axes or colorbar; use
+    :func:`_write_map_fig_with_colorbar` when a labeled figure is needed
+    instead.
 
     Args:
         path: Output ``.png`` path.
@@ -157,6 +197,13 @@ def _write_map_png(path: Path, arr, *, cmap="viridis", vmin=None, vmax=None):
 def _write_photon_png(path: Path, arr):
     """Write a grayscale photon-count map PNG with percentile contrast.
 
+    Contrast bounds are fixed at the 2nd/98th percentile of finite values
+    (not the raw min/max) so a handful of saturated or zero-count pixels do
+    not compress the visible range for the rest of the field of view. Used
+    for both the thresholded photon map and the brightfield (pre-threshold)
+    map, which is why the colormap is always grayscale rather than
+    parameterized like :func:`_write_map_png`.
+
     Args:
         path: Output ``.png`` path.
         arr: 2-D photon or intensity array.
@@ -187,6 +234,12 @@ def _write_map_fig_with_colorbar(
     label: str = "ns",
 ) -> bool:
     """Write a τ (or similar) map figure PNG including a colorbar.
+
+    Unlike :func:`_write_map_png`, this renders a full Matplotlib figure
+    (with a title and a labeled colorbar) so the PNG is self-describing when
+    viewed outside the app, e.g. in a shared report. Display bounds are
+    fixed at the 2nd/98th percentile of finite values, matching the raw
+    (colorbar-less) map so the two paired outputs stay visually consistent.
 
     Args:
         path: Output ``.png`` path (e.g. ``tau_mod_ns_fig.png``).
@@ -222,6 +275,13 @@ def _write_map_fig_with_colorbar(
 def _write_maps_npz(sample_dir: Path, d, *, prefix: str) -> str | None:
     """Write quantitative phasor/lifetime arrays as ``{prefix}_maps.npz``.
 
+    Delegates to :func:`~flim_phasors.session_bundle_io._maps_from_dataset`
+    for the same map set used by session bundles (calibrated g/s, photon
+    counts, and the three lifetime maps), so exported ``.npz`` files can be
+    reloaded with plain NumPy for downstream analysis without needing this
+    package installed. Nothing is written when the dataset has no computed
+    maps yet.
+
     Args:
         sample_dir: Per-sample export directory.
         d: Processed ``PhasorData``.
@@ -254,6 +314,7 @@ def cluster_rows_for_dataset(win, d, stats):
         List of row dictionaries keyed for ``clusters.csv`` columns.
     """
     rows = []
+    # Shared ref checkbox overrides per-sample ref_path when resolving export metadata.
     ref = win._effective_ref_path(d) if hasattr(win, "_effective_ref_path") else d.ref_path
     ref_base = os.path.basename(ref) if ref else ""
     sample_base = os.path.basename(d.sample_path) if d.sample_path else ""
@@ -283,6 +344,13 @@ def cluster_rows_for_dataset(win, d, stats):
 
 def sample_metadata_row(win, d, index: int) -> dict:
     """Build one row of sample-level metadata for summary CSV and session JSON.
+
+    Covers acquisition parameters, the effective reference (accounting for
+    the shared-reference override), applied filter, and thresholding
+    statistics used to compute masked-pixel percentages. The same dict shape
+    is reused both as a CSV row (via :func:`write_samples_summary`) and as
+    the ``"samples"`` entries of :func:`build_session_dict`, so its keys
+    double as both column headers and JSON field names.
 
     Args:
         win: Main window for shared reference and filter state.
@@ -353,6 +421,7 @@ def build_session_dict(win) -> dict:
         "shared_reference": bool(win.chk_shared_ref.isChecked()) if hasattr(win, "chk_shared_ref") else False,
         "shared_reference_path": getattr(win, "shared_ref_path", ""),
         "calibration": {
+            # When shared_reference is true, GUI uses shared_reference_path for all samples.
             "frequency_MHz": win.sp_freq.value(),
             "harmonic": win.sp_harm.value(),
             "reference_lifetime_ns": win.sp_reflt.value(),
@@ -363,6 +432,11 @@ def build_session_dict(win) -> dict:
             "reference_channel": getattr(win, "shared_ref_channel", 0),
             "mean_g": getattr(win.ref_calibration, "mean_g", 0.0) if hasattr(win, "ref_calibration") else 0.0,
             "mean_s": getattr(win.ref_calibration, "mean_s", 0.0) if hasattr(win, "ref_calibration") else 0.0,
+            "harmonic_gs": (
+                [[float(g), float(s)] for g, s in (win.ref_calibration.harmonic_gs or [])]
+                if hasattr(win, "ref_calibration") and getattr(win.ref_calibration, "harmonic_gs", None)
+                else None
+            ),
             "manual": bool(getattr(win.ref_calibration, "use_manual", False)) if hasattr(win, "ref_calibration") else False,
             "manual_g": getattr(win.ref_calibration, "manual_g", 0.0) if hasattr(win, "ref_calibration") else 0.0,
             "manual_s": getattr(win.ref_calibration, "manual_s", 0.0) if hasattr(win, "ref_calibration") else 0.0,
@@ -379,6 +453,12 @@ def build_session_dict(win) -> dict:
 def write_clusters_csv(path: Path, rows: list[dict]):
     """Write cluster statistics rows to a UTF-8 CSV file.
 
+    Column order follows the key order of the first row, so all rows passed
+    in must share the same keys (as produced by
+    :func:`cluster_rows_for_dataset`). This is a no-op when ``rows`` is
+    empty, which lets callers skip writing a ``clusters.csv`` for samples
+    that have no cursors or GMM clusters defined.
+
     Args:
         path: Destination ``.csv`` path.
         rows: Non-empty list of homogeneous row dicts from ``cluster_rows_for_dataset``.
@@ -394,6 +474,12 @@ def write_clusters_csv(path: Path, rows: list[dict]):
 
 def write_samples_summary(path: Path, rows: list[dict]):
     """Write per-sample metadata rows to a UTF-8 CSV summary file.
+
+    Mirrors :func:`write_clusters_csv` but for the one-row-per-sample
+    summary table (acquisition settings, reference info, thresholding
+    stats) rather than per-cluster rows; column order again follows the key
+    order of the first row. Writing is skipped entirely when ``rows`` is
+    empty.
 
     Args:
         path: Destination ``samples_summary.csv`` path.
@@ -476,6 +562,13 @@ def write_excel_bundle(path: Path, win, all_cluster_rows: list[dict], sample_row
 def _cursor_masks_for_dataset(d, cursors) -> np.ndarray | None:
     """Boolean masks for phasor cursors on one dataset.
 
+    Cursor geometry (circular or elliptic) is defined in phasor (g, s)
+    space, so each cursor's mask is computed with ``phasorpy``'s
+    ``mask_from_circular_cursor``/``mask_from_elliptic_cursor`` helpers
+    against the dataset's calibrated ``real_cal``/``imag_cal`` maps, then
+    intersected with the sample's valid-pixel mask (finite g/s that passed
+    the photon threshold) so cursor regions never include masked-out pixels.
+
     Args:
         d: ``PhasorData`` with calibrated g/s.
         cursors: Iterable of cursor dicts from the phasor canvas.
@@ -487,7 +580,7 @@ def _cursor_masks_for_dataset(d, cursors) -> np.ndarray | None:
 
     if not cursors or d.real_cal is None:
         return None
-    g, s = d.real_cal, d.imag_cal
+    g, s = d.real_cal, d.imag_cal  # cursor masks live in phasor (g, s) space
     valid = d.valid_mask()
     masks = []
     for c in cursors:
@@ -503,7 +596,7 @@ def _cursor_masks_for_dataset(d, cursors) -> np.ndarray | None:
                 g, s, [c["center_real"]], [c["center_imag"]], radius=[c["radius"]])
         if mk.ndim == 3:
             mk = mk[0]
-        masks.append(mk & valid)
+        masks.append(mk & valid)  # intersect with thresholded finite g/s pixels
     return np.stack(masks) if masks else None
 
 
@@ -534,6 +627,7 @@ def cluster_stats_and_masks_for_dataset(win, d, *, is_active: bool = False):
     stored_fit = getattr(d, "gmm_fit", None)
     stored_stats = list(getattr(d, "cluster_stats", None) or [])
 
+    # Per-sample stash wins so Export all captures GMM after switching images.
     if stored_fit is not None:
         cr, ci, rm, _ri, _ang = stored_fit
         labelmap = label_pixels_by_gmm(g, s, cr, ci, rm)
@@ -615,6 +709,12 @@ def _export_cluster_masks(
 ):
     """Write ``{prefix}_mask_01.png`` … grayscale masks for each cluster.
 
+    Each boolean slice along the first axis of ``masks`` is scaled to
+    ``0``/``255`` and written as an independent single-channel PNG, numbered
+    from 1 in cluster order (matching the ``idx`` field used in cluster stat
+    rows), so masks can be loaded individually in external tools like
+    ImageJ/Fiji without needing to know the original cluster count.
+
     Args:
         sample_dir: Per-sample export subdirectory.
         masks: Boolean array ``(n, H, W)``.
@@ -653,7 +753,7 @@ def export_sample_maps(sample_dir: Path, d, *, prefix: str | None = None, index:
     if npz_name:
         written.append(npz_name)
 
-    # Masked / thresholded photons (no colorbar + colorbar)
+    # Masked / thresholded photons (mean_thr: NaN where g/s invalid or below Min N)
     thr = d.mean_thr if d.mean_thr is not None else d.mean_raw
     if thr is not None:
         name = f"{prefix}_photons.png"
@@ -666,7 +766,7 @@ def export_sample_maps(sample_dir: Path, d, *, prefix: str | None = None, index:
         ):
             written.append(cbar_name)
 
-    # Brightfield: full intensity including below Min N (no colorbar + colorbar)
+    # Brightfield: pre-threshold counts (LIF photon image or raw histogram sum).
     bright = None
     if hasattr(d, "intensity_brightfield"):
         bright = d.intensity_brightfield()
@@ -736,6 +836,7 @@ def export_analysis_bundle(win, out_dir: str | Path) -> dict:
     for d in datasets:
         if d.signal_full is None and d.sample_path and hasattr(d, "ensure_loaded"):
             try:
+                # session.json restore has paths only; try decode before skipping export.
                 d.ensure_loaded(frame=getattr(d, "frame_index", -1))
             except Exception:
                 pass

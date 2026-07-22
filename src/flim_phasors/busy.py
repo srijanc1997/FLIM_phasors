@@ -15,27 +15,67 @@ T = TypeVar("T")
 
 
 class CancelledError(Exception):
-    """Raised when the user cancels a long-running job."""
+    """Raised when the user cancels a long-running job.
+
+    Signals cooperative cancellation of background work started via
+    :func:`run_busy_qt`: either the worker itself raises this after noticing
+    :attr:`CancelToken.cancelled`, or ``run_busy_qt`` raises it on the caller's
+    behalf when the dialog is dismissed before the job finishes. Callers
+    typically catch this to suppress error dialogs for user-initiated aborts.
+    """
 
 
 class CancelToken:
-    """Thread-safe cancellation flag checked by worker loops."""
+    """Thread-safe cancellation flag checked by worker loops.
+
+    A single instance is shared between the GUI thread (which calls
+    :meth:`cancel` when the user dismisses the progress dialog) and the
+    background worker thread (which polls :attr:`cancelled` or calls
+    :meth:`check` between processing steps to exit early).
+    """
 
     def __init__(self):
-        """Create a token that starts in the non-cancelled state."""
+        """Create a token that starts in the non-cancelled state.
+
+        Backed by a :class:`threading.Event` so ``cancel()`` from the GUI
+        thread is immediately visible to a worker polling on another thread
+        without extra locking.
+        """
         self._event = threading.Event()
 
     def cancel(self):
-        """Signal cooperative cancellation to any worker polling this token."""
+        """Signal cooperative cancellation to any worker polling this token.
+
+        Does not forcibly stop the worker thread; it only sets the flag that
+        :attr:`cancelled` and :meth:`check` observe, so the worker must reach
+        a check point to actually abort.
+        """
         self._event.set()
 
     @property
     def cancelled(self) -> bool:
-        """Whether :meth:`cancel` has been called."""
+        """Whether :meth:`cancel` has been called.
+
+        Backed by :meth:`threading.Event.is_set`, so this is safe to poll
+        from a worker thread without additional locking while the GUI
+        thread calls :meth:`cancel` concurrently. Worker loops typically
+        check this (or call :meth:`check`) between chunks of long-running
+        work rather than only once at the start.
+
+        Returns:
+            True once cancellation has been requested; stays True for the
+            lifetime of this token (there is no un-cancel).
+        """
         return self._event.is_set()
 
     def check(self):
         """Raise :class:`CancelledError` if cancellation was requested.
+
+        Convenience wrapper over :attr:`cancelled` for worker code that
+        wants to abort immediately rather than branch on a boolean; calling
+        this at natural checkpoints (e.g. between processing steps of a long
+        FLIM load) lets :func:`run_busy_qt` unwind cleanly via the normal
+        exception path instead of needing a separate polling loop.
 
         Raises:
             CancelledError: When :attr:`cancelled` is true.
@@ -44,7 +84,7 @@ class CancelToken:
             raise CancelledError("Cancelled by user")
 
 
-# --- unused (focused cleanup): uncomment if needed ---
+# --- unused: uncomment if needed ---
 # def run_in_thread(
 #     fn: Callable[[], T],
 #     *,
@@ -89,6 +129,14 @@ def run_busy_qt(
     cancel_out: list[CancelToken] | None = None,
 ) -> tuple[T, float]:
     """Run *fn* off the GUI thread behind a modal progress dialog.
+
+    Starts ``fn`` in a daemon :class:`threading.Thread` while the GUI thread
+    keeps pumping ``QApplication.processEvents`` so the window stays
+    responsive (and repaints the progress dialog) while the background work
+    runs; a :class:`CancelToken` is created per call and wired to the
+    dialog's Cancel button so dismissing it does not forcibly kill the
+    thread but instead lets cooperative checkpoints inside ``fn`` notice and
+    raise :class:`CancelledError`.
 
     Args:
         parent: Qt parent widget for the progress dialog.
@@ -135,7 +183,13 @@ def run_busy_qt(
     completed = False
 
     def target():
-        """Worker thread entry: run ``fn`` and capture result or exception."""
+        """Worker thread entry: run ``fn`` and capture result or exception.
+
+        Runs on the background :class:`threading.Thread` started by
+        ``run_busy_qt``; any return value or raised exception is stashed in
+        the enclosing ``result``/``error`` lists (rather than returned or
+        re-raised directly) so the GUI thread can retrieve it after joining.
+        """
         nonlocal completed
         try:
             result.append(fn())

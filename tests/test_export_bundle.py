@@ -18,6 +18,7 @@ from flim_phasors.session_bundle_io import MAP_KEYS
 
 
 def _make_dataset(name: str, g0: float = 0.4, s0: float = 0.3) -> PhasorData:
+    """Build a tiny in-memory PhasorData with uniform calibrated g/s maps."""
     d = PhasorData()
     d.sample_path = f"/data/{name}.ptu"
     d.group_name = "grp"
@@ -45,6 +46,7 @@ def _make_dataset(name: str, g0: float = 0.4, s0: float = 0.3) -> PhasorData:
 
 
 def _fake_win(datasets: list[PhasorData], *, mode: str = "cursor"):
+    """Minimal MainWindow stand-in with the attributes export_bundle reads."""
     active = datasets[0]
     cursors = [
         {
@@ -88,6 +90,7 @@ def _fake_win(datasets: list[PhasorData], *, mode: str = "cursor"):
 
 
 def test_export_sample_maps_writes_npz_and_brightfield(tmp_path: Path):
+    """Prefixed maps.npz and photon/brightfield/tau PNGs are written; no legacy names."""
     d = _make_dataset("a")
     written = export_sample_maps(tmp_path, d, prefix="a")
     assert "a_maps.npz" in written
@@ -107,6 +110,7 @@ def test_export_sample_maps_writes_npz_and_brightfield(tmp_path: Path):
 
 
 def test_export_analysis_bundle_multi_sample_clusters(tmp_path: Path):
+    """Multi-sample Export all writes shared CSV/XLSX/session plus per-sample dirs."""
     d1 = _make_dataset("s1", g0=0.35, s0=0.28)
     d2 = _make_dataset("s2", g0=0.45, s0=0.32)
     win = _fake_win([d1, d2], mode="cursor")
@@ -142,6 +146,7 @@ def test_export_analysis_bundle_multi_sample_clusters(tmp_path: Path):
 
 
 def test_export_rewrites_same_excel_and_clears_sample_dir(tmp_path: Path):
+    """Re-export overwrites analysis.xlsx and removes stale files in sample dirs."""
     d = _make_dataset("cellA")
     win = _fake_win([d])
     export_analysis_bundle(win, tmp_path)
@@ -195,6 +200,7 @@ def test_export_uses_per_sample_gmm_fit(tmp_path: Path):
 
 
 def test_build_session_dict_includes_gmm_and_clusters():
+    """Session JSON payload includes serialized GMM fit and cluster_stats."""
     d = _make_dataset("x")
     win = _fake_win([d])
     win.cluster_stats = [

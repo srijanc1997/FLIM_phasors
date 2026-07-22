@@ -15,6 +15,12 @@ from flim_phasors.calibration import ReferenceCalibration
 def calibration_to_dict(cal: ReferenceCalibration, *, ui_extra: dict | None = None) -> dict:
     """Convert a :class:`~flim_phasors.calibration.ReferenceCalibration` to JSON.
 
+    Only scalar reference statistics (mean G/S, mean intensity, manual
+    overrides, per-harmonic G/S pairs) are persisted; spatial reference
+    maps are intentionally excluded so calibration files stay small and
+    reloading always re-derives maps from the original reference file
+    rather than trusting a stale cached array.
+
     Args:
         cal: Reference calibration with mean G/S phasor and optional manual
             override values.
@@ -39,6 +45,7 @@ def calibration_to_dict(cal: ReferenceCalibration, *, ui_extra: dict | None = No
         "values_ready": cal.values_ready,
     }
     if cal.harmonic_gs:
+        # Per-harmonic g/s for PAW-FLIM; spatial maps are never serialized.
         d["harmonic_gs"] = [[float(g), float(s)] for g, s in cal.harmonic_gs]
     if ui_extra:
         d["ui"] = ui_extra
@@ -47,6 +54,12 @@ def calibration_to_dict(cal: ReferenceCalibration, *, ui_extra: dict | None = No
 
 def calibration_from_dict(data: dict) -> ReferenceCalibration:
     """Reconstruct a :class:`~flim_phasors.calibration.ReferenceCalibration` from JSON.
+
+    Inverse of :func:`calibration_to_dict`. All numeric fields have
+    fallback defaults so loading an older or hand-edited calibration file
+    with missing keys does not raise; ``values_ready`` defaults to whether
+    both ``mean_g`` and ``mean_s`` keys were present, matching how the GUI
+    decides whether calibration can actually be applied.
 
     Args:
         data: Dict from :func:`calibration_to_dict` or a saved calibration file.
@@ -82,6 +95,12 @@ def calibration_from_dict(data: dict) -> ReferenceCalibration:
 def save_calibration(path: str | Path, cal: ReferenceCalibration, *, ui_extra: dict | None = None):
     """Write reference calibration parameters to a JSON file.
 
+    Serializes via :func:`calibration_to_dict` and writes pretty-printed
+    UTF-8 JSON, overwriting any existing file at ``path``. This lets a
+    calibration derived from one reference measurement be reused across
+    sessions or shared between samples without re-running reference
+    processing each time.
+
     Args:
         path: Output ``.json`` path.
         cal: Reference phasor calibration to persist.
@@ -95,6 +114,11 @@ def save_calibration(path: str | Path, cal: ReferenceCalibration, *, ui_extra: d
 
 def load_calibration(path: str | Path) -> tuple[ReferenceCalibration, dict]:
     """Load reference calibration from a JSON file.
+
+    Counterpart to :func:`save_calibration`. Only scalar calibration values
+    are restored; the caller must still recompute or reload spatial
+    reference maps separately if per-pixel calibration is needed, since
+    those are never written to the JSON file in the first place.
 
     Args:
         path: Calibration JSON file produced by :func:`save_calibration`.

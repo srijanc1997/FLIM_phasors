@@ -45,3 +45,4 @@ CODEBASE.md
 
 # Sphinx build output
 docs/_build/
+*.txt

@@ -29,6 +29,13 @@ LIF_EXTENSIONS = (".lif", ".xlef", ".xlif", ".lof")
 class LifPhasorSeries:
     """Metadata for one FLIM measurement that includes LAS X phasor exports.
 
+    Produced by :func:`list_lif_phasor_series` while scanning a Leica
+    container for FLIM series that were exported with the ``Phasor
+    Intensity``/``Real``/``Imaginary`` triplet. Instances only describe
+    *which* series are available and how to address them (``image_key``);
+    the actual map arrays are loaded lazily via
+    :func:`load_lif_phasor_maps` once a series is selected.
+
     Attributes:
         lif_path: Absolute path to the container file.
         image_key: Internal liffile path/key for the parent FLIM series.
@@ -46,6 +53,11 @@ class LifPhasorSeries:
 
 def is_lif_path(path: str) -> bool:
     """Return whether ``path`` has a recognized Leica container extension.
+
+    Used to route file-open handling to this module's LIF phasor-map loading
+    path instead of the raw-histogram loaders in :mod:`flim_phasors.io`; the
+    check is name-only and does not open or validate the file's internal
+    structure.
 
     Args:
         path: File path to test.
@@ -79,6 +91,12 @@ def _phasor_parent_key(im) -> str | None:
 
 def _has_phasor_triplet(lif, image_key: str) -> bool:
     """Return whether all three LAS X phasor companion images exist for a series.
+
+    LAS X exports a FLIM phasor result as three sibling images (Intensity,
+    Real, Imaginary) nested under the same parent series; a series is only
+    usable for phasor analysis if all three are present, so this probes each
+    expected image path and treats any lookup failure as "missing" rather
+    than propagating the underlying ``liffile`` exception.
 
     Args:
         lif: Open ``liffile.LifFile`` instance.
@@ -155,6 +173,12 @@ def list_lif_phasor_series(path: str) -> list[LifPhasorSeries]:
 def lasx_channel_meta(attrs: dict[str, Any], channel: int = 0) -> dict[str, Any] | None:
     """Return per-channel LAS X phasor metadata from phasorpy attribute dict.
 
+    LAS X stores one metadata block per acquired channel (calibration phase,
+    modulation, intensity threshold, etc.) in the ``flim_phasor_channels``
+    list; ``channel`` is clamped to the valid index range rather than
+    raising, so a stale channel selection from a previously loaded file with
+    fewer channels still resolves to the last available channel.
+
     Args:
         attrs: Attribute dictionary returned by ``phasor_from_lif``.
         channel: Channel index (clamped to available entries).
@@ -194,6 +218,7 @@ def lasx_intensity_threshold(
     raw_thr = float(ch.get("IntensityThreshold", 0))
     if photon_image:
         return raw_thr
+    # Phasor Intensity is mean photons/bin; LAS X threshold is on total counts.
     samples = float(attrs.get("samples", 1) or 1)
     if samples <= 0:
         samples = 1.0
@@ -257,6 +282,7 @@ def apply_lasx_phasor_calibration(
     if modulation == 0.0:
         modulation = 1.0
 
+    # phasor_transform(real, imag, angle, scale): rotate by -phase, divide modulation.
     real, imag = phasor_transform(
         real,
         imag,
@@ -307,6 +333,7 @@ def lif_intensity_for_maps(
         attrs["lasx_intensity_threshold"] = lasx_intensity_threshold(
             attrs, channel, photon_image=True)
         return np.asarray(photon, dtype=np.float32), attrs
+    # Fall back to normalized Phasor Intensity; threshold is scaled by samples (see above).
     attrs["uses_photon_intensity"] = False
     attrs["lasx_intensity_threshold"] = lasx_intensity_threshold(
         attrs, channel, photon_image=False)
@@ -338,6 +365,7 @@ def load_lif_phasor_maps(
         dict (frequency, LAS X thresholds, calibration record, etc.).
     """
     mean, real, imag, attrs = phasor_from_lif(path, image=image_key)
+    # phasor_from_lif returns real/imag ≡ g/s (not Cartesian time-domain components).
     mean = to_2d(np.asarray(mean, dtype=np.float32))
     real = to_2d(np.asarray(real, dtype=np.float32))
     imag = to_2d(np.asarray(imag, dtype=np.float32))

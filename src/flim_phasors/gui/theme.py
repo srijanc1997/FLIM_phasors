@@ -1,4 +1,13 @@
-"""Phasor Lab UI themes (dark default + light variant)."""
+"""Phasor Lab UI themes (dark default + light variant).
+
+Defines the two named themes used throughout the FLIM Phasors GUI — the dark
+``phasor_lab`` theme (default) and the light ``phasor_lab_light`` variant —
+along with helper functions that resolve a theme id (tolerant of legacy
+boolean-era settings) to the concrete Qt stylesheets, activity-log style,
+matplotlib toolbar style, and raw toolbar palette colors needed to fully
+restyle the main window. ``EnhancementsMixin`` in ``enhancements.py`` is the
+sole consumer of these helpers when applying or switching themes.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +21,7 @@ THEME_MENU_LABELS = {
 }
 
 PRIMARY_BUTTON_ATTRS = (
+    # Widgets tagged with setProperty("primary", True) — styled via QPushButton[primary="true"] below.
     "btn_calibrate",
     "btn_apply",
     "btn_apply_all",
@@ -21,7 +31,24 @@ PRIMARY_BUTTON_ATTRS = (
 
 
 def normalize_theme_id(raw: str) -> str:
-    """Map persisted or legacy theme ids to a Phasor Lab theme name."""
+    """Coerce any persisted, legacy, or user-supplied value to a known theme id.
+
+    Used everywhere a theme id is read from ``QSettings`` or passed in from a
+    menu action, so the rest of the theme module can assume it always has one
+    of exactly two valid ids. Lowercases and strips ``raw``, normalizes hyphens
+    to underscores, then maps it: ``"phasor_lab"``/``"dark"`` (old boolean-era
+    naming) to :data:`THEME_PHASOR_LAB`, and ``"phasor_lab_light"``/``"light"``
+    to :data:`THEME_PHASOR_LAB_LIGHT`. Any other value (unrecognized, empty, or
+    corrupted settings) falls back to :data:`DEFAULT_THEME` rather than
+    raising, so a bad settings file can never crash theme application.
+
+    Args:
+        raw: Theme id as read from settings or a UI action, or any other
+            string-like value to normalize.
+
+    Returns:
+        One of :data:`THEME_PHASOR_LAB` or :data:`THEME_PHASOR_LAB_LIGHT`.
+    """
     key = str(raw).lower().strip().replace("-", "_")
     if key in (THEME_PHASOR_LAB, "dark"):
         return THEME_PHASOR_LAB
@@ -31,33 +58,117 @@ def normalize_theme_id(raw: str) -> str:
 
 
 def is_dark_theme(theme: str) -> bool:
-    """Return whether *theme* uses the dark Phasor Lab palette."""
+    """Return whether a given theme id corresponds to the dark palette.
+
+    Used by ``EnhancementsMixin._init_enhancements``/``_apply_ui_theme`` to
+    maintain the legacy ``self._dark_theme`` boolean flag (and the matching
+    ``"dark_theme"`` QSettings key) alongside the newer named-theme system, for
+    backward compatibility with any code or settings still expecting a simple
+    boolean. Normalizes ``theme`` first so callers do not need to validate it
+    themselves.
+
+    Args:
+        theme: Theme id, tolerant of legacy/typo'd values via
+            :func:`normalize_theme_id`.
+
+    Returns:
+        ``True`` if the normalized theme is :data:`THEME_PHASOR_LAB` (dark);
+        ``False`` otherwise.
+    """
     return normalize_theme_id(theme) == THEME_PHASOR_LAB
 
 
 def stylesheet_for(theme: str) -> str:
-    """Return the application-wide Qt stylesheet for *theme*."""
+    """Return the full application-wide Qt stylesheet string for a theme.
+
+    Called by ``EnhancementsMixin._apply_ui_theme`` via
+    ``self.setStyleSheet(stylesheet_for(theme))`` to restyle every widget in
+    the window at once. The returned string is a single Qt stylesheet covering
+    generic widget backgrounds/text, group boxes, buttons (including the
+    ``[primary="true"]`` accent-button variant), combo/spin boxes, tab bars,
+    text edits, the table widget, header sections, scroll bars, and the
+    matplotlib toolbar container — see ``_PHASOR_LAB_DARK_STYLESHEET`` and
+    ``_PHASOR_LAB_LIGHT_STYLESHEET`` for the concrete rule sets.
+
+    Args:
+        theme: Theme id, tolerant of legacy/typo'd values via
+            :func:`normalize_theme_id`.
+
+    Returns:
+        The Qt stylesheet string for the normalized theme.
+    """
     if normalize_theme_id(theme) == THEME_PHASOR_LAB_LIGHT:
         return _PHASOR_LAB_LIGHT_STYLESHEET
     return _PHASOR_LAB_DARK_STYLESHEET
 
 
 def log_style_for(theme: str) -> str:
-    """Return the activity-log ``QPlainTextEdit`` stylesheet."""
+    """Return the stylesheet for the activity-log text widget in a theme.
+
+    Called by ``EnhancementsMixin._apply_theme_widgets`` to restyle
+    ``self.txt_log`` directly, separately from the global stylesheet, because
+    the log widget uses a monospace font and a background distinct from other
+    text edits (to visually set it apart as a console-like readout) that is
+    easier to express as its own small stylesheet than to encode via a
+    global ``QPlainTextEdit#activity_log`` selector alone.
+
+    Args:
+        theme: Theme id, tolerant of legacy/typo'd values via
+            :func:`normalize_theme_id`.
+
+    Returns:
+        Qt stylesheet string setting the log widget's font, background, text
+        color, and border for the normalized theme.
+    """
     if normalize_theme_id(theme) == THEME_PHASOR_LAB_LIGHT:
         return _LOG_PHASOR_LAB_LIGHT
     return _LOG_PHASOR_LAB_DARK
 
 
 def toolbar_style_for(theme: str) -> str:
-    """Return the matplotlib navigation toolbar stylesheet."""
+    """Return the stylesheet for matplotlib's navigation toolbar widgets.
+
+    Called by ``EnhancementsMixin._apply_theme_widgets`` for each of
+    ``phasor_toolbar``/``image_toolbar``. Matplotlib's ``NavigationToolbar2QT``
+    renders its own ``QToolButton``s and labels that need explicit background/
+    hover/pressed styling to match the rest of the app, since it is not a
+    plain Qt widget the global stylesheet fully reaches. The returned string
+    also styles the toolbar's own background/border; note callers additionally
+    set the widget's ``QPalette`` via :func:`toolbar_colors_for`, since some of
+    matplotlib's toolbar painting uses palette colors rather than the
+    stylesheet.
+
+    Args:
+        theme: Theme id, tolerant of legacy/typo'd values via
+            :func:`normalize_theme_id`.
+
+    Returns:
+        Qt stylesheet string for the toolbar and its child buttons/labels.
+    """
     if normalize_theme_id(theme) == THEME_PHASOR_LAB_LIGHT:
         return _MPL_TOOLBAR_PHASOR_LAB_LIGHT
     return _MPL_TOOLBAR_PHASOR_LAB_DARK
 
 
 def toolbar_colors_for(theme: str) -> tuple[str, str]:
-    """Return ``(background, foreground)`` hex colors for plot toolbars."""
+    """Return the raw background/foreground hex colors for plot toolbars.
+
+    Called by ``EnhancementsMixin._apply_theme_widgets`` to build a
+    ``QPalette`` (window, button, window-text, and button-text roles) applied
+    directly to the matplotlib toolbar widgets, in addition to the stylesheet
+    from :func:`toolbar_style_for`. This is necessary because parts of
+    matplotlib's ``NavigationToolbar2QT`` painting read palette colors rather
+    than stylesheet rules, so the two functions must be kept visually
+    consistent with each other for the toolbar to look uniform.
+
+    Args:
+        theme: Theme id, tolerant of legacy/typo'd values via
+            :func:`normalize_theme_id`.
+
+    Returns:
+        A ``(background_hex, foreground_hex)`` tuple for the normalized
+        theme.
+    """
     if normalize_theme_id(theme) == THEME_PHASOR_LAB_LIGHT:
         return "#e8eef5", "#1a2a33"
     return "#252a3d", "#e8eaf0"

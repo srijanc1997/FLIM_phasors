@@ -30,6 +30,12 @@ from flim_phasors.utils import (
 def freq_ok(data):
     """Return whether a dataset has a valid modulation frequency for tick marks.
 
+    Used to gate :meth:`PhasorCanvas._draw_lifetime_ticks`, since placing
+    lifetime annotations on the universal semicircle requires converting a
+    lifetime to a phasor coordinate via the laser frequency; without a
+    positive ``work_frequency`` that conversion is undefined and the ticks
+    are simply skipped.
+
     Args:
         data: :class:`~flim_phasors.data.PhasorData` instance or ``None``.
 
@@ -41,6 +47,11 @@ def freq_ok(data):
 
 def cmap_mid_color(name):
     """Sample a colormap at normalized position 0.65 for legend swatches.
+
+    Compare-mode density clouds are drawn with partial alpha near the low
+    end of their colormap, so a swatch taken from the very start of the
+    colormap would look washed out in the legend; 0.65 was chosen as a
+    representative, clearly visible color for that cloud's legend marker.
 
     Args:
         name: Matplotlib colormap name.
@@ -72,7 +83,28 @@ def _subsample_phasor_points(g, s, max_points=COMPARE_SCATTER_MAX):
 
 
 def _phasor_map_key(d) -> tuple:
-    """Stable cache key for a dataset's calibrated phasor maps."""
+    """Build a stable cache key for a dataset's calibrated phasor maps.
+
+    Used to key :attr:`PhasorCanvas._hist_cache` so repeated redraws (cursor
+    drags, click markers, legend updates) can reuse a previously binned 2-D
+    histogram instead of recomputing it. The key mixes object identity
+    (``id()``) of the dataset and its ``real_cal``/``imag_cal`` arrays with
+    the array shape rather than array contents, since hashing or comparing
+    full phasor maps on every redraw would be far more expensive than the
+    identity check. This means the cache is only valid as long as calibrated
+    arrays are replaced (not mutated in place) whenever calibration changes —
+    which matches how :class:`~flim_phasors.data.PhasorData` is updated
+    elsewhere in the codebase.
+
+    Args:
+        d: :class:`~flim_phasors.data.PhasorData` instance, or ``None``.
+
+    Returns:
+        A hashable tuple suitable for use as a dict key. When ``d`` is
+        ``None`` or lacks calibrated maps, returns ``(id(d), None, None,
+        None)`` so all "empty" datasets collapse onto distinct-but-stable
+        keys per object identity.
+    """
     if d is None or d.real_cal is None or d.imag_cal is None:
         return (id(d), None, None, None)
     return (
@@ -86,8 +118,29 @@ def _phasor_map_key(d) -> tuple:
 class PhasorCanvas(FigureCanvas):
     """Matplotlib canvas for interactive phasor histograms and segmentation cursors.
 
+    Renders one or more datasets as 2-D density histograms (or scatter/summary
+    overlays in compare mode) on the universal semicircle, and lets the user
+    draw, move, resize, and delete circular or elliptical segmentation cursors
+    directly on the plot. Phasor coordinates follow the convention ``g`` (real
+    part, x-axis) and ``s`` (imaginary part, y-axis). Cursors are stored as
+    plain dicts in :attr:`cursors` (keys: ``center_real``, ``center_imag``,
+    ``radius``, ``kind``, ``radius_minor``, ``angle``, ``color``, ``label``,
+    ``patch``) so they can be serialized independently of their matplotlib
+    ``patch`` artist, which is rebuilt on every redraw. Two-dimensional
+    histograms are memoized in :attr:`_hist_cache` keyed by dataset identity
+    and array shape so that cursor drags and click markers can redraw quickly
+    without recomputing the binning.
+
     Emits Qt signals when cursors are added, moved, resized, or when the user
-    clicks on the phasor plane outside existing cursors.
+    clicks on the phasor plane outside existing cursors:
+
+    * :attr:`cursorChanged` — a "committed" edit (add/remove/drag end) that
+      warrants a full downstream recompute (masks, lifetimes, etc.).
+    * :attr:`cursorMoving` — a fast, interactive update (drag/scroll/slider)
+      meant for cheap overlay-only redraws.
+    * :attr:`cursorSelectionChanged` — the active cursor index changed.
+    * :attr:`phasorClicked` — the user clicked the phasor plane outside any
+      cursor, reporting the ``(g, s)`` coordinate.
     """
 
     cursorChanged = Signal()   # committed: gesture end / add / remove (full recompute)
@@ -97,6 +150,12 @@ class PhasorCanvas(FigureCanvas):
 
     def __init__(self, parent=None):
         """Initialize axes, mouse handlers, and empty cursor state.
+
+        Sets up the matplotlib figure/axes, the compare-mode defaults
+        (single dataset, cloud style, no layers), the empty segmentation
+        cursor list, and an empty 2-D histogram cache, then wires up the
+        button-press/release, motion, and scroll Qt/matplotlib event
+        callbacks that drive cursor selection, dragging, and resizing.
 
         Args:
             parent: Optional Qt parent widget.
@@ -127,7 +186,19 @@ class PhasorCanvas(FigureCanvas):
         self.mpl_connect("scroll_event", self.on_scroll)
 
     def _init_axes(self):
-        """Clear and configure the phasor axes with the universal semicircle."""
+        """Clear and configure the phasor axes with the universal semicircle.
+
+        Called at the start of every :meth:`redraw_hist` (and once during
+        ``__init__``) to reset the axes to a known baseline before layering
+        histograms, GMM ellipses, and cursors back on top. Also drops the
+        cached click-marker artist reference, since ``ax.clear()`` destroys
+        all artists including it; callers are responsible for re-adding the
+        marker afterward (see :meth:`_redraw_click_marker`). The universal
+        semicircle (the locus of single-exponential lifetimes in phasor
+        space) is drawn once here so every subsequent redraw shows it, and
+        the ``(g, s)`` axis limits and 1:1 aspect ratio are fixed so distances
+        on screen match distances in phasor units.
+        """
         self.ax.clear()
         self._click_marker_artist = None
         self.ax.set_xlabel("g")
@@ -146,6 +217,12 @@ class PhasorCanvas(FigureCanvas):
 
     def set_compare(self, enabled, style, layers, *, legend_loc=None, legend_fontsize=None):
         """Configure multi-dataset compare overlay mode.
+
+        Stores the compare flag, style, and layer list on the canvas so
+        the next :meth:`redraw_hist` renders clouds, scatter points, or
+        mean/std summaries for each layer instead of a single dataset.
+        Does not redraw by itself; callers typically follow with
+        :meth:`update_display` or :meth:`redraw_hist`.
 
         Args:
             enabled: When ``True``, render multiple compare layers.
@@ -174,6 +251,12 @@ class PhasorCanvas(FigureCanvas):
     ):
         """Replace the active dataset and redraw the phasor histogram.
 
+        Convenience wrapper that combines :attr:`data` assignment with
+        :meth:`set_compare` and a full :meth:`redraw_hist`, so callers
+        updating both the primary dataset and compare configuration in
+        response to a UI change don't need to sequence the calls
+        themselves.
+
         Args:
             data: Primary :class:`~flim_phasors.data.PhasorData` to display.
             compare_enabled: Enable multi-layer compare rendering.
@@ -192,6 +275,13 @@ class PhasorCanvas(FigureCanvas):
     def _draw_lifetime_ticks(self, data):
         """Annotate standard lifetime values on the universal semicircle.
 
+        Marks the phasor positions corresponding to a fixed set of
+        reference lifetimes (0.5-8 ns) so users can visually calibrate
+        cursor placement against known single-exponential decays. Silently
+        does nothing when ``data`` lacks a usable modulation frequency
+        (see :func:`freq_ok`), since the lifetime-to-phasor conversion is
+        frequency-dependent.
+
         Args:
             data: Dataset supplying ``work_frequency`` for tick placement.
         """
@@ -203,7 +293,23 @@ class PhasorCanvas(FigureCanvas):
             self.ax.annotate(f"{tau}ns", (gg, ss), fontsize=7, alpha=0.7)
 
     def _store_hist_cache(self, key, value):
-        """Insert a histogram into the LRU-ish cache (bounded size)."""
+        """Insert a histogram into the bounded, insertion-ordered cache.
+
+        Implements a simple LRU-ish eviction policy: inserting (or
+        re-inserting, which callers do by popping then storing) a key moves
+        it to the "most recently used" end of the cache because Python dicts
+        preserve insertion order. Once the cache exceeds
+        :data:`~flim_phasors.constants.PHASOR_HIST_CACHE_MAX` entries, the
+        oldest key (least recently touched) is evicted. This keeps memory
+        bounded when many datasets or bin-count/key-prefix combinations are
+        cycled through during a session (e.g. switching between single,
+        compare-cloud, and per-layer histograms).
+
+        Args:
+            key: Cache key, typically produced alongside a bins/key_prefix
+                pair and a :func:`_phasor_map_key` for the dataset.
+            value: The ``(counts, xedges, yedges)`` tuple to store.
+        """
         self._hist_cache[key] = value
         while len(self._hist_cache) > PHASOR_HIST_CACHE_MAX:
             # dict preserves insertion order (Py3.7+)
@@ -214,7 +320,29 @@ class PhasorCanvas(FigureCanvas):
 
         Results are cached by map identity so repeated redraws (cursor moves,
         click markers) skip re-binning. Large clouds are subsampled before
-        binning to keep hist2d cheap.
+        binning to keep hist2d cheap. Bins with fewer than 1 count are set to
+        ``NaN`` (matching matplotlib's ``hist2d(cmin=1)`` behavior) so empty
+        regions of phasor space are rendered transparent instead of as a
+        solid low-value color. ``key_prefix`` lets callers keep separate cache
+        entries for the same dataset rendered at different resolutions or in
+        different compare-layer roles (e.g. ``"single"`` vs ``"cmp0"``,
+        ``"cmp1"``, ...), since bin count and role both affect the result.
+
+        Args:
+            d: :class:`~flim_phasors.data.PhasorData` with calibrated
+                ``real_cal``/``imag_cal`` maps and a ``valid_mask()`` method.
+            bins: Number of bins per axis passed to ``np.histogram2d``.
+            key_prefix: Cache-key namespace distinguishing single-view vs
+                per-compare-layer histograms at potentially different bin
+                counts.
+
+        Returns:
+            Tuple ``(counts, xedges, yedges)`` where ``counts`` has shape
+            ``(bins, bins)`` with ``NaN`` in empty bins, and ``xedges``/
+            ``yedges`` are the bin edge arrays along g and s respectively.
+            When the dataset has no valid pixels, returns an all-``NaN``
+            histogram over the default ``[0, 1.05] x [0, 0.75]`` phasor
+            range.
         """
         key = (key_prefix, bins, _phasor_map_key(d))
         cached = self._hist_cache.get(key)
@@ -250,6 +378,12 @@ class PhasorCanvas(FigureCanvas):
     def _draw_single_cloud(self, d):
         """Render a single-dataset phasor density histogram (turbo colormap).
 
+        Used when compare mode is off (or only one layer is visible).
+        Pulls a cached, pre-binned 2-D histogram via
+        :meth:`_histogram2d_cached` and paints it with ``pcolormesh``; if
+        the dataset has no finite bins (e.g. no valid pixels), nothing is
+        drawn.
+
         Args:
             d: :class:`~flim_phasors.data.PhasorData` with calibrated maps.
         """
@@ -257,12 +391,20 @@ class PhasorCanvas(FigureCanvas):
             d, bins=PHASOR_HIST_BINS, key_prefix="single")
         if not np.any(np.isfinite(counts)):
             return
+        # .T: histogram2d is (x,y) but pcolormesh expects rows = y bins.
         self.ax.pcolormesh(
             xedges, yedges, counts.T, cmap="turbo", shading="auto",
             rasterized=True)
 
     def _draw_layer_cloud(self, d, color_idx):
         """Render one compare-layer density cloud with a distinct colormap.
+
+        Used in multi-layer compare mode with ``style="cloud"``: each layer
+        gets its own colormap (cycled from
+        :data:`~flim_phasors.constants.COMPARE_CMAPS`) and is drawn with
+        partial transparency and a fixed ``zorder`` so overlapping layers
+        remain individually distinguishable rather than one fully
+        occluding another.
 
         Args:
             d: Dataset for this layer.
@@ -282,6 +424,13 @@ class PhasorCanvas(FigureCanvas):
     def _draw_layer_scatter(self, d, color, label):
         """Render subsampled scatter points for one compare layer.
 
+        Used in multi-layer compare mode with ``style="scatter"``. Points
+        are subsampled via :func:`_subsample_phasor_points` and drawn with
+        very small markers and low alpha so overlapping layers remain
+        legible; the ``label`` is attached to the scatter artist so
+        :meth:`_draw_compare_legend` can build a legend directly from the
+        axes' handles instead of constructing proxy artists.
+
         Args:
             d: Dataset for this layer.
             color: Matplotlib color for scatter markers.
@@ -296,6 +445,14 @@ class PhasorCanvas(FigureCanvas):
 
     def _draw_layer_summary(self, d, color, label):
         """Render mean ± std error bars for one compare layer.
+
+        Used in multi-layer compare mode with ``style="summary"``, this
+        collapses an entire dataset's valid phasor pixels down to a single
+        marker at the mean ``(g, s)`` with error bars at the standard
+        deviation along each axis, which is useful for comparing many
+        samples at a glance without the visual clutter of full clouds or
+        scatter points. Error bars have a small floor (``1e-6``) so a
+        dataset with zero spread still renders a visible bar.
 
         Args:
             d: Dataset for this layer.
@@ -314,7 +471,23 @@ class PhasorCanvas(FigureCanvas):
             fmt="o", color=color, label=label, capsize=3, ms=8, mew=1.5, alpha=0.95)
 
     def redraw_hist(self):
-        """Rebuild the full phasor plot: semicircle, clouds, legend, and cursors."""
+        """Rebuild the full phasor plot: semicircle, clouds, legend, and cursors.
+
+        This is the "full" redraw path (as opposed to the cheaper
+        :meth:`_redraw_cursors`/:meth:`_redraw_click_marker` paths used during
+        drags) and is called whenever the underlying dataset, compare
+        configuration, or lifetime-tick frequency changes. It re-derives the
+        set of visible layers from :attr:`data` or :attr:`compare_layers`
+        (skipping layers without calibrated maps or marked invisible),
+        chooses a rendering style per layer — density cloud, scatter, or
+        mean/std "summary" — based on :attr:`compare_style`, draws a legend
+        only when more than one layer is visible in compare mode, and finally
+        re-adds cursor patches and the click-marker crosshair, which
+        :meth:`_init_axes` would otherwise have discarded via ``ax.clear()``.
+        The 2-D histogram cache is untouched by this call, so repeated
+        redraws of an unchanged dataset are cheap.
+        """
+        # Clears axes (and cursor patch refs) but _hist_cache survives — keyed by numpy array id.
         self._init_axes()
         visible_layers = []
         if self.compare_enabled and self.compare_layers:
@@ -362,7 +535,23 @@ class PhasorCanvas(FigureCanvas):
         self.draw_idle()
 
     def _redraw_click_marker(self, *, draw: bool = True):
-        """Draw or clear the phasor click crosshair without rebuilding the hist."""
+        """Draw or clear the phasor click crosshair without rebuilding the hist.
+
+        The crosshair is a lightweight, separately tracked artist
+        (``_click_marker_artist``) so it can be shown or moved via
+        :meth:`set_click_marker` without paying the cost of a full
+        :meth:`redraw_hist`. The previous marker artist (if any) is always
+        removed first — both to move it and because ``_init_axes`` clears the
+        axes and invalidates any prior reference. When ``_click_marker`` is
+        ``None`` the crosshair simply stays absent after removal.
+
+        Args:
+            draw: When ``True`` (default), request a canvas repaint via
+                ``draw_idle()`` after updating the artist. Callers that are
+                about to redraw the whole figure anyway (e.g. the end of
+                :meth:`redraw_hist`) pass ``False`` to avoid a redundant
+                paint.
+        """
         if self._click_marker_artist is not None:
             try:
                 self._click_marker_artist.remove()
@@ -377,13 +566,29 @@ class PhasorCanvas(FigureCanvas):
             self.draw_idle()
 
     def _remove_legend(self):
-        """Remove the current axes legend if one exists."""
+        """Remove the current axes legend if one exists.
+
+        Matplotlib keeps at most one legend per axes, but calling
+        ``ax.legend(...)`` again does not automatically discard a
+        differently-styled previous legend artist in every version, so
+        compare-mode redraws explicitly remove the old legend before
+        deciding whether (and how) to draw a new one. Safe to call when no
+        legend is present.
+        """
         leg = self.ax.get_legend()
         if leg is not None:
             leg.remove()
 
     def _draw_compare_legend(self, visible_layers, style):
         """Build or refresh the compare-mode legend.
+
+        Removes any existing legend first, then either constructs proxy
+        square-marker handles colored from each layer's colormap (for
+        ``style="cloud"``, since pcolormesh artists don't make good legend
+        handles) or reuses the axes' own scatter/errorbar handles (for
+        ``"scatter"``/``"summary"``). No legend is drawn when compare mode
+        is off or fewer than two layers are visible, since a legend adds
+        no information for a single dataset.
 
         Args:
             visible_layers: Layers currently drawn on the axes.
@@ -432,6 +637,12 @@ class PhasorCanvas(FigureCanvas):
     ):
         """Refresh legend text and style without rebuilding phasor density plots.
 
+        Cheaper than :meth:`update_display`/:meth:`redraw_hist` for cases
+        where only labels, colors, style, or legend placement changed
+        (e.g. a sample was renamed) and the underlying density clouds,
+        scatter points, or summary markers don't need to be recomputed.
+        No-ops entirely when compare mode is disabled.
+
         Args:
             layers: Updated compare layer list.
             compare_style: Optional new compare style.
@@ -473,6 +684,15 @@ class PhasorCanvas(FigureCanvas):
                    emit_changed=True):
         """Add a new segmentation cursor centered on the data median (or default).
 
+        Centering on the median of the currently loaded dataset's valid
+        pixels gives a sensible starting position over the densest region
+        of the phasor cloud; when no dataset (or no valid pixels) is
+        available, falls back to a fixed default position. The new cursor
+        is appended to :attr:`cursors`, immediately selected via
+        :meth:`select_cursor`, and — unless ``emit_changed`` is
+        ``False`` — triggers :attr:`cursorChanged` so downstream masks and
+        lifetime computations refresh.
+
         Args:
             radius: Major radius in phasor units.
             kind: ``"circle"`` or ``"ellipse"``.
@@ -502,6 +722,14 @@ class PhasorCanvas(FigureCanvas):
     def select_cursor(self, index, emit=True):
         """Select which cursor is active for move, resize, or delete.
 
+        Clamps ``index`` to ``-1`` when it is out of range or when there
+        are no cursors, then redraws cursor patches so the newly selected
+        one is highlighted with a thicker outline (see
+        :meth:`_redraw_cursors`). :attr:`cursorSelectionChanged` is only
+        emitted when the selection actually changes and ``emit`` is
+        ``True``, avoiding redundant signal traffic when re-selecting the
+        same cursor.
+
         Args:
             index: Cursor index, or ``-1`` for no selection.
             emit: When ``True``, emit :attr:`cursorSelectionChanged` on change.
@@ -518,7 +746,17 @@ class PhasorCanvas(FigureCanvas):
             self.cursorSelectionChanged.emit(index)
 
     def remove_selected(self):
-        """Delete the currently selected cursor and emit :attr:`cursorChanged`."""
+        """Delete the currently selected cursor and emit :attr:`cursorChanged`.
+
+        No-ops when :attr:`selected` is out of range (``-1`` or stale),
+        which happens whenever no cursor is currently active. On removal, the
+        cursor's matplotlib patch artist is detached first via
+        :meth:`_remove_cursor_artists`, then the cursor dict is popped from
+        :attr:`cursors`. Selection falls back to the new last cursor in the
+        list (or ``-1`` if the list becomes empty) so a subsequent delete
+        continues to operate on a sensible target rather than an index that
+        no longer exists.
+        """
         if 0 <= self.selected < len(self.cursors):
             self._remove_cursor_artists(self.cursors[self.selected])
             self.cursors.pop(self.selected)
@@ -528,7 +766,18 @@ class PhasorCanvas(FigureCanvas):
             self.cursorChanged.emit()
 
     def clear_cursors(self):
-        """Remove all segmentation cursors and reset selection."""
+        """Remove all segmentation cursors and reset selection.
+
+        Detaches every cursor's matplotlib patch artist before clearing
+        :attr:`cursors` to an empty list, then calls
+        :meth:`_purge_stray_cursor_artists` as a defensive sweep for any
+        ``Circle``/``Ellipse`` patches that ended up on the axes outside the
+        tracked cursor dicts (e.g. from a code path that added a patch
+        directly). Selection is reset to ``-1`` and both
+        :attr:`cursorSelectionChanged` and :attr:`cursorChanged` are emitted
+        so listeners (segmentation panels, mask overlays) drop all
+        cursor-derived state.
+        """
         for c in self.cursors:
             self._remove_cursor_artists(c)
         self.cursors = []
@@ -538,11 +787,31 @@ class PhasorCanvas(FigureCanvas):
 
     @property
     def is_dragging_cursor(self) -> bool:
-        """Return whether the user is actively dragging a cursor."""
+        """Return whether the user is actively dragging a cursor.
+
+        Reflects the internal ``_dragging`` flag, which is set ``True`` in
+        :meth:`on_press` when a left-click lands with a cursor selected and
+        cleared in :meth:`on_release`. Note that scroll-wheel resizing
+        (:meth:`on_scroll`) never sets this flag — only click-and-drag moves
+        do — so callers using this property to suppress other UI updates
+        during interaction should also consider scroll events separately if
+        needed.
+
+        Returns:
+            ``True`` while a mouse-button drag of the selected cursor is in
+            progress, ``False`` otherwise.
+        """
         return self._dragging
 
     def set_selected_radius(self, r):
         """Set the major radius of the selected cursor (slider control).
+
+        Intended for continuous slider-driven resizing: updates the radius
+        in place, redraws the cursor patch, and emits the lightweight
+        :attr:`cursorMoving` signal (rather than :attr:`cursorChanged`) so
+        listeners perform cheap overlay-only updates during interactive
+        dragging instead of a full recompute on every slider tick. No-ops
+        when no cursor is selected.
 
         Args:
             r: New radius in phasor units.
@@ -553,6 +822,12 @@ class PhasorCanvas(FigureCanvas):
 
     def _remove_cursor_artists(self, c):
         """Remove matplotlib patch artists attached to one cursor dict.
+
+        Detaches the cursor's ``"patch"`` artist from the axes (if any)
+        and clears the dict entry back to ``None``. Errors from an
+        already-removed or stale artist are swallowed, since axes-clearing
+        redraws (:meth:`_init_axes`) can invalidate patch references
+        before this is called.
 
         Args:
             c: Cursor state dict with optional ``"patch"`` key.
@@ -566,7 +841,17 @@ class PhasorCanvas(FigureCanvas):
             c["patch"] = None
 
     def _purge_stray_cursor_artists(self):
-        """Remove circle/ellipse patches left behind after cursor deletion."""
+        """Remove circle/ellipse patches left behind after cursor deletion.
+
+        Defensive cleanup complementing :meth:`_remove_cursor_artists`: it
+        scans ``ax.patches`` for any ``Circle`` or ``Ellipse`` artist that is
+        not currently referenced by a live cursor dict's ``"patch"`` entry
+        and removes it. This guards against orphaned patches that can
+        accumulate if a cursor's artist reference is lost or overwritten
+        without being explicitly removed first (e.g. due to an exception
+        mid-update), which would otherwise silently pile up as invisible or
+        stale shapes on the phasor plot across repeated redraws.
+        """
         keep_patches = {c["patch"] for c in self.cursors if c.get("patch")}
         for p in list(self.ax.patches):
             if isinstance(p, (Circle, Ellipse)) and p not in keep_patches:
@@ -576,7 +861,17 @@ class PhasorCanvas(FigureCanvas):
                     pass
 
     def _redraw_cursors(self):
-        """Recreate matplotlib patch artists for all cursors."""
+        """Rebuild the matplotlib patch for every cursor from scratch.
+
+        Called after any cursor add/move/resize/select/delete so drawn
+        shapes stay in sync with the `cursors` state dicts. Detaches every
+        existing patch artist first (via `_remove_cursor_artists`) and
+        sweeps for orphaned patches (`_purge_stray_cursor_artists`) before
+        creating fresh `Circle`/`Ellipse` artists, since matplotlib patches
+        cannot have their center/radius/angle updated in place as cheaply as
+        just recreating them. The selected cursor is drawn with a thicker
+        outline (`lw=2.5` vs `1.2`) so it is visually distinguishable.
+        """
         for c in self.cursors:
             self._remove_cursor_artists(c)
         self._purge_stray_cursor_artists()
@@ -609,6 +904,7 @@ class PhasorCanvas(FigureCanvas):
             colors: Edge/marker color per component.
         """
         self.clear_gmm()
+        # GMM ellipses live in _gmm_artists, separate from user-drawn cursor patches.
         for k in range(len(center_real)):
             e = Ellipse(
                 (center_real[k], center_imag[k]),
@@ -639,7 +935,16 @@ class PhasorCanvas(FigureCanvas):
     #     self.draw_idle()
 
     def clear_gmm(self):
-        """Remove all GMM ellipse and center marker artists."""
+        """Remove all GMM ellipse and center marker artists.
+
+        ``_gmm_artists`` holds a flat list of matplotlib artists (each
+        ellipse plus its paired "x" center marker) added by
+        :meth:`show_gmm_ellipses`, kept separate from the user-drawn
+        segmentation cursor patches so the two overlays can be cleared and
+        redrawn independently. Removal errors are swallowed since an artist
+        may already have been detached by an axes-clearing redraw (e.g.
+        :meth:`_init_axes`) before this is called.
+        """
         for a in self._gmm_artists:
             try: a.remove()
             except Exception: pass
@@ -720,6 +1025,7 @@ class PhasorCanvas(FigureCanvas):
         if 0 <= self.selected < len(self.cursors):
             self._dragging = True
             self.draw_idle()
+            # Click outside all cursors but with one selected: drag moves that cursor here.
             if i < 0:
                 self.cursorMoving.emit()
         else:
@@ -728,6 +1034,14 @@ class PhasorCanvas(FigureCanvas):
 
     def on_motion(self, event):
         """Handle mouse drag to move the selected cursor center.
+
+        Connected to matplotlib's ``motion_notify_event``. Only acts while
+        :attr:`_dragging` is set (by :meth:`on_press`) and the pointer is
+        within the axes with valid data coordinates; otherwise it is a
+        no-op so ordinary mouse movement outside a drag gesture is cheap.
+        Updates the selected cursor's center, redraws cursor patches, and
+        emits the lightweight :attr:`cursorMoving` signal on every move so
+        listeners can do fast overlay-only updates during the drag.
 
         Args:
             event: Matplotlib mouse event.
@@ -742,9 +1056,17 @@ class PhasorCanvas(FigureCanvas):
     def on_release(self, event):
         """End cursor drag and emit :attr:`cursorChanged` when appropriate.
 
+        Connected to matplotlib's ``button_release_event``. Clears the
+        :attr:`_dragging` flag set in :meth:`on_press` and, only if a drag
+        was actually in progress, emits the "committed"
+        :attr:`cursorChanged` signal so downstream masks and lifetimes are
+        recomputed once at the end of the gesture rather than on every
+        intermediate :attr:`cursorMoving` tick.
+
         Args:
             event: Matplotlib mouse event.
         """
+        # Scroll-wheel resize never sets _dragging — those commits use debounced cursorMoving instead.
         if self._dragging:
             self._dragging = False; self.cursorChanged.emit()
 

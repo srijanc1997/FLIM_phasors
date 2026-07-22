@@ -12,6 +12,12 @@ import numpy as np
 def nbytes_array(arr) -> int:
     """Return the byte size of an array, or zero for missing data.
 
+    Accepts NumPy arrays, xarray objects, or ``None`` interchangeably by
+    coercing through :func:`numpy.asarray`, so callers estimating memory use
+    across a mix of raw histograms (xarray) and computed maps (NumPy) do not
+    need to branch on type; any conversion failure is treated the same as
+    "no data" rather than raising.
+
     Args:
         arr: ``numpy`` array, xarray object, or ``None``.
 
@@ -62,6 +68,12 @@ def estimate_dataset_mb(d) -> dict:
 
 def format_memory_line(d) -> str:
     """Format a one-line memory summary for the status bar or dataset info.
+
+    Wraps :func:`estimate_dataset_mb` into a short human-readable string
+    suitable for a status bar or tooltip. Datasets restored lazily from a
+    session (path known, histogram not yet decoded) report simply
+    ``"lazy (histogram not loaded)"`` instead of a zero-byte breakdown, which
+    would otherwise misleadingly suggest the sample uses no memory at all.
 
     Args:
         d: Dataset to summarize.

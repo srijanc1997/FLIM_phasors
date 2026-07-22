@@ -45,6 +45,9 @@ from flim_phasors.io import is_supported_flim_path
 def _collect_paths(folder: Path) -> list[str]:
     """Gather supported FLIM file paths from a directory.
 
+    Batch mode handles histogram files only (``.ptu``/``.tif``); LIF phasor
+    maps are GUI-only via :mod:`flim_phasors.lif_io`.
+
     Args:
         folder: Directory to scan for ``.ptu``, ``.tif``, and ``.tiff`` files.
 
@@ -70,6 +73,13 @@ def process_one(
     ref_cal=None,
 ):
     """Load and process a single FLIM sample through the phasor pipeline.
+
+    Mirrors the GUI's Apply step for a single sample: loads the raw
+    histogram, sets acquisition parameters, and calls
+    :meth:`~flim_phasors.data.PhasorData.apply_processing` to run
+    calibration, spatial/signal filtering, and photon thresholding in one
+    pass. Passing a precomputed ``ref_cal`` (as :func:`main` does for batch
+    runs) avoids re-decoding the reference file once per sample.
 
     Args:
         path: Sample ``.ptu`` or ``.tif``/``.tiff`` path.
@@ -97,7 +107,7 @@ def process_one(
     d.apply_processing(
         ref_calibration=ref_cal,
         ref_path=ref_path or None,
-        ref_lifetime=ref_lifetime,
+        ref_lifetime=ref_lifetime,  # ns; drives phasor_calibrate phase reference
         filter_mode=filter_mode,
         intensity_min=float(min_photons),
     )
@@ -106,6 +116,14 @@ def process_one(
 
 def main(argv=None) -> int:
     """Run batch FLIM phasor processing from command-line arguments.
+
+    Resolves the input (single file or directory of ``.ptu``/``.tif`` files),
+    computes the reference calibration once and reuses it across all
+    samples, then processes each sample with :func:`process_one` and writes
+    its maps to a numbered subfolder under ``--output`` via
+    :func:`~flim_phasors.export_bundle.export_sample_maps`. A
+    ``batch_summary.json`` recording each sample's path and valid-pixel
+    count is written at the end for quick review without opening the GUI.
 
     Args:
         argv: Argument list (defaults to ``sys.argv``).
@@ -137,6 +155,7 @@ def main(argv=None) -> int:
         if not os.path.isfile(args.reference):
             print(f"Reference not found: {args.reference}", file=sys.stderr)
             return 1
+        # One reference decode shared by all samples (same channel/harmonic as GUI).
         ref_cal = compute_reference_phasor(args.reference, args.ref_channel, args.harmonic)
 
     out = Path(args.output)

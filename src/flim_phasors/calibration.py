@@ -19,7 +19,24 @@ from flim_phasors.utils import reduce_signal, to_2d
 
 
 def _weighted_gs(rmean, rreal, rimag) -> tuple[float, float, float]:
-    """Intensity-weighted mean g/s (phasorpy ``phasor_center`` / mean method)."""
+    """Compute an intensity-weighted mean reference phasor coordinate.
+
+    Pixels with more photons contribute more to the average, matching
+    phasorpy's ``phasor_center`` mean method. This gives a single
+    representative (g, s) for the whole reference measurement, which is used
+    to build uniform reference maps in :meth:`ReferenceCalibration.maps_for_shape`
+    when full spatial reference maps are unavailable or mismatched in shape.
+
+    Args:
+        rmean: Reference mean photon count or intensity map.
+        rreal: Reference real (g) phasor map, same shape as ``rmean``.
+        rimag: Reference imaginary (s) phasor map, same shape as ``rmean``.
+
+    Returns:
+        Tuple ``(g, s, mean_intensity)``. Falls back to an unweighted mean
+        over finite pixels when every intensity is zero, and to
+        ``(0.0, 0.0, 1.0)`` when no pixel has finite g, s, and intensity.
+    """
     rmean = np.asarray(rmean, dtype=float)
     rreal = np.asarray(rreal, dtype=float)
     rimag = np.asarray(rimag, dtype=float)
@@ -34,6 +51,7 @@ def _weighted_gs(rmean, rreal, rimag) -> tuple[float, float, float]:
             float(np.average(rimag[finite], weights=weights)),
             float(np.mean(rmean[finite])),
         )
+    # Unweighted fallback when all intensities are zero (still finite g/s).
     return (
         float(np.mean(rreal[finite])),
         float(np.mean(rimag[finite])),
@@ -86,6 +104,13 @@ class ReferenceCalibration:
     def is_active(self) -> bool:
         """Return whether calibration values are available for sample preprocessing.
 
+        This is the gate checked before running ``phasor_calibrate`` on a
+        sample: calibration is considered active either because the user
+        has entered manual reference g/s values (``use_manual``), or because
+        a reference measurement was successfully loaded/computed
+        (``values_ready``). When neither is true, samples are processed
+        uncalibrated.
+
         Returns:
             True when manual g/s are enabled or reference maps/means are ready.
         """
@@ -95,6 +120,13 @@ class ReferenceCalibration:
     def has_spatial_maps(self) -> bool:
         """Return whether per-pixel reference maps are stored (not scalar-only).
 
+        Distinguishes a reference that was freshly computed from a decoded
+        file (spatial mean/g/s maps kept in ``_maps``) from one restored from
+        manual entry or a saved calibration JSON, which only carries scalar
+        means. Spatial maps allow per-pixel calibration when their shape
+        matches the sample; otherwise :meth:`maps_for_shape` falls back to
+        uniform scalar fields regardless of this flag.
+
         Returns:
             True if ``set_maps`` populated ``_maps``; False for manual or JSON-only g/s.
         """
@@ -102,6 +134,14 @@ class ReferenceCalibration:
 
     def set_maps(self, rmean, rreal, rimag):
         """Store reference intensity and phasor maps and update scalar means.
+
+        Called after computing a single-harmonic reference phasor from a
+        decoded FLIM file. Maps are reduced to 2-D via :func:`to_2d` and kept
+        for per-pixel calibration when their shape matches a sample; the
+        scalar ``mean_g``/``mean_s``/``mean_intensity`` are simultaneously
+        derived via an intensity-weighted average (see :func:`_weighted_gs`)
+        so calibration also works when spatial maps cannot be used directly
+        (mismatched shape) or are not persisted (e.g. saved-JSON reload).
 
         Args:
             rmean: Reference mean photon count or intensity map.
@@ -135,7 +175,7 @@ class ReferenceCalibration:
                 f"Expected harmonic g/s with shape (n, Y, X); got {rreal.shape}, {rimag.shape}")
         if rreal.shape != rimag.shape:
             raise ValueError(f"g/s harmonic shapes differ: {rreal.shape} vs {rimag.shape}")
-        self._maps = None
+        self._maps = None  # PAW path keeps scalars only; spatial maps would be wrong shape.
         self.harmonic_gs = []
         for i in range(rreal.shape[0]):
             g, s, inten = _weighted_gs(rmean, rreal[i], rimag[i])
@@ -174,7 +214,21 @@ class ReferenceCalibration:
         return self._scalar_or_spatial_2d(shape)
 
     def _scalar_or_spatial_2d(self, shape: tuple[int, ...]):
-        """Build or return 2-D reference maps for a spatial ``shape``."""
+        """Build or return 2-D reference maps for a spatial ``shape``.
+
+        Chooses among three sources in priority order: manual g/s/mean when
+        ``use_manual`` is set, stored spatial maps from ``set_maps`` when
+        their shape matches ``shape``, or uniform fields broadcast from the
+        scalar ``mean_g``/``mean_s``/``mean_intensity`` otherwise (covers
+        loaded calibration JSON and shape mismatches from a different ROI or
+        resolution).
+
+        Args:
+            shape: Target 2-D spatial shape ``(Y, X)`` matching the sample map.
+
+        Returns:
+            Tuple ``(rmean, rreal, rimag)`` of arrays shaped like ``shape``.
+        """
         if self.use_manual:
             g = float(self.manual_g)
             s = float(self.manual_s)
@@ -193,6 +247,7 @@ class ReferenceCalibration:
         rmean, rreal, rimag = self._maps
         if rreal.shape == shape:
             return rmean, rreal, rimag
+        # Shape mismatch (different ROI/resolution): fall back to uniform scalar g/s.
         return (
             np.full(shape, self.mean_intensity, dtype=float),
             np.full(shape, self.mean_g, dtype=float),
@@ -200,7 +255,24 @@ class ReferenceCalibration:
         )
 
     def _expand_gs_to_harmonics(self, n_harm, spatial, rreal_2d, rimag_2d):
-        """Stack per-harmonic g/s planes for multi-harmonic ``phasor_calibrate``."""
+        """Stack per-harmonic g/s planes for multi-harmonic ``phasor_calibrate``.
+
+        PAW-FLIM calibrates on two harmonics (H and 2H) simultaneously, so the
+        reference g/s must have a leading harmonic axis matching the sample's
+        ``(n_harm, Y, X)`` real/imag arrays. Prefers exact per-harmonic scalars
+        from ``harmonic_gs`` (set by ``set_harmonic_means``); falls back to
+        broadcasting a single 2-D map to every harmonic plane, or to the
+        scalar ``mean_g``/``mean_s`` when neither is available.
+
+        Args:
+            n_harm: Number of harmonic planes required by the sample array.
+            spatial: Target 2-D spatial shape ``(Y, X)`` for each plane.
+            rreal_2d: Fallback 2-D real (g) map used when no per-harmonic data exists.
+            rimag_2d: Fallback 2-D imaginary (s) map used when no per-harmonic data exists.
+
+        Returns:
+            Tuple ``(rreal, rimag)`` each shaped ``(n_harm, *spatial)``.
+        """
         if self.use_manual:
             g = float(self.manual_g)
             s = float(self.manual_s)
@@ -226,7 +298,13 @@ class ReferenceCalibration:
         )
 
     def clear(self):
-        """Reset all calibration fields to defaults and drop stored maps."""
+        """Reset all calibration fields to defaults and drop stored maps.
+
+        Used when the user removes the reference file or switches to a fresh
+        session; after this call ``is_active`` is False (both ``use_manual``
+        and ``values_ready`` are cleared), so samples processed afterward run
+        uncalibrated until a new reference is set.
+        """
         self.source_path = ""
         self.channel = 0
         self._maps = None
@@ -272,13 +350,13 @@ def compute_reference_phasor(
     sig = load_flim_signal(ref_path, channel=ch, frame=-1, dtype=np.uint32)
     if not n_channels:
         n_channels = int(sig.sizes["C"]) if "C" in getattr(sig, "dims", ()) else 1
-    rsig = reduce_signal(sig, 0)
+    rsig = reduce_signal(sig, 0)  # channel axis already collapsed by load_flim_signal
     del sig
     rmean, rreal, rimag = phasor_from_signal(rsig, axis="H", harmonic=harm)
-    del rsig
+    del rsig  # histogram released; only (mean, g, s) maps are kept
     cal = ReferenceCalibration(
         source_path=ref_path,
-        channel=int(channel),
+        channel=int(ch),
         n_channels=n_channels,
         harmonic=harm if isinstance(harm, int) else harm[0],
     )
@@ -290,7 +368,7 @@ def compute_reference_phasor(
     return cal
 
 
-# Small LRU-style cache of ReferenceCalibration by (path, channel, harmonic)
+# Reserved for LRU reuse of compute_reference_phasor; currently unused (see commented getter).
 _CAL_CACHE: dict[tuple, ReferenceCalibration] = {}
 
 
@@ -306,5 +384,10 @@ _CAL_CACHE: dict[tuple, ReferenceCalibration] = {}
 
 
 def clear_calibration_cache():
-    """Clear the in-memory cache of computed ``ReferenceCalibration`` objects."""
+    """Clear the in-memory cache of computed ``ReferenceCalibration`` objects.
+
+    ``_CAL_CACHE`` is currently unused (reserved for a future LRU reuse of
+    :func:`compute_reference_phasor`); this function empties it defensively
+    so a stale entry cannot outlive a closed session or reloaded reference.
+    """
     _CAL_CACHE.clear()

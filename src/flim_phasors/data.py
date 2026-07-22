@@ -40,11 +40,23 @@ class PhasorData:
     """
 
     def __init__(self):
-        """Initialize an empty dataset with default acquisition parameters."""
+        """Initialize an empty dataset with default acquisition parameters.
+
+        Takes no arguments; all state (histogram, phasor maps, calibration
+        flags, and per-sample segmentation) is populated later via
+        ``load_sample``/``load_lif_phasor`` and ``apply_processing``. Delegates
+        to :meth:`reset` so the initial state matches a manually cleared one.
+        """
         self.reset()
 
     def reset(self):
-        """Clear all loaded data, maps, paths, and processing flags."""
+        """Clear all loaded data, maps, paths, and processing flags.
+
+        Restores every attribute to its default value (no histogram, no
+        phasor/lifetime maps, no calibration or LIF metadata, empty
+        segmentation state). Used both by ``__init__`` and when the GUI
+        discards a sample to load a fresh one in its place.
+        """
         self.signal_full = None
         self.n_channels = 1
         self.channel = 0
@@ -114,6 +126,13 @@ class PhasorData:
     def has_loaded_maps(self) -> bool:
         """Return whether calibrated or base phasor maps are present.
 
+        Covers two distinct sources: a regular sample that has been through
+        Apply/calibration (``real_cal`` set), or a LIF phasor import whose
+        maps were decoded directly from LAS X exports and never needed a raw
+        histogram (``_lif_base_real`` set). Used to decide whether
+        map-dependent UI (phasor plot, export, cluster stats) can be enabled
+        for this dataset.
+
         Returns:
             True if ``real_cal`` or LIF base real component is set.
         """
@@ -122,11 +141,20 @@ class PhasorData:
     def _pixel_size_from_lif_attrs(self, attrs):
         """Set ``pixel_size_um`` from LIF coordinate steps or raw metadata.
 
+        LIF/XLEF coordinate arrays are stored in micrometers, so the pixel
+        size is simply the spacing between consecutive X coordinate samples
+        (falling back to Y if X is unavailable, since pixels are assumed
+        square). If neither axis yields a usable step, this falls back to
+        the ``VoxelSizeX``/``VoxelSizeY`` fields embedded in the raw
+        ``flim_rawdata`` block. Mutates ``self.pixel_size_um`` in place and
+        leaves it untouched (default) if no source yields a positive value.
+
         Args:
             attrs: Attribute dict from ``load_lif_phasor_maps`` (coords or
                 ``flim_rawdata`` VoxelSize fields).
         """
         coords = attrs.get("coords") or {}
+        # LIF coords are in µm; X step alone is enough when pixels are square.
         for ax in ("X", "Y"):
             c = coords.get(ax)
             if c is not None and len(c) > 1:
@@ -135,7 +163,7 @@ class PhasorData:
                     if step > 0:
                         if ax == "X":
                             self.pixel_size_um = step
-                        return
+                        return  # stop after first positive axis step
                 except (TypeError, ValueError):
                     pass
         raw = attrs.get("flim_rawdata") or {}
@@ -175,8 +203,10 @@ class PhasorData:
         self.lif_lasx_calibrated = bool(cal.get("applied", False))
         self.lif_lasx_intensity_threshold = float(attrs.get("lasx_intensity_threshold", 0.0))
         self.lif_uses_photon_intensity = bool(attrs.get("uses_photon_intensity", False))
+        # Store (width, height) = (X, Y) for GUI layout; arrays remain (Y, X).
         self._shape_hint = (int(mean.shape[1]), int(mean.shape[0]))
         self._pixel_size_from_lif_attrs(attrs)
+        # Base maps keep LAS X calibration/threshold state; Apply re-runs from here.
         self._lif_base_mean = np.asarray(mean, dtype=float)
         self._lif_base_real = np.asarray(real, dtype=float)
         self._lif_base_imag = np.asarray(imag, dtype=float)
@@ -254,6 +284,7 @@ class PhasorData:
         self.sample_path = path
         self.frequency = float(sig.attrs.get("frequency", 80.0))
         red = reduce_signal(sig, self.channel)
+        # Spatial shape excludes time axis H; order follows xarray dim order (often Y, X).
         yx = [s for d, s in zip(red.dims, red.shape) if d != "H"]
         shape = tuple(yx) if len(yx) == 2 else (red.shape[0], red.shape[1])
         self._shape_hint = shape
@@ -268,6 +299,12 @@ class PhasorData:
 
     def _sample_channel_signal(self):
         """Return the TCSPC stack reduced to the active emission channel.
+
+        Thin wrapper around :func:`~flim_phasors.utils.reduce_signal` bound
+        to this dataset's current ``channel`` selection, used as the common
+        entry point before phasor computation so channel/frame reduction
+        logic lives in one place rather than being duplicated at each
+        call site.
 
         Returns:
             Reduced signal array with time axis ``H`` and spatial dimensions.
@@ -294,6 +331,8 @@ class PhasorData:
         """
         shape = real.shape
         rmean, rreal, rimag = ref_cal.maps_for_shape(shape)
+        # phasor_calibrate rotates/scales sample (real, imag) ≡ (g, s) using ref maps
+        # and the known reference fluorophore lifetime (ns) at frequency (MHz).
         return phasor_calibrate(
             real, imag, rmean, rreal, rimag,
             frequency=frequency, lifetime=float(lifetime), harmonic=harmonic)
@@ -334,6 +373,7 @@ class PhasorData:
                 detect_harmonics=bool(detect_harmonics),
             )
         else:
+            # thr==0: skip phasor_threshold but still NaN-mask invalid g/s pixels.
             mean_thr = self.mean_raw.copy()
             bad = ~np.isfinite(real) | ~np.isfinite(imag)
             if np.any(bad):
@@ -347,6 +387,7 @@ class PhasorData:
         self.imag_cal = to_2d(imag)
         self._intensity_stats = self._compute_intensity_stats(thr)
 
+        # Lifetimes use ω at the analysis harmonic, not the laser fundamental alone.
         work_freq = self.frequency * self.harmonic
         with np.errstate(invalid="ignore", divide="ignore"):
             tau_phi, tau_mod = phasor_to_apparent_lifetime(real, imag, work_freq)
@@ -392,6 +433,7 @@ class PhasorData:
         real = np.asarray(self._lif_base_real, dtype=float)
         imag = np.asarray(self._lif_base_imag, dtype=float)
 
+        # LIF exports have no TCSPC stack — histogram/signal/PAW filters unavailable.
         if filter_mode in ("pawflim", "signal median", "signal gaussian"):
             filter_mode = "median"
 
@@ -477,6 +519,7 @@ class PhasorData:
             mean, real, imag = phasor_filter_pawflim(
                 mean, real, imag, sigma=float(paw_sigma),
                 levels=int(paw_levels), harmonic=harmonics)
+            # PAW-FLIM filters both harmonics; GUI maps use the primary harmonic only.
             real = to_2d(real[0])
             imag = to_2d(imag[0])
             mean = to_2d(mean)
@@ -512,7 +555,11 @@ class PhasorData:
 
     @staticmethod
     def _photon_count_from_mean(mean, sig):
-        """Convert phasorpy mean intensity to total photons per pixel (mean × n_bins)."""
+        """Convert phasorpy mean intensity to total photons per pixel (mean × n_bins).
+
+        ``phasor_from_signal`` returns mean = (sum over H) / n_bins; thresholding
+        and export expect cumulative photon counts, hence the scale factor.
+        """
         mean2 = to_2d(np.asarray(mean, dtype=float))
         if hasattr(sig, "sizes") and "H" in getattr(sig, "dims", ()):
             n_h = int(sig.sizes["H"])
@@ -541,6 +588,13 @@ class PhasorData:
     def work_frequency(self):
         """Effective modulation frequency for lifetime conversion (MHz).
 
+        FLIM lifetime formulas assume the phasor was computed at the
+        harmonic frequency actually used, not the fundamental laser
+        repetition rate; multiplying by ``harmonic`` (1 for the fundamental,
+        2+ for higher harmonics) gives the frequency to pass into
+        :func:`~flim_phasors.analysis.lifetimes_at_phasor` and related
+        conversions so τφ/τm/τn come out in nanoseconds correctly.
+
         Returns:
             ``frequency * harmonic`` — harmonic-scaled frequency used for τ maps.
         """
@@ -549,6 +603,9 @@ class PhasorData:
     def valid_mask(self):
         """Return pixels with finite calibrated phasor coordinates.
 
+        Reflects threshold/NaN masking in ``mean_thr`` and g/s maps, not raw
+        photon counts alone.
+
         Returns:
             Boolean array matching ``real_cal`` shape.
         """
@@ -556,6 +613,13 @@ class PhasorData:
 
     def _compute_intensity_stats(self, threshold):
         """Summarize raw photon counts and masking fraction for the status bar.
+
+        Computed from ``mean_raw`` (total photon counts per pixel, before
+        thresholding) rather than the calibrated/masked maps, so the summary
+        reflects the intensity distribution the user is choosing a threshold
+        against. ``masked_pct`` is the fraction of finite pixels that fall
+        below ``threshold`` and would therefore be excluded (NaN) from the
+        calibrated g/s maps once Apply runs.
 
         Args:
             threshold: Intensity cutoff used during finalize (0 = no cutoff).

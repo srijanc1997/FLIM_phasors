@@ -27,10 +27,10 @@ BUNDLE_EXTENSION = ".flimsession"
 MANIFEST_NAME = "manifest.json"
 
 MAP_KEYS = (
-    "real_cal",
-    "imag_cal",
+    "real_cal",  # g after calibration/threshold
+    "imag_cal",  # s after calibration/threshold
     "mean_raw",
-    "mean_thr",
+    "mean_thr",  # NaN where masked; same scale as mean_raw (photon counts)
     "tau_phi",
     "tau_mod",
     "tau_normal",
@@ -39,6 +39,11 @@ MAP_KEYS = (
 
 def is_session_bundle(path: str | Path) -> bool:
     """Return whether a path looks like a session bundle file.
+
+    The check is purely name-based (suffix comparison); it does not open the
+    file or verify that it is a valid zip archive with a manifest. Callers
+    that need certainty should attempt :func:`load_session_bundle` and handle
+    the resulting ``ValueError`` instead.
 
     Args:
         path: File path to inspect.
@@ -52,6 +57,13 @@ def is_session_bundle(path: str | Path) -> bool:
 
 def _json_default(obj):
     """JSON serializer hook for NumPy scalars and arrays.
+
+    Passed as the ``default`` callback to :func:`json.dumps` when writing the
+    bundle manifest, since the standard encoder does not know how to handle
+    NumPy types that can appear in metadata dicts (e.g. ``np.float64`` means
+    or ``np.ndarray`` harmonic tables). It only needs to cover types that
+    slip through despite the explicit ``float``/``int``/``.tolist()`` casts
+    used elsewhere in this module.
 
     Args:
         obj: Value to serialize.
@@ -71,6 +83,14 @@ def _json_default(obj):
 
 def _maps_from_dataset(d: PhasorData) -> dict[str, np.ndarray]:
     """Collect computed map arrays present on a dataset.
+
+    Only attributes that are actually set (i.e. not ``None``) are included,
+    so a dataset that has not been through calibration/thresholding yet
+    contributes an empty dict. Arrays are cast to float64 for a stable
+    on-disk representation; ``last_overlay``, when present, is additionally
+    clipped to the ``[0, 1]`` range expected by the RGBA overlay renderer.
+    The returned dict is written directly into a per-sample ``maps.npz``
+    archive by :func:`save_session_bundle`.
 
     Args:
         d: Processed :class:`~flim_phasors.data.PhasorData` instance.
@@ -93,6 +113,13 @@ def _maps_from_dataset(d: PhasorData) -> dict[str, np.ndarray]:
 def _apply_maps_to_dataset(d: PhasorData, maps: dict[str, np.ndarray]) -> None:
     """Attach bundled map arrays onto a :class:`PhasorData` instance.
 
+    This is the inverse of :func:`_maps_from_dataset`, used when rehydrating
+    a dataset from a loaded bundle. Only keys present in ``maps`` are set, so
+    a sample that was saved before it had e.g. a computed ``tau_normal`` map
+    simply leaves that attribute unset. After attaching ``real_cal``, the
+    dataset's internal ``_shape_hint`` is refreshed so downstream UI code can
+    size widgets without needing the original raw histogram.
+
     Args:
         d: Dataset updated in place.
         maps: Dict of array names to NumPy arrays from an ``maps.npz`` archive.
@@ -108,6 +135,12 @@ def _apply_maps_to_dataset(d: PhasorData, maps: dict[str, np.ndarray]) -> None:
 
 def _sample_meta_row(win, d: PhasorData, index: int, maps_file: str) -> dict:
     """Build one manifest ``samples`` entry for a dataset.
+
+    Gathers acquisition parameters (frequency, harmonic, channel selection),
+    calibration/reference bookkeeping, cached intensity statistics, and the
+    processing-settings stash into a single JSON-serializable row. This row
+    is what :func:`dataset_from_bundle_sample` later reads back to rebuild an
+    equivalent dataset without re-loading the raw histogram file.
 
     Args:
         win: Main window used to resolve effective reference paths.
@@ -149,6 +182,13 @@ def _sample_meta_row(win, d: PhasorData, index: int, maps_file: str) -> dict:
 def _serialize_gmm_fit(fit) -> dict | None:
     """Convert a GMM ellipse fit tuple to a JSON-friendly dict.
 
+    The in-memory fit is a 5-tuple of parallel arrays (one entry per Gaussian
+    cluster) as returned by :func:`~flim_phasors.analysis.fit_phasor_gmm`.
+    JSON has no native array/tuple distinction, so each component is
+    converted to a plain Python list via ``.tolist()`` for storage in the
+    bundle manifest; angles remain in radians, matching the GMM fit
+    convention used elsewhere in the app.
+
     Args:
         fit: Tuple of center, radii, and angle arrays, or ``None``.
 
@@ -169,6 +209,11 @@ def _serialize_gmm_fit(fit) -> dict | None:
 
 def _deserialize_gmm_fit(block: dict | None):
     """Restore a GMM ellipse fit tuple from manifest JSON.
+
+    This is the inverse of :func:`_serialize_gmm_fit`: each JSON list is
+    converted back to a float64 NumPy array so the tuple can be passed
+    directly to plotting helpers (e.g. ``phasor.show_gmm_ellipses``) that
+    expect the same array layout produced by the original GMM fit.
 
     Args:
         block: Serialized GMM dict from the manifest, or ``None``.
@@ -191,6 +236,13 @@ def _deserialize_gmm_fit(block: dict | None):
 def _serialize_cluster_stats(stats: list[dict]) -> list[dict]:
     """Prepare cluster statistics rows for JSON export.
 
+    Cluster stat rows carry an RGB ``color`` field used for table swatches
+    and legend entries; NumPy or Qt color types are not directly
+    JSON-serializable, so this makes a shallow copy of each row and coerces
+    ``color`` (when present) to a plain 3-element list of floats. All other
+    fields (label, mean lifetimes, pixel counts, etc.) are passed through
+    unchanged.
+
     Args:
         stats: List of cluster stat dicts from the main window.
 
@@ -209,6 +261,12 @@ def _serialize_cluster_stats(stats: list[dict]) -> list[dict]:
 
 def _deserialize_cluster_stats(rows: list[dict]) -> list[dict]:
     """Restore cluster statistics rows after loading a bundle.
+
+    Inverse of :func:`_serialize_cluster_stats`: each row's ``color`` field,
+    if it is a list of at least three numbers, is converted back to a tuple
+    of floats matching the format the cluster/legend rendering code expects.
+    Rows without a usable ``color`` (e.g. older bundles) are passed through
+    unchanged rather than raising.
 
     Args:
         rows: Serialized cluster stat list from the manifest.
@@ -240,7 +298,7 @@ def build_bundle_manifest(win) -> dict:
     """
     datasets = [
         d for d in (win._all_datasets() if hasattr(win, "_all_datasets") else [win.data])
-        if d.real_cal is not None
+        if d.real_cal is not None  # raw histograms are not stored in the zip
     ]
     cursors = []
     if hasattr(win, "phasor"):
@@ -321,6 +379,11 @@ def build_bundle_manifest(win) -> dict:
             "reference_channel": int(getattr(win, "shared_ref_channel", 0)),
             "mean_g": float(getattr(win.ref_calibration, "mean_g", 0.0)) if hasattr(win, "ref_calibration") else 0.0,
             "mean_s": float(getattr(win.ref_calibration, "mean_s", 0.0)) if hasattr(win, "ref_calibration") else 0.0,
+            "harmonic_gs": (
+                [[float(g), float(s)] for g, s in (win.ref_calibration.harmonic_gs or [])]
+                if hasattr(win, "ref_calibration") and getattr(win.ref_calibration, "harmonic_gs", None)
+                else None
+            ),
             "manual": bool(getattr(win.ref_calibration, "use_manual", False)) if hasattr(win, "ref_calibration") else False,
             "manual_g": float(getattr(win.ref_calibration, "manual_g", 0.0)) if hasattr(win, "ref_calibration") else 0.0,
             "manual_s": float(getattr(win.ref_calibration, "manual_s", 0.0)) if hasattr(win, "ref_calibration") else 0.0,
@@ -337,6 +400,12 @@ def build_bundle_manifest(win) -> dict:
 
 def _compare_checked_indices(win) -> list[int]:
     """Read checked compare-table row indices from the main window.
+
+    The compare table's checkbox column drives which datasets are drawn as
+    overlay layers in compare mode; this reads the Qt check state of column 0
+    for every row and returns the dataset index stored in that item's
+    ``UserRole`` data, so the selection can be persisted in the bundle
+    manifest and reapplied later by :func:`_restore_compare_checks`.
 
     Args:
         win: Main window with an optional ``table_compare`` widget.
@@ -361,6 +430,13 @@ def _compare_checked_indices(win) -> list[int]:
 
 def dataset_from_bundle_sample(meta: dict, maps: dict[str, np.ndarray]) -> PhasorData:
     """Reconstruct a :class:`PhasorData` from manifest metadata and map arrays.
+
+    Because bundles intentionally omit raw TCSPC histograms, this rebuilds a
+    dataset purely from already-computed maps and metadata rather than
+    re-running acquisition/calibration. The resulting dataset is marked
+    ``maps_calibrated = True`` so downstream code treats its ``real_cal``/
+    ``imag_cal`` maps as post-processing output, not raw phasor coordinates
+    requiring another calibration pass.
 
     Args:
         meta: One ``samples`` row from the bundle manifest.
@@ -388,12 +464,22 @@ def dataset_from_bundle_sample(meta: dict, maps: dict[str, np.ndarray]) -> Phaso
     d.gmm_fit = _deserialize_gmm_fit(meta.get("gmm_fit"))
     d.cluster_stats = _deserialize_cluster_stats(meta.get("cluster_stats") or [])
     _apply_maps_to_dataset(d, maps)
+    # Bundles store post-Apply maps; no histogram to re-run calibration on load.
     d.maps_calibrated = bool(meta.get("maps_calibrated", True))
     return d
 
 
 def save_session_bundle(win, path: str | Path) -> dict:
     """Write one ``.flimsession`` zip with manifest and per-sample map arrays.
+
+    Only datasets that have been through Apply (i.e. have a non-``None``
+    ``real_cal``) are included; raw histograms are never written, which keeps
+    bundles small and avoids re-embedding potentially large PTU/LIF source
+    data. Before serializing, this flushes the active window's in-progress UI
+    edits (processing settings, segmentation) onto its dataset so the saved
+    state matches what is currently displayed. Each sample's maps are stored
+    as a compressed ``.npz`` under ``samples/{i:03d}/maps.npz``, and a single
+    ``manifest.json`` ties everything together.
 
     Args:
         win: Main window whose computed datasets and UI state are saved.
@@ -411,7 +497,7 @@ def save_session_bundle(win, path: str | Path) -> dict:
 
     datasets = [
         d for d in (win._all_datasets() if hasattr(win, "_all_datasets") else [win.data])
-        if d.real_cal is not None
+        if d.real_cal is not None  # raw histograms are not stored in the zip
     ]
     if not datasets:
         raise ValueError("No computed samples — run Apply on at least one image first.")
@@ -448,6 +534,13 @@ def save_session_bundle(win, path: str | Path) -> dict:
 
 def load_session_bundle(path: str | Path) -> dict:
     """Read a ``.flimsession`` zip archive.
+
+    Validates the manifest format tag and version before touching any map
+    data, then decompresses each sample's ``maps.npz`` and rebuilds a
+    :class:`PhasorData` per sample via :func:`dataset_from_bundle_sample`.
+    This function only parses the archive and returns in-memory objects; it
+    does not mutate any GUI state — see :func:`apply_session_bundle_to_window`
+    for wiring the result into a main window.
 
     Args:
         path: Path to an existing bundle file.
@@ -564,6 +657,7 @@ def apply_session_bundle_to_window(win, loaded: dict) -> None:
 
     gmm_fit = loaded.get("gmm_fit")
     active_d = win.data
+    # Active sample's per-image GMM overrides manifest-level ui.gmm_fit.
     if getattr(active_d, "gmm_fit", None) is not None:
         gmm_fit = active_d.gmm_fit
     if gmm_fit is not None:
@@ -588,7 +682,7 @@ def apply_session_bundle_to_window(win, loaded: dict) -> None:
     win.cluster_stats = stored_stats if stored_stats else list(loaded.get("cluster_stats") or [])
     win.last_overlay = getattr(active_d, "last_overlay", None)
     if win.last_overlay is None:
-        win.last_overlay = loaded.get("overlay")
+        win.last_overlay = loaded.get("overlay")  # legacy root overlay.npz fallback
 
     if hasattr(win, "chk_compare"):
         win.chk_compare.blockSignals(True)
@@ -639,6 +733,12 @@ def apply_session_bundle_to_window(win, loaded: dict) -> None:
 
 def _restore_compare_checks(win, indices: list[int]) -> None:
     """Restore compare-table checkbox states from saved indices.
+
+    Inverse of :func:`_compare_checked_indices`. Signals are blocked while
+    updating check states so re-applying a saved selection does not trigger
+    the table's ``itemChanged`` handlers (and the resulting redraw cascade)
+    once per row; only rows whose column-0 item is user-checkable are
+    touched, matching how the table is populated elsewhere.
 
     Args:
         win: Main window with a ``table_compare`` widget.

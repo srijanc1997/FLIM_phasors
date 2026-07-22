@@ -1,4 +1,13 @@
-"""Optional features mixin for MainWindow (menus, session, lazy load, etc.)."""
+"""Optional features mixin for MainWindow (menus, session, lazy load, etc.).
+
+Groups all of MainWindow's secondary UI concerns — the menu bar, keyboard
+shortcuts, drag-and-drop file loading, recent-files tracking, calibration
+save/load, session bundle/JSON save/load, batch export, Phasor Lab theme
+switching, cursor undo/save/load, and table export — into
+:class:`EnhancementsMixin` so ``main_window.py`` can stay focused on core
+widget layout and processing logic. ``MainWindow`` mixes this class in and
+calls ``_init_enhancements()`` once ``_build_ui`` has run.
+"""
 
 
 
@@ -97,13 +106,36 @@ from flim_phasors.gui.theme import (
 
 class EnhancementsMixin:
 
-    """Mixin methods — call ``_init_enhancements()`` from MainWindow after ``_build_ui``."""
+    """Mixin supplying MainWindow's "optional" UI features.
+
+    Bundles everything that is layered on top of the core processing UI built by
+    ``MainWindow._build_ui``: extra widgets (calibration I/O buttons, reference
+    preview, metadata label, display toggles, cursor undo/save/load buttons, table
+    export buttons), the menu bar, keyboard shortcuts, drag-and-drop of FLIM files,
+    theme handling, session bundle/JSON load-save, recent-files menus, and cursor
+    undo history. ``MainWindow`` must call ``_init_enhancements()`` once, after
+    ``_build_ui`` has created the widgets this mixin extends (``proc_grid``,
+    ``cursor_box``, ``gb_act``, etc.), otherwise attribute lookups here will fail.
+    """
 
 
 
     def _init_enhancements(self):
 
-        """Wire optional UI, menus, shortcuts, drag-drop, and persisted theme."""
+        """Initialize all mixin-provided UI and behavior on the main window.
+
+        Must be called by ``MainWindow.__init__`` after ``_build_ui`` so that the
+        widgets extended here already exist. Initializes the calibration
+        staleness hash and the cursor undo stack, restores the persisted theme
+        id/dark-mode flag from ``QSettings``, then in order: extends the
+        processing/cursor panels with extra widgets (``_extend_ui``), builds the
+        menu bar (``_build_menus``), binds keyboard shortcuts
+        (``_setup_shortcuts``), enables drag-and-drop of FLIM files
+        (``_setup_drag_drop``), tags primary action buttons for accent styling
+        (``_tag_primary_buttons``), and finally applies the restored theme
+        (``_apply_ui_theme``) so the stylesheet and widget palettes match on
+        first paint.
+        """
 
         self._cal_settings_hash = ""
 
@@ -129,7 +161,23 @@ class EnhancementsMixin:
 
     def _extend_ui(self):
 
-        """Add calibration I/O, ref preview, metadata, display, and export controls."""
+        """Add calibration I/O, reference preview, metadata, and export widgets.
+
+        Called once from ``_init_enhancements`` to graft additional rows onto
+        widgets created by ``MainWindow._build_ui``. Adds, in the processing
+        grid (``self.proc_grid``): a Save/Load calibration button row wired to
+        ``save_calibration_file``/``load_calibration_file``; the reference
+        phasor preview canvas (``self.ref_preview``, a
+        :class:`RefPreviewCanvas`); a metadata label (``self.lbl_metadata``)
+        that later shows memory/pixel-size/version info; a pixel-size spin box
+        (``self.sp_pixel_um``) used for the optional image scale bar; and a
+        display-options row with "Log photons" and "Auto contrast" checkboxes
+        (``self.chk_log_display``, ``self.chk_auto_contrast``) both wired to
+        ``refresh_image``. Also appends an Undo/Save cursors/Load cursors button
+        row to ``self.cursor_box`` and an Export table CSV/Copy table button row
+        to ``self.gb_act``. Creates new instance attributes on ``self`` for every
+        widget it adds; does not remove or reflow any pre-existing widgets.
+        """
 
         _small = "font-size: 10px;"
 
@@ -158,6 +206,9 @@ class EnhancementsMixin:
         self.ref_preview.setMinimumHeight(120)
 
         self.ref_preview.setMaximumHeight(180)
+
+        # Only useful when editing manual g/s — keep hidden for file-based cal.
+        self.ref_preview.setVisible(False)
 
         self.proc_grid.addWidget(self.ref_preview, 12, 0, 1, 4)
 
@@ -267,7 +318,23 @@ class EnhancementsMixin:
 
     def _build_menus(self):
 
-        """Create File, View, and Help menus with session and export actions."""
+        """Build the File, View, and Help menus on the window's menu bar.
+
+        Called once from ``_init_enhancements``. Populates **File** with sample
+        and reference file pickers, calibration, the "Recent samples"/"Recent
+        references" submenus (stored as ``self._recent_samples_menu`` and
+        ``self._recent_refs_menu`` and filled by ``_refresh_recent_menus``),
+        session open/save, calibration save/load, batch export, export-all, and
+        quit — each bound to its handler method and, where noted, a keyboard
+        shortcut. Populates **View → Theme** with a checkable, mutually
+        exclusive action per available theme (grouped via
+        ``self._theme_group``, tracked in ``self._theme_actions``); triggering
+        an action calls ``_apply_ui_theme`` with that theme id, and the action
+        matching the currently restored theme is pre-checked. Populates **Help**
+        with the shortcuts reference and About dialogs. Finishes by calling
+        ``_refresh_recent_menus`` to populate the recent-file submenus from
+        persisted settings.
+        """
 
         mb = self.menuBar()
 
@@ -326,6 +393,7 @@ class EnhancementsMixin:
             self._theme_actions[theme_id] = act
 
             act.triggered.connect(
+                # Default arg captures theme_id — bare `theme_id` in the loop would bind late.
                 lambda _checked=False, tid=theme_id: self._apply_ui_theme(tid))
 
         checked = self._theme_actions.get(self._ui_theme)
@@ -350,7 +418,19 @@ class EnhancementsMixin:
 
     def _setup_shortcuts(self):
 
-        """Bind keyboard shortcuts for common workflow actions."""
+        """Register application-wide keyboard shortcuts for common actions.
+
+        Called once from ``_init_enhancements``. Creates one ``QShortcut`` per
+        entry in a local table mapping key sequences to handlers, covering
+        processing (F5 Apply, F6 Calibrate, F7 Paint), cursor/segmentation
+        editing (Ctrl+Shift+N add, Ctrl+Z undo, Ctrl+Shift+X clear, Delete/
+        Backspace remove, Ctrl+G fit GMM, Ctrl+M toggle Cursors/GMM mode),
+        right-panel tab navigation (Ctrl+1/2/3), and cursor/calibration file
+        I/O (Ctrl+Shift+U/Y/B/K). Each ``QShortcut`` is parented to ``self`` so
+        it fires regardless of which child widget has focus, and is torn down
+        automatically when the window is destroyed. See ``show_shortcuts`` for
+        the user-facing reference list kept in sync with this table.
+        """
 
         bind = QtGui.QShortcut
 
@@ -384,7 +464,20 @@ class EnhancementsMixin:
 
     def _shortcut_goto_tab(self, which: str):
 
-        """Switch the right-hand panel to Setup, Multi-phasor, or Analyze."""
+        """Switch the right-hand panel tabs in response to a Ctrl+1/2/3 shortcut.
+
+        Looks up the target tab index from ``_tab_setup_idx``,
+        ``_tab_compare_idx``, or ``_tab_analyze_idx`` attributes on ``self``
+        (falling back to 0/1/2 respectively if MainWindow has not set them),
+        then calls ``self.panel_tabs.setCurrentIndex`` to switch the visible
+        tab. Silently does nothing if ``self`` has no ``panel_tabs`` attribute
+        yet (e.g. shortcut fired before ``_build_ui`` finished) or if ``which``
+        is not a recognized key, in which case it defaults to index 0.
+
+        Args:
+            which: One of ``"setup"``, ``"compare"``, or ``"analyze"``,
+                identifying which right-panel tab to activate.
+        """
 
         if not hasattr(self, "panel_tabs"):
 
@@ -406,7 +499,16 @@ class EnhancementsMixin:
 
     def _shortcut_toggle_segmentation_mode(self):
 
-        """Toggle between cursor ROI and GMM segmentation modes."""
+        """Flip the segmentation-mode radio buttons on the Ctrl+M shortcut.
+
+        Triggered by the Ctrl+M keyboard shortcut. If the GMM radio button
+        (``self.rb_gmm``) is currently checked, checks the cursor ROI radio
+        button (``self.rb_cursor``) instead, and vice versa; checking a
+        ``QRadioButton`` in a mutually exclusive group automatically unchecks
+        its sibling and fires that button's own ``toggled``/state-change
+        handlers, which drive the rest of the segmentation-mode UI update. Does
+        nothing if ``self`` has no ``rb_cursor`` attribute yet.
+        """
 
         if not hasattr(self, "rb_cursor"):
 
@@ -424,7 +526,15 @@ class EnhancementsMixin:
 
     def show_shortcuts(self):
 
-        """Show a reference list of keyboard shortcuts."""
+        """Display a modal reference list of all keyboard shortcuts.
+
+        Bound to Help → "Keyboard shortcuts…". Builds a static HTML string
+        grouping shortcuts by category (files & session, processing,
+        segmentation, navigation) matching the bindings registered in
+        ``_setup_shortcuts``, and shows it in a blocking
+        ``QMessageBox.information`` dialog. Purely informational; does not
+        change any application state.
+        """
 
         text = (
             "<b>Files & session</b><br>"
@@ -461,7 +571,13 @@ class EnhancementsMixin:
 
     def _setup_drag_drop(self):
 
-        """Accept FLIM file drops onto the main window."""
+        """Enable drag-and-drop of FLIM files onto the main window.
+
+        Called once from ``_init_enhancements``. Simply calls
+        ``self.setAcceptDrops(True)`` so Qt starts delivering
+        ``dragEnterEvent``/``dropEvent`` to this window; the actual filtering
+        and loading logic lives in those two event handlers below.
+        """
 
         self.setAcceptDrops(True)
 
@@ -469,7 +585,20 @@ class EnhancementsMixin:
 
     def dragEnterEvent(self, event):
 
-        """Accept drag events that contain supported FLIM file URLs."""
+        """Qt event handler that decides whether a drag can be dropped here.
+
+        Fired continuously by Qt while the user drags an item over the window
+        (requires ``setAcceptDrops(True)``, set in ``_setup_drag_drop``).
+        Inspects the drag's mime data for file URLs and, on the first URL whose
+        local path ``is_supported_flim_path`` (a supported PTU/TIF/LIF file),
+        calls ``event.acceptProposedAction()`` to show the "drop allowed"
+        cursor and enable ``dropEvent`` to fire; otherwise leaves the event
+        unaccepted so Qt shows the "drop rejected" cursor. Does not modify any
+        window state — this only affects drag-cursor feedback.
+
+        Args:
+            event: The ``QDragEnterEvent`` describing the pending drag.
+        """
 
         if event.mimeData().hasUrls():
 
@@ -485,7 +614,24 @@ class EnhancementsMixin:
 
     def dropEvent(self, event):
 
-        """Load dropped FLIM files as samples using the standard load pipeline."""
+        """Qt event handler that loads FLIM files dropped onto the window.
+
+        Fired by Qt when the user releases the mouse to complete a drop that
+        was accepted by ``dragEnterEvent``. Filters the dropped URLs down to
+        local paths accepted by ``is_supported_flim_path`` and, if any remain,
+        routes them through the same job pipeline used by the Sample… file
+        dialog: ``_expand_sample_load_jobs`` (which raises ``ValueError`` — shown
+        via a warning dialog — if a dropped LIF file needs series selection and
+        that selection is cancelled or invalid), then ``_prepare_sample_load``
+        (which may prompt the user and can abort the load), and finally
+        ``_load_sample_paths`` to actually read the files into new dataset
+        entries and refresh the UI. Does nothing if the drop contains no
+        supported files.
+
+        Args:
+            event: The ``QDropEvent`` carrying the dropped mime data (file
+                URLs).
+        """
 
         paths = [
 
@@ -523,7 +669,25 @@ class EnhancementsMixin:
 
     def _remember_recent(self, key: str, path: str, max_items: int = 8):
 
-        """Push a path to the QSettings recent list and refresh menu entries."""
+        """Record a file path in a persisted recent-files list and refresh the menu.
+
+        Reads the existing list stored under ``key`` in ``self._settings``
+        (normalizing a legacy single-string value into a one-item list),
+        removes any existing entry equal to the absolute form of ``path``, then
+        inserts the absolute path at the front (most-recent-first) and
+        truncates to ``max_items`` before writing the list back to
+        ``QSettings``. Finishes by calling ``_refresh_recent_menus`` so the
+        File menu's "Recent samples"/"Recent references" submenus immediately
+        reflect the change.
+
+        Args:
+            key: QSettings key for the list, e.g. ``"recent_samples"`` or
+                ``"recent_refs"``.
+            path: File path to move to the front of the recent list; stored in
+                absolute form.
+            max_items: Maximum number of entries to retain (oldest entries
+                beyond this are dropped). Defaults to 8.
+        """
 
         items = list(self._settings.value(key, []) or [])
 
@@ -545,7 +709,21 @@ class EnhancementsMixin:
 
     def _refresh_recent_menus(self):
 
-        """Rebuild Recent samples and Recent references submenus from settings."""
+        """Rebuild the "Recent samples" and "Recent references" submenus.
+
+        Called after any change to the recent-files lists (from
+        ``_remember_recent``) or once at startup (from ``_build_menus``). For
+        each of the two submenus, clears all existing actions, reads the
+        corresponding list from ``self._settings`` (normalizing a legacy
+        single-string value into a one-item list), and if the list is empty
+        adds a single disabled "(empty)" placeholder action. Otherwise adds one
+        action per path that still exists on disk (stale entries are silently
+        skipped rather than removed from settings), labeled with the file's
+        base name, wired via a closure that binds both the path and the
+        open-handler by default argument so each action opens the correct file
+        with the correct handler (sample vs reference) regardless of loop
+        iteration order.
+        """
 
         for menu, key, handler in (
 
@@ -575,13 +753,31 @@ class EnhancementsMixin:
 
                 if os.path.isfile(p):
 
-                    menu.addAction(os.path.basename(p), lambda checked=False, path=p: handler(path))
+                    # Bind both path and handler — a bare `handler` in the lambda
+                    # would close over the for-loop variable and always call the
+                    # last handler (_open_recent_ref), sending samples to Reference.
+                    menu.addAction(
+                        os.path.basename(p),
+                        lambda checked=False, path=p, h=handler: h(path),
+                    )
 
 
 
     def _open_recent_sample(self, path):
 
-        """Load a sample from the recent-files menu."""
+        """Load a sample chosen from the "Recent samples" menu.
+
+        Triggered when the user clicks an entry in the recent-samples submenu.
+        Mirrors ``dropEvent``'s pipeline for a single path: expands it into
+        load jobs via ``_expand_sample_load_jobs`` (showing a warning dialog
+        and aborting if the path is an invalid/ambiguous LIF file), then, if
+        any jobs resulted, confirms the load via ``_prepare_sample_load`` and
+        finally loads via ``_load_sample_paths``, which appends a new dataset
+        and refreshes the sample list/image views.
+
+        Args:
+            path: Absolute path to the previously-opened sample file.
+        """
 
         try:
 
@@ -607,7 +803,16 @@ class EnhancementsMixin:
 
     def _open_recent_ref(self, path):
 
-        """Select a reference file from the recent-files menu."""
+        """Select a reference file chosen from the "Recent references" menu.
+
+        Triggered when the user clicks an entry in the recent-references
+        submenu. Simply delegates to ``choose_ref_with_path``, which validates
+        the path and updates the active calibration reference without opening
+        a file dialog.
+
+        Args:
+            path: Absolute path to the previously-used reference file.
+        """
 
         self.choose_ref_with_path(path)
 
@@ -615,7 +820,19 @@ class EnhancementsMixin:
 
     def choose_ref_with_path(self, path: str):
 
-        """Set the calibration reference path without opening a file dialog."""
+        """Set the active calibration reference file without a file dialog.
+
+        Used by ``_open_recent_ref`` (and available for programmatic/session
+        restore use) as an alternative to the "Reference…" file-picker action.
+        Validates ``path`` with ``is_supported_flim_path`` and silently does
+        nothing if it is empty or unsupported; otherwise delegates to
+        ``_set_reference_path``, which updates ``self.shared_ref_path``/the
+        active dataset's reference and refreshes dependent UI (reference label,
+        calibration display).
+
+        Args:
+            path: Candidate reference file path.
+        """
 
         if not path or not is_supported_flim_path(path):
 
@@ -627,7 +844,20 @@ class EnhancementsMixin:
 
     def _calibration_settings_tuple(self):
 
-        """Return harmonic, filter, channel, and manual-cal flags as a hashable tuple."""
+        """Snapshot the calibration-relevant UI controls as a hashable tuple.
+
+        Reads the current harmonic spin box, filter combo box text, reference
+        channel combo box index, and the manual-calibration checkbox state. Used
+        by ``_mark_calibration_current``/``_update_calibration_stale_style`` to
+        detect, by string comparison against a previously stored snapshot,
+        whether the user has changed calibration-affecting settings since the
+        last time Calibrate was run — used purely for the "stale" warning
+        styling on the calibration label, not for the actual processing math.
+
+        Returns:
+            Tuple of ``(harmonic, filter_text, ref_channel_index,
+            manual_cal_checked)``.
+        """
 
         return (
 
@@ -635,7 +865,7 @@ class EnhancementsMixin:
 
             self.cb_filter.currentText(),
 
-            int(self.cb_ref_channel.currentIndex()) if self.cb_ref_channel.isEnabled() else 0,
+            int(self.cb_ref_channel.currentIndex()),
 
             bool(self.chk_manual_cal.isChecked()),
 
@@ -645,7 +875,16 @@ class EnhancementsMixin:
 
     def _mark_calibration_current(self):
 
-        """Record calibration settings so stale styling can detect later changes."""
+        """Snapshot calibration settings as the new "not stale" baseline.
+
+        Called right after a successful Calibrate action (and after loading a
+        calibration file) to record the current harmonic/filter/channel/manual
+        settings, via ``_calibration_settings_tuple``, into
+        ``self._cal_settings_hash``. Immediately calls
+        ``_update_calibration_stale_style`` afterward so the calibration label
+        clears any stale-orange styling right away, since by definition the
+        settings now match the just-recorded snapshot.
+        """
 
         self._cal_settings_hash = str(self._calibration_settings_tuple())
 
@@ -655,7 +894,18 @@ class EnhancementsMixin:
 
     def _update_calibration_stale_style(self):
 
-        """Highlight the calibration label when harmonic/filter changed since Calibrate."""
+        """Recolor the calibration display label to warn about stale calibration.
+
+        Computes whether the reference calibration is "stale": it is active
+        (``self.ref_calibration.is_active``), manual calibration override is
+        off, and the current ``_calibration_settings_tuple`` no longer matches
+        the snapshot recorded by ``_mark_calibration_current``
+        (``self._cal_settings_hash``) — meaning the user changed
+        harmonic/filter/channel/manual-cal after the last Calibrate run without
+        re-running it. Sets ``self.lbl_cal_display``'s stylesheet to an amber
+        color (``#b45309``) when stale, otherwise gray. Purely cosmetic; does
+        not alter calibration data or block processing.
+        """
 
         stale = (
 
@@ -675,27 +925,53 @@ class EnhancementsMixin:
 
     def _update_ref_preview(self):
 
-        """Refresh the reference phasor preview canvas with current calibration."""
+        """Show/redraw the reference preview only in Manual ref phasor mode.
 
-        if hasattr(self, "ref_preview"):
+        File-based calibration already shows g/s in the status label; the mini
+        plot is mainly useful when typing manual g/s so you can see the point
+        vs the Ref τ target. Hidden otherwise to avoid clutter.
+        """
 
-            self.ref_preview.show_calibration(
+        if not hasattr(self, "ref_preview"):
 
-                self.ref_calibration,
+            return
 
-                ref_lifetime_ns=self.sp_reflt.value(),
+        manual = bool(getattr(self, "chk_manual_cal", None) and self.chk_manual_cal.isChecked())
 
-                frequency_mhz=self.sp_freq.value(),
+        self.ref_preview.setVisible(manual)
 
-                harmonic=int(self.sp_harm.value()),
+        if not manual:
 
-            )
+            return
+
+        self.ref_preview.show_calibration(
+
+            self.ref_calibration,
+
+            ref_lifetime_ns=self.sp_reflt.value(),
+
+            frequency_mhz=self.sp_freq.value(),
+
+            harmonic=int(self.sp_harm.value()),
+
+        )
 
 
 
     def _update_metadata_panel(self):
 
-        """Show memory estimate, pixel size, and phasorpy version below processing."""
+        """Rebuild the small metadata line shown below the processing controls.
+
+        Assembles a "·"-separated string from whichever of these apply: a
+        memory-usage estimate for the active dataset (via
+        ``format_memory_line``, only if a sample is loaded); the dataset's
+        detected pixel size in µm if known, or otherwise the user-entered
+        manual pixel size from ``self.sp_pixel_um`` if non-zero (labeled
+        "(manual)"); and the installed ``phasorpy`` package version, if
+        importable. Writes the resulting string (or an empty string if nothing
+        applies) into ``self.lbl_metadata``. Called whenever a sample is
+        loaded/changed or the manual pixel size is edited.
+        """
 
         d = self.data
 
@@ -729,7 +1005,22 @@ class EnhancementsMixin:
 
     def save_calibration_file(self):
 
-        """Write the active reference calibration and UI settings to JSON."""
+        """Save the active reference calibration and related UI settings to JSON.
+
+        Bound to the "Save cal…" button, File → "Save calibration…", and the
+        Ctrl+Shift+B shortcut. If no calibration is active
+        (``self.ref_calibration.is_active`` is falsy), shows an informational
+        dialog and returns without prompting for a file. Otherwise prompts for
+        a save path via a file dialog (defaulting to the remembered
+        ``"cal_dir"``), appends a ``.json`` extension if missing, and calls
+        ``save_calibration`` with the reference calibration object plus a
+        dict of UI extras (reference lifetime, frequency, harmonic, filter
+        mode) so the file can later restore both the numeric g/s values and the
+        matching processing settings. Remembers the chosen directory in
+        ``self._settings`` and appends a confirmation line to the activity log.
+        Does not save the reference image data itself — only derived g/s
+        values and settings.
+        """
 
         if not self.ref_calibration.is_active:
 
@@ -771,7 +1062,28 @@ class EnhancementsMixin:
 
     def load_calibration_file(self):
 
-        """Load reference g/s from JSON and update processing controls."""
+        """Load a previously saved calibration JSON and apply it to the UI.
+
+        Bound to the "Load cal…" button, File → "Load calibration…", and the
+        Ctrl+Shift+K shortcut. Prompts for a file via a file dialog (defaulting
+        to the remembered ``"cal_dir"``); returns immediately if cancelled.
+        Parses the file with ``load_calibration`` into a calibration object and
+        a dict of UI extras, then replaces ``self.ref_calibration``. If the
+        file recorded the original reference file's path, updates
+        ``self.shared_ref_path``, the reference label, the active dataset's
+        ``ref_path``, and propagates the shared reference to other datasets via
+        ``_propagate_shared_reference`` — note the reference *image* itself is
+        not stored in the JSON, only its path, so Apply will still need that
+        file to exist on disk. Restores reference lifetime, frequency,
+        harmonic, and filter-mode spin/combo boxes from the UI extras when
+        present, sets the manual-calibration checkbox to match the loaded
+        calibration, and syncs manual g/s fields
+        (``_sync_manual_fields_from_calibration``). Refreshes the calibration
+        display label, the reference preview canvas, and marks the calibration
+        as current (clearing stale styling). Turns off any active compare
+        overlay if supported, and logs a summary line including the loaded g/s
+        values.
+        """
 
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
 
@@ -830,12 +1142,24 @@ class EnhancementsMixin:
             f"Calibration loaded from {os.path.basename(path)} "
 
             f"(g={cal.mean_g:.4f}, s={cal.mean_s:.4f}; reference file not decoded).")
+        # JSON stores g/s only — user must still have the reference PTU/TIF on disk for Apply.
 
 
 
     def open_session(self):
 
-        """Open a session bundle or JSON session file from a file dialog."""
+        """Prompt for and open a session file, dispatching by session type.
+
+        Bound to File → "Open session…" and the Ctrl+Shift+O shortcut. Shows a
+        file dialog (defaulting to the remembered ``"session_dir"``) accepting
+        session bundle files, plain JSON, or any file. Returns immediately if
+        the user cancels. Uses ``is_session_bundle`` to detect whether the
+        chosen file is a self-contained bundle (processed maps embedded) versus
+        a lightweight path-only JSON session, and delegates to
+        ``_open_session_bundle`` or ``_open_session_json`` respectively — the
+        two have different restore semantics and error handling, documented on
+        each.
+        """
 
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
 
@@ -865,7 +1189,23 @@ class EnhancementsMixin:
 
     def _open_session_bundle(self, path: str):
 
-        """Restore datasets, calibration, and cursors from a self-contained bundle."""
+        """Restore full application state from a self-contained session bundle.
+
+        Called by ``open_session`` when the chosen file is detected as a
+        bundle (embeds processed phasor maps rather than just paths, so no
+        original PTU/TIF files are required to view results). Loads the bundle
+        via ``load_session_bundle`` and applies it to the window via
+        ``apply_session_bundle_to_window``, which is responsible for
+        repopulating ``self.datasets``, calibration state, cursors, and other
+        UI state; any exception during either step is shown in a critical
+        dialog and aborts without further changes. On success, logs a summary
+        line with the number of restored samples and the bundle file's size on
+        disk, and remembers the containing directory as ``"session_dir"`` in
+        ``self._settings``.
+
+        Args:
+            path: Path to the session bundle file to load.
+        """
 
         try:
 
@@ -897,7 +1237,30 @@ class EnhancementsMixin:
 
     def _open_session_json(self, path: str):
 
-        """Restore sample list and settings from a path-based session JSON file."""
+        """Restore the sample list and settings from a lightweight, path-based session.
+
+        Called by ``open_session`` when the chosen file is a plain JSON session
+        (stores file paths and settings only, not processed image data — unlike
+        a bundle). Parses the file via ``load_session_json``, showing a
+        critical dialog and aborting on failure. If any referenced sample/
+        reference files are missing on disk, warns the user via
+        ``missing_paths_message`` and a dialog listing up to 8 missing paths
+        (truncated with "…" if more), reminding them that a session bundle
+        would have avoided this dependency. Clears ``self.datasets`` and
+        rebuilds it by calling ``register_sample_from_session_row`` for each
+        saved sample row; if any datasets resulted, enables multi-image mode
+        (``self.chk_multi``) and restores the previously active sample index
+        (clamped to the valid range), making it ``self.data``. Applies saved
+        calibration via ``apply_calibration_from_session`` and, if present,
+        restores phasor cursors via ``restore_cursors_to_phasor``. Finishes by
+        calling ``_restore_ui_for_active`` and ``_refresh_image_combo`` to sync
+        the UI to the newly active dataset, remembers the directory as
+        ``"session_dir"``, and logs a reminder that samples still need to be
+        (re)loaded/decoded and Applied since raw data was not embedded.
+
+        Args:
+            path: Path to the JSON session file to load.
+        """
 
         try:
 
@@ -967,7 +1330,22 @@ class EnhancementsMixin:
 
     def save_session(self):
 
-        """Save processed maps and UI state to a portable session bundle."""
+        """Save all processed results and UI state to a portable session bundle.
+
+        Bound to File → "Save session…" and the Ctrl+Shift+S shortcut. Requires
+        that Apply has run on the active dataset (checks ``self.data.real_cal
+        is not None``); if not, shows an informational dialog explaining that
+        the bundle stores processed maps rather than raw PTU data, and returns
+        without prompting. Otherwise prompts for a save path via a file dialog
+        (defaulting to the remembered ``"session_dir"`` or, failing that,
+        ``"export_dir"``), appending the bundle extension if missing. Calls
+        ``save_session_bundle`` with ``self`` and the chosen path to actually
+        serialize datasets, calibration, cursors, and settings; any exception
+        is shown in a critical dialog and aborts without further changes. On
+        success, remembers the containing directory as ``"session_dir"`` and
+        logs a summary line with the resulting file name, sample count, and
+        size on disk.
+        """
 
         if self.data.real_cal is None:
 
@@ -1031,7 +1409,22 @@ class EnhancementsMixin:
 
     def batch_export_folder(self):
 
-        """Run headless batch phasor export on a folder using current settings."""
+        """Batch-process every supported FLIM file in a folder using current settings.
+
+        Bound to File → "Batch export folder…". Prompts the user for an input
+        folder (containing FLIM files to process) and then an output folder for
+        results; returns without doing anything if either dialog is cancelled.
+        Builds a command-line argument list for
+        ``flim_phasors.batch_cli.main`` mirroring the current UI's harmonic,
+        frequency, filter mode, and intensity threshold, and, if a shared
+        reference file is set, also passes the reference path, reference
+        channel, and reference lifetime for calibration. Imports
+        ``batch_cli.main`` lazily to avoid a module-level dependency, and runs
+        it inside ``_run_busy`` so the UI shows a "Batch processing…" busy
+        indicator while every file in the folder is processed and exported.
+        Logs a completion message with the output folder on success, or shows
+        a critical error dialog if the batch run raises.
+        """
 
         inp = QtWidgets.QFileDialog.getExistingDirectory(self, "Input folder of FLIM files")
 
@@ -1079,7 +1472,15 @@ class EnhancementsMixin:
 
     def show_about(self):
 
-        """Show version info for FLIM Phasors, phasorpy, and Python."""
+        """Display the About dialog with application and dependency versions.
+
+        Bound to Help → "About…". Attempts to import ``phasorpy`` to read its
+        ``__version__`` (falling back to ``"not installed"`` if the import
+        fails), then shows a standard ``QMessageBox.about`` dialog listing the
+        FLIM Phasor Analyzer version (from ``flim_phasors.__version__``), the
+        phasorpy version, and the running Python version. Purely informational;
+        does not change any application state.
+        """
 
         try:
 
@@ -1107,7 +1508,20 @@ class EnhancementsMixin:
 
     def _load_ui_theme_setting(self) -> str:
 
-        """Return persisted Phasor Lab theme id."""
+        """Determine which Phasor Lab theme to start the window with.
+
+        Called once from ``_init_enhancements`` before any theme is applied.
+        Prefers the current ``"ui_theme"`` QSettings key if present, normalized
+        via ``normalize_theme_id`` to tolerate legacy/typo'd values. Falls back
+        to the legacy boolean ``"dark_theme"`` key (from before named themes
+        existed) if present, mapping ``True`` to ``THEME_PHASOR_LAB`` and
+        ``False`` to ``THEME_PHASOR_LAB_LIGHT``. If neither key exists (first
+        run), returns ``DEFAULT_THEME``. Does not itself apply the theme or
+        write any settings.
+
+        Returns:
+            The theme id string to use as the initial theme.
+        """
 
         if self._settings.contains("ui_theme"):
 
@@ -1125,7 +1539,19 @@ class EnhancementsMixin:
 
     def _tag_primary_buttons(self):
 
-        """Mark key workflow buttons for accent styling in Phasor Lab themes."""
+        """Flag the key workflow buttons so the theme stylesheet accents them.
+
+        Called once from ``_init_enhancements``, after ``_build_ui`` has
+        created the buttons named in ``PRIMARY_BUTTON_ATTRS`` (Calibrate,
+        Apply, Apply all, Export, Paint). For each attribute name in that
+        tuple, if the corresponding button exists on ``self``, sets its
+        ``"primary"`` Qt dynamic property to ``True``; the stylesheets in
+        ``theme.py`` key off ``QPushButton[primary="true"]`` to render these
+        buttons with an accent color, distinguishing the primary workflow
+        actions from ordinary buttons. Does not itself repaint the buttons —
+        see ``_repolish_primary_buttons`` for forcing Qt to re-evaluate the
+        selector after a stylesheet change.
+        """
 
         for attr in PRIMARY_BUTTON_ATTRS:
 
@@ -1139,8 +1565,19 @@ class EnhancementsMixin:
 
     def _repolish_primary_buttons(self):
 
-        """Re-apply stylesheet rules to primary buttons after a theme change."""
+        """Force Qt to re-evaluate primary-button styling after a stylesheet swap.
 
+        Called at the end of ``_apply_ui_theme``. Setting a new application
+        stylesheet does not automatically re-run dynamic-property selectors
+        (like ``QPushButton[primary="true"]``) on widgets that already exist,
+        so for each button attribute named in ``PRIMARY_BUTTON_ATTRS`` that
+        exists on ``self``, calls ``style().unpolish(btn)`` followed by
+        ``style().polish(btn)`` to force Qt to recompute and reapply the
+        widget's style from the new stylesheet, ensuring the accent color
+        actually updates when switching between Phasor Lab themes.
+        """
+
+        # unpolish/polish forces Qt to re-run QPushButton[primary="true"] selectors.
         for attr in PRIMARY_BUTTON_ATTRS:
 
             btn = getattr(self, attr, None)
@@ -1157,7 +1594,29 @@ class EnhancementsMixin:
 
     def _apply_ui_theme(self, theme: str):
 
-        """Apply a Phasor Lab theme and persist the preference."""
+        """Switch the entire application to a Phasor Lab theme and persist it.
+
+        Called from ``_init_enhancements`` at startup and whenever the user
+        picks a theme from the View → Theme menu (each theme action's
+        ``triggered`` signal is wired directly to this method with its theme
+        id). Normalizes ``theme`` via ``normalize_theme_id``, updates
+        ``self._ui_theme`` and the derived ``self._dark_theme`` boolean, and
+        writes both the theme id and dark-mode flag to ``self._settings`` so
+        the choice persists across restarts (the boolean is kept for backward
+        compatibility with older settings readers). Applies the theme's global
+        stylesheet via ``self.setStyleSheet(stylesheet_for(theme))``, then
+        calls ``_apply_theme_widgets`` to restyle the activity log and
+        matplotlib toolbars (which use manual palettes, not just the
+        stylesheet) and ``_repolish_primary_buttons`` to force existing accent
+        buttons to pick up the new colors. Finally, updates the checked state
+        of every action in ``self._theme_actions`` so the menu's radio-style
+        checkmark matches the newly active theme.
+
+        Args:
+            theme: Theme id to activate, e.g. ``THEME_PHASOR_LAB`` or
+                ``THEME_PHASOR_LAB_LIGHT`` (tolerant of legacy/typo'd values
+                via ``normalize_theme_id``).
+        """
 
         theme = normalize_theme_id(theme)
 
@@ -1173,6 +1632,7 @@ class EnhancementsMixin:
 
         self._apply_theme_widgets(theme)
 
+        # Stylesheet swap does not re-evaluate dynamic [primary="true"] rules on existing buttons.
         self._repolish_primary_buttons()
 
         for theme_id, act in getattr(self, "_theme_actions", {}).items():
@@ -1183,7 +1643,23 @@ class EnhancementsMixin:
 
     def _apply_theme_widgets(self, theme: str):
 
-        """Refresh log and matplotlib toolbar styles after a theme change."""
+        """Restyle widgets that need manual palette updates beyond the stylesheet.
+
+        Called from ``_apply_ui_theme`` after the global stylesheet is set.
+        The activity log (``self.txt_log``, if present) gets its stylesheet
+        replaced via ``log_style_for(theme)``. Each matplotlib navigation
+        toolbar attribute (``phasor_toolbar``, ``image_toolbar``, if present on
+        ``self``) gets its Qt stylesheet set via ``toolbar_style_for(theme)``
+        and, because matplotlib toolbars render some backgrounds via the
+        widget palette rather than the stylesheet alone, also has its
+        ``QPalette`` window/button/text colors explicitly set from
+        ``toolbar_colors_for(theme)`` and ``setAutoFillBackground(True)``
+        enabled so the palette colors actually show through.
+
+        Args:
+            theme: Theme id whose colors should be applied (any legacy/typo'd
+                value is normalized inside the ``*_for`` helper functions).
+        """
 
         if hasattr(self, "txt_log"):
 
@@ -1223,7 +1699,17 @@ class EnhancementsMixin:
 
     def _apply_dark_theme(self, on: bool):
 
-        """Backward-compatible wrapper for legacy dark-theme toggles."""
+        """Backward-compatible shim for code that still toggles a boolean dark flag.
+
+        Kept for any external callers or old shortcuts expecting a simple
+        on/off dark-mode toggle instead of the newer named-theme system.
+        Translates the boolean into the corresponding theme id and delegates
+        to ``_apply_ui_theme`` to perform the actual switch.
+
+        Args:
+            on: ``True`` to apply ``THEME_PHASOR_LAB`` (dark); ``False`` to
+                apply ``THEME_PHASOR_LAB_LIGHT``.
+        """
 
         self._apply_ui_theme(THEME_PHASOR_LAB if on else THEME_PHASOR_LAB_LIGHT)
 
@@ -1231,7 +1717,16 @@ class EnhancementsMixin:
 
     def _push_cursor_undo(self):
 
-        """Snapshot current phasor cursors for a later undo operation."""
+        """Save a snapshot of the current cursor ROIs onto the undo stack.
+
+        Called before any operation that mutates ``self.phasor.cursors`` (e.g.
+        adding, removing, or editing a cursor ROI), so that operation can later
+        be reverted by ``undo_cursor``. Deep-copies ``self.phasor.cursors`` (to
+        avoid aliasing with later in-place mutations) and appends it to
+        ``self._cursor_undo_stack``. Caps the stack at 30 entries by discarding
+        the oldest snapshot once the limit is exceeded, bounding memory use for
+        long editing sessions.
+        """
 
         import copy
 
@@ -1245,7 +1740,19 @@ class EnhancementsMixin:
 
     def undo_cursor(self):
 
-        """Restore the most recent cursor snapshot from the undo stack."""
+        """Revert the most recent cursor edit, bound to the Ctrl+Z shortcut.
+
+        Triggered by the "Undo" button or the Ctrl+Z shortcut. If
+        ``self._cursor_undo_stack`` is empty, logs "Nothing to undo." and
+        returns without changing anything. Otherwise pops the most recent
+        snapshot pushed by ``_push_cursor_undo`` and assigns it to
+        ``self.phasor.cursors``, replacing the current cursor set with the
+        prior one. Calls ``self.phasor.redraw_hist()`` to repaint the phasor
+        plot with the restored cursors, ``_refresh_active_cursor_combo`` to
+        update the active-cursor selector to match, and
+        ``_refresh_after_cursor_edit`` to recompute any dependent
+        segmentation/statistics, then logs "Cursor undo."
+        """
 
         if not self._cursor_undo_stack:
 
@@ -1267,7 +1774,17 @@ class EnhancementsMixin:
 
     def save_cursors_file(self):
 
-        """Write phasor ROI cursors to a JSON file."""
+        """Save the current phasor cursor ROIs to a JSON file.
+
+        Bound to the "Save cursors…" button, and the Ctrl+Shift+U shortcut. If
+        there are no cursors defined (``self.phasor.cursors`` is empty), shows
+        an informational dialog and returns without prompting. Otherwise
+        prompts for a save path via a file dialog (defaulting to the
+        remembered ``"sample_dir"``); returns if cancelled. Calls
+        ``save_cursors`` with the cursor list and the active sample's path
+        (stored as a hint for later matching on load), then logs a
+        confirmation line with the saved path.
+        """
 
         if not self.phasor.cursors:
 
@@ -1291,7 +1808,21 @@ class EnhancementsMixin:
 
     def load_cursors_file(self):
 
-        """Load phasor ROI cursors from JSON and restore them on the plot."""
+        """Load phasor cursor ROIs from a JSON file and apply them to the plot.
+
+        Bound to the "Load cursors…" button and the Ctrl+Shift+Y shortcut.
+        Prompts for a file via a file dialog (defaulting to the remembered
+        ``"sample_dir"``); returns if cancelled. Parses the file with
+        ``load_cursors`` into a list of cursor dicts plus a ``sample_hint``
+        (the original sample path they were saved against, currently unused
+        for matching but reserved for future validation). Restores the cursors
+        onto the phasor plot via ``restore_cursors_to_phasor``, refreshes the
+        active-cursor combo box (``_refresh_active_cursor_combo``) and
+        dependent segmentation/statistics (``_refresh_after_cursor_edit``), and
+        logs the count of cursors loaded and the source file name. Note this
+        does not push an undo snapshot first, so loading replaces the current
+        cursors without an undo path back to them.
+        """
 
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
 
@@ -1315,7 +1846,18 @@ class EnhancementsMixin:
 
     def export_table_csv(self):
 
-        """Save cluster lifetime statistics from Paint to a CSV file."""
+        """Export the current cluster/lifetime statistics table to a CSV file.
+
+        Bound to the "Export table CSV…" button. If ``self.cluster_stats`` is
+        empty (Paint has not been run yet), shows an informational dialog and
+        returns without prompting. Otherwise prompts for a save path via a
+        file dialog (defaulting to the remembered ``"export_dir"``); returns if
+        cancelled. Writes one row per cluster with the fixed column set
+        ``idx, label, g, s, tp, tm, tn, n, area`` using ``csv.DictWriter`` with
+        ``extrasaction="ignore"`` (any extra keys present on the stat dicts,
+        e.g. internal bookkeeping fields, are silently dropped), then logs a
+        confirmation line with the saved path.
+        """
 
         if not self.cluster_stats:
 
@@ -1351,7 +1893,17 @@ class EnhancementsMixin:
 
     def copy_table_to_clipboard(self):
 
-        """Copy cluster lifetime statistics as tab-separated text."""
+        """Copy the cluster/lifetime statistics table as tab-separated text.
+
+        Bound to the "Copy table" button. Does nothing if
+        ``self.cluster_stats`` is empty (Paint has not been run yet). Otherwise
+        builds a header line (``#, Label, g, s, τφ, τmod, τn, Pixels, Area%``)
+        followed by one tab-separated line per cluster with values formatted to
+        a fixed number of decimal places, joins them with newlines, and sets
+        the result as the system clipboard's text via
+        ``QApplication.clipboard().setText`` — suitable for pasting directly
+        into a spreadsheet. Logs a confirmation line afterward.
+        """
 
         if not self.cluster_stats:
 
@@ -1377,7 +1929,24 @@ class EnhancementsMixin:
 
     def _effective_ref_label(self, d) -> str:
 
-        """Return a short reference filename label for a dataset row in the compare table."""
+        """Return a short display label for a dataset's effective reference file.
+
+        Used when populating the compare/multi-sample table, where each row
+        needs a compact indicator of which reference file it was (or will be)
+        calibrated against. If shared-reference mode is enabled
+        (``self.chk_shared_ref`` checked) and a shared reference path is set,
+        returns that shared file's base name — since in that mode every
+        dataset uses the same reference regardless of its own ``ref_path``.
+        Otherwise returns the dataset's own ``ref_path`` base name, or an
+        em dash (``"—"``) placeholder if it has no reference assigned.
+
+        Args:
+            d: Dataset (:class:`PhasorData`-like) whose reference label to
+                compute.
+
+        Returns:
+            Base file name of the effective reference, or ``"—"`` if none.
+        """
 
         if self.chk_shared_ref.isChecked() and self.shared_ref_path:
 

@@ -27,6 +27,13 @@ PROC_SETTING_KEYS = (
 def capture_processing_from_ui(win) -> dict:
     """Snapshot filter, threshold, and harmonic controls from the main window.
 
+    Reads the current value of every widget listed in
+    :data:`PROC_SETTING_KEYS` and packs them into a plain dict. Used to
+    stash per-sample processing settings when "Per-sample filters" is
+    enabled (so each dataset remembers its own filter/harmonic choices)
+    and when saving a session bundle, since widgets themselves cannot be
+    serialized.
+
     Args:
         win: Main window with processing widgets.
 
@@ -52,11 +59,21 @@ def capture_processing_from_ui(win) -> dict:
 def per_sample_processing(win) -> bool:
     """Return whether multiple samples are loaded with independent filter settings.
 
+    Used throughout this module to decide whether processing parameters
+    should be pulled from a dataset's own stashed
+    ``processing_settings`` (per-sample mode) or uniformly from the
+    current UI control values (single-image mode). The name is slightly
+    misleading in that it does not check the "Multi-image" checkbox
+    itself — it only checks how many datasets are loaded — since
+    per-sample stashes are only meaningful once there is more than one
+    dataset to diverge.
+
     Args:
         win: Main window instance.
 
     Returns:
-        ``True`` when ``win.datasets`` contains more than one sample.
+        ``True`` when ``win.datasets`` has more than one entry (multi-image list),
+        regardless of whether the Multi-image checkbox is checked.
     """
     return len(getattr(win, "datasets", [])) > 1
 
@@ -93,35 +110,52 @@ def apply_processing_settings_to_ui(win, settings: dict) -> None:
     """
     if not settings:
         return
-    if "harmonic" in settings:
-        win.sp_harm.setValue(int(settings["harmonic"]))
-    if "frequency" in settings:
-        win.sp_freq.setValue(float(settings["frequency"]))
-    if "channel" in settings:
-        n = max(1, win.cb_channel.count())
-        win.cb_channel.setCurrentIndex(min(int(settings["channel"]), n - 1))
-    if "ref_lifetime" in settings:
-        win.sp_reflt.setValue(float(settings["ref_lifetime"]))
-    mode = settings.get("filter_mode", "median")
-    if mode in [win.cb_filter.itemText(i) for i in range(win.cb_filter.count())]:
-        win.cb_filter.setCurrentText(mode)
-    win.on_filter_change(win.cb_filter.currentText())
-    if "median_size" in settings:
-        win.sp_msize.setValue(int(settings["median_size"]))
-    if "median_repeat" in settings:
-        win.sp_mrep.setValue(int(settings["median_repeat"]))
-    if "paw_sigma" in settings:
-        win.sp_psigma.setValue(float(settings["paw_sigma"]))
-    if "paw_levels" in settings:
-        win.sp_plevels.setValue(int(settings["paw_levels"]))
-    if "intensity_min" in settings:
-        win.sp_thr.setValue(int(settings["intensity_min"]))
-    if "detect_harmonics" in settings:
-        win.chk_detect_harm.setChecked(bool(settings["detect_harmonics"]))
+    win.sp_harm.blockSignals(True)
+    win.cb_filter.blockSignals(True)
+    win.cb_channel.blockSignals(True)
+    try:
+        if "harmonic" in settings:
+            win.sp_harm.setValue(int(settings["harmonic"]))
+        if "frequency" in settings:
+            win.sp_freq.setValue(float(settings["frequency"]))
+        if "channel" in settings:
+            n = max(1, win.cb_channel.count())
+            win.cb_channel.setCurrentIndex(min(int(settings["channel"]), n - 1))
+        if "ref_lifetime" in settings:
+            win.sp_reflt.setValue(float(settings["ref_lifetime"]))
+        mode = settings.get("filter_mode", "median")
+        if mode in [win.cb_filter.itemText(i) for i in range(win.cb_filter.count())]:
+            win.cb_filter.setCurrentText(mode)
+        # Side effect: shows/hides median vs pawflim rows.
+        win.on_filter_change(win.cb_filter.currentText())
+        if "median_size" in settings:
+            win.sp_msize.setValue(int(settings["median_size"]))
+        if "median_repeat" in settings:
+            win.sp_mrep.setValue(int(settings["median_repeat"]))
+        if "paw_sigma" in settings:
+            win.sp_psigma.setValue(float(settings["paw_sigma"]))
+        if "paw_levels" in settings:
+            win.sp_plevels.setValue(int(settings["paw_levels"]))
+        if "intensity_min" in settings:
+            win.sp_thr.setValue(int(settings["intensity_min"]))
+        if "detect_harmonics" in settings:
+            win.chk_detect_harm.setChecked(bool(settings["detect_harmonics"]))
+    finally:
+        win.sp_harm.blockSignals(False)
+        win.cb_filter.blockSignals(False)
+        win.cb_channel.blockSignals(False)
 
 
 def processing_params_from_ui(win, d: PhasorData) -> dict:
     """Build keyword arguments for :meth:`PhasorData.apply_processing` from the UI.
+
+    Reads filter mode, median/pawFLIM parameters, intensity threshold,
+    and harmonic-detection toggle directly from the main window's current
+    widget values (ignoring any per-sample stash), then resolves the
+    active reference calibration and reference file path for ``d``. This
+    is the "single image" / UI-driven path used directly by
+    :func:`processing_params_for_dataset` when per-sample processing is
+    not active.
 
     Args:
         win: Main window with current control values.
@@ -149,6 +183,14 @@ def processing_params_from_ui(win, d: PhasorData) -> dict:
 def processing_params_for_dataset(win, d: PhasorData) -> dict:
     """Return processing kwargs for a dataset, honoring per-sample stash when active.
 
+    When :func:`per_sample_processing` is true and ``d`` has a non-empty
+    ``processing_settings`` stash, builds kwargs from that stash (falling
+    back field-by-field to current UI values for anything missing);
+    otherwise defers entirely to :func:`processing_params_from_ui`. This
+    lets each dataset in a multi-sample session keep its own filter and
+    harmonic choices while still sharing the currently-active reference
+    calibration.
+
     Args:
         win: Main window instance.
         d: Dataset to process.
@@ -159,6 +201,7 @@ def processing_params_for_dataset(win, d: PhasorData) -> dict:
     if per_sample_processing(win):
         stash = getattr(d, "processing_settings", None) or {}
         if stash:
+            # UI shows the active sample; other rows use their stashed settings when processing.
             mode = stash.get("filter_mode", "median")
             ref_path = win._effective_ref_path(d)
             return {
@@ -179,6 +222,14 @@ def processing_params_for_dataset(win, d: PhasorData) -> dict:
 
 def apply_dataset_harmonic_channel(win, d: PhasorData, *, use_ui_settings: bool) -> None:
     """Set harmonic, frequency, and channel on a dataset before processing.
+
+    Mutates ``d.harmonic``/``d.frequency``/``d.channel`` in place, pulling
+    from the dataset's per-sample stash when :func:`per_sample_processing`
+    is active and a stash exists, otherwise from the current UI control
+    values. Called before :meth:`PhasorData.apply_processing` so the
+    dataset's acquisition metadata matches what is about to be processed;
+    a no-op when ``use_ui_settings`` is ``False`` (e.g. re-processing with
+    parameters already set elsewhere).
 
     Args:
         win: Main window instance.
@@ -218,7 +269,19 @@ def run_processing_on_dataset(
             or per-sample stash onto ``d``.
         calibrate: When ``False``, skip reference calibration and clear ref kwargs.
     """
+    import os
+
     apply_dataset_harmonic_channel(win, d, use_ui_settings=use_ui_settings)
+    # Fast-load keeps only one channel in RAM; re-decode if Apply asks for another.
+    fl = getattr(d, "fast_loaded_channel", None)
+    if (
+        fl is not None
+        and int(d.channel) != int(fl)
+        and d.sample_path
+        and os.path.isfile(d.sample_path)
+        and d.load_source != "lif_phasor"
+    ):
+        d.load_sample(d.sample_path, frame=d.frame_index, load_channel=int(d.channel))
     if calibrate and win._effective_ref_path(d):
         d.ref_channel = win._ref_channel_for_dataset(d)
     params = processing_params_for_dataset(win, d)

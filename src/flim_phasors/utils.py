@@ -48,6 +48,11 @@ def categorical_rgb(i):
 def categorical_name(i):
     """Human-readable label for cluster/cursor index (matches ring color).
 
+    Indexing wraps modulo the length of :data:`CATEGORICAL_NAMES`, using the
+    same cyclic scheme as :func:`categorical_rgb`, so a cursor's color swatch
+    and its text label always refer to the same entry even when there are
+    more clusters than named colors.
+
     Args:
         i: Zero-based cluster or cursor index.
 
@@ -59,6 +64,14 @@ def categorical_name(i):
 
 def reduce_signal(sig, channel):
     """Select a channel and collapse frames to a single histogram stack.
+
+    Multi-channel acquisitions carry an extra ``C`` dimension that must be
+    resolved to a single emission channel before phasor calculation;
+    ``channel`` is clamped to the last available index rather than raising,
+    so stale UI selections from a previously loaded file with fewer channels
+    degrade gracefully. Multiple time frames (``T``) are summed (not
+    averaged) to preserve total photon counts, matching how a single-frame
+    acquisition's counts are interpreted downstream.
 
     Args:
         sig: xarray DataArray with TCSPC histogram dimension ``H``.
@@ -84,6 +97,13 @@ def reduce_signal(sig, channel):
 def photon_count_from_signal(sig):
     """Compute per-pixel photon counts from a TCSPC histogram.
 
+    Sums the time-bin axis (``H`` for xarray input, or the last axis for a
+    plain NumPy array) to collapse the full decay curve into a single
+    intensity value per pixel, in raw photon counts (not normalized or
+    scaled). This is the quantity thresholded against the "Min photons"
+    setting during calibration, and the basis for the raw brightfield/photon
+    maps shown in the GUI and export.
+
     Args:
         sig: xarray DataArray with ``H`` dimension, or a raw histogram array
             whose last axis is time bins.
@@ -104,19 +124,36 @@ def photon_count_from_signal(sig):
 def dataset_has_sample(d) -> bool:
     """Return whether a dataset holds loadable FLIM or LIF phasor data.
 
+    Three independent data sources count as "having a sample": a full raw
+    TCSPC histogram (freshly loaded PTU/Imspector file), precomputed LIF
+    phasor base maps (LAS X exports that skip histogram decoding entirely),
+    or calibrated maps restored from a session bundle with no raw signal at
+    all. Callers use this to decide whether processing/export controls
+    should be enabled for a given slot in a multi-image session.
+
     Args:
         d: :class:`~flim_phasors.data.PhasorData` instance.
 
     Returns:
-        True when a full histogram or precomputed LIF phasor maps are present.
+        True when a full histogram, precomputed LIF phasor maps, or restored
+        session-bundle maps (``real_cal`` without raw signal) are present.
     """
     if getattr(d, "signal_full", None) is not None:
         return True
-    return getattr(d, "load_source", "") == "lif_phasor" and getattr(d, "_lif_base_real", None) is not None
+    if getattr(d, "_lif_base_real", None) is not None:
+        return True
+    # Session-bundle / map-only restores have calibrated maps but no histogram.
+    return getattr(d, "real_cal", None) is not None
 
 
 def _dataset_file_label(d, index=0) -> str:
     """Build a default label from the sample path or LIF series key.
+
+    Used as the fallback when a user has not set a custom ``display_name``.
+    For plain FLIM files this is just the file's basename; for LIF
+    containers with multiple series, the series name is appended after a
+    middle-dot separator (``basename · series``) since the basename alone
+    would be ambiguous across series from the same container file.
 
     Args:
         d: :class:`~flim_phasors.data.PhasorData` instance.
@@ -138,6 +175,12 @@ def _dataset_file_label(d, index=0) -> str:
 def dataset_short_label(d, index=0):
     """Return the user-facing name for a dataset.
 
+    This is the base label used throughout the GUI (multi-image list, combo
+    boxes, table rows) before any group prefixing is applied. A user-supplied
+    ``display_name`` always takes precedence over the derived file/series
+    label, letting users rename samples without losing the ability to trace
+    them back to a source file via :func:`_dataset_file_label`.
+
     Args:
         d: :class:`~flim_phasors.data.PhasorData` instance.
         index: Fallback image index when no path is set.
@@ -153,6 +196,13 @@ def dataset_short_label(d, index=0):
 
 def dataset_phasor_legend_label(d, index=0, *, include_group: bool = True) -> str:
     """Build a label for the multi-image phasor plot legend.
+
+    Legend space is limited, so this builds on the short
+    :func:`dataset_short_label` rather than the full file path. When
+    ``include_group`` is true and the dataset has a non-empty
+    ``group_name``, the group is prepended with a middle-dot separator
+    (``group · name``) so compare-mode legends visually cluster related
+    samples together by group.
 
     Args:
         d: :class:`~flim_phasors.data.PhasorData` instance.
@@ -173,6 +223,12 @@ def dataset_phasor_legend_label(d, index=0, *, include_group: bool = True) -> st
 
 def dataset_display_label(d, index=0):
     """Return a list/overlay label with optional group prefix.
+
+    Thin wrapper around :func:`dataset_phasor_legend_label` with
+    ``include_group`` always true, kept as a separate name so call sites in
+    the multi-image list, compare table, and session/export metadata read
+    clearly without repeating the ``include_group=True`` argument
+    everywhere it is needed.
 
     Args:
         d: :class:`~flim_phasors.data.PhasorData` instance.

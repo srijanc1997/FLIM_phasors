@@ -9,6 +9,13 @@ __all__ = ["MainWindow"]
 def __getattr__(name: str):
     """Lazy-load heavy GUI modules on first attribute access.
 
+    Implements :pep:`562` module-level ``__getattr__`` so that
+    ``from flim_phasors.gui import MainWindow`` only imports
+    :mod:`flim_phasors.gui.main_window` (and, transitively, Qt and
+    matplotlib) the first time ``MainWindow`` is actually accessed,
+    keeping a plain ``import flim_phasors.gui`` cheap for code that only
+    needs other package contents.
+
     Args:
         name: Attribute name requested on this package.
 

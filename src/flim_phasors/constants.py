@@ -43,6 +43,9 @@ FILTER_MODES = (
     "signal gaussian",
 )
 
+# Channels offered in the Ch spin/combo before a file is loaded (0 .. N inclusive).
+CHANNEL_PRESELECT_MAX = 7
+
 IMAGE_VIEW_ITEMS = (
     "Photons (masked)",
     "Brightfield (all photons)",

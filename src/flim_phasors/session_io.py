@@ -19,6 +19,13 @@ from flim_phasors.data import PhasorData
 def load_session_json(path: str | Path) -> dict:
     """Read and parse a session JSON file.
 
+    ``session.json`` (produced by :func:`~flim_phasors.export_bundle.build_session_dict`)
+    carries only paths and settings, never map arrays, so parsing it is cheap
+    and does not by itself restore any computed phasor data — callers must
+    still reload samples and recompute maps, or apply calibration/cursors
+    from the returned dict via :func:`apply_calibration_from_session` and
+    :func:`restore_cursors_to_phasor`.
+
     Args:
         path: Path to ``session.json`` or compatible export.
 
@@ -40,11 +47,16 @@ def apply_calibration_from_session(win, session: dict):
             ``shared_reference_path``).
     """
     cal_block = session.get("calibration") or {}
+    harmonic_gs = None
+    raw_gs = cal_block.get("harmonic_gs")
+    if isinstance(raw_gs, list) and raw_gs:
+        harmonic_gs = [(float(pair[0]), float(pair[1])) for pair in raw_gs]
     cal = ReferenceCalibration(
         source_path=str(cal_block.get("reference_path", "")),
         channel=int(cal_block.get("reference_channel", 0)),
         mean_g=float(cal_block.get("mean_g", 0.0)),
         mean_s=float(cal_block.get("mean_s", 0.0)),
+        harmonic_gs=harmonic_gs,
         use_manual=bool(cal_block.get("manual", False)),
         manual_g=float(cal_block.get("manual_g", 0.0)),
         manual_s=float(cal_block.get("manual_s", 0.0)),
@@ -52,6 +64,8 @@ def apply_calibration_from_session(win, session: dict):
     if cal.use_manual:
         cal.mean_g = cal.manual_g
         cal.mean_s = cal.manual_s
+        cal.harmonic_gs = [(cal.manual_g, cal.manual_s)]
+    # JSON stores scalar g/s only; spatial reference maps are not restored.
     cal.values_ready = cal.use_manual or (
         "mean_g" in cal_block or "mean_s" in cal_block
     )
@@ -59,7 +73,7 @@ def apply_calibration_from_session(win, session: dict):
     ref_path = cal_block.get("reference_path") or session.get("shared_reference_path") or ""
     if ref_path and os.path.isfile(ref_path):
         win.shared_ref_path = ref_path
-        win.data.ref_path = ref_path
+        win.data.ref_path = ref_path  # missing files are left unset (user must re-pick)
     if hasattr(win, "sp_freq"):
         win.sp_freq.setValue(float(cal_block.get("frequency_MHz", win.sp_freq.value())))
     if hasattr(win, "sp_harm"):
@@ -83,6 +97,13 @@ def apply_calibration_from_session(win, session: dict):
 def restore_cursors_to_phasor(win, cursors: list[dict]):
     """Recreate phasor segmentation cursors from serialized session records.
 
+    Signals are blocked on the phasor canvas while cursors are rebuilt one
+    by one via ``add_cursor`` and then repositioned to their exact saved
+    center, so intermediate redraws and change-notification signals do not
+    fire for each cursor individually; a single ``redraw_hist`` call at the
+    end refreshes the plot once all cursors are in place. Cursor centers are
+    phasor-plane (g, s) coordinates, not image pixel positions.
+
     Args:
         win: Main window with a ``phasor`` :class:`~flim_phasors.canvas.phasor.PhasorCanvas`.
         cursors: List of cursor dicts with center, radius, kind, label, and color fields.
@@ -102,6 +123,7 @@ def restore_cursors_to_phasor(win, cursors: list[dict]):
             )
             win.phasor.cursors[-1]["center_real"] = float(c["center_real"])
             win.phasor.cursors[-1]["center_imag"] = float(c["center_imag"])
+            # Centers are in phasor g/s coordinates, not image pixel space.
             win.phasor.cursors[-1]["label"] = c.get("label", "")
             if "color" in c:
                 win.phasor.cursors[-1]["color"] = tuple(c["color"][:3])
@@ -118,6 +140,7 @@ def register_sample_from_session_row(row: dict) -> PhasorData:
     """Build a :class:`~flim_phasors.data.PhasorData` stub from a session sample row.
 
     Only metadata and paths are restored; maps must be recomputed via Apply.
+    Unlike ``.flimsession`` bundles, ``session.json`` does not embed ``maps.npz``.
 
     Args:
         row: One entry from the session ``samples`` list.
@@ -141,6 +164,13 @@ def register_sample_from_session_row(row: dict) -> PhasorData:
 
 def missing_paths_message(session: dict) -> list[str]:
     """Collect sample and reference file paths that no longer exist on disk.
+
+    Since ``session.json`` stores absolute or relative file paths rather
+    than embedding data, a session can only be fully restored if the
+    original sample and reference files are still reachable at those paths;
+    this check is typically run right after :func:`load_session_json` so the
+    GUI can warn the user and let them re-point missing files before
+    attempting to reload each sample.
 
     Args:
         session: Parsed session dictionary.
