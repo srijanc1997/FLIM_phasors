@@ -1,9 +1,12 @@
 GUI
 ===
 
-PySide6 application window, processing helpers, and UI extensions.
+PySide6 application window, processing helpers, themes, and UI extensions.
 
 .. automodule:: flim_phasors.gui
+   :members:
+
+.. automodule:: flim_phasors.gui.theme
    :members:
 
 .. automodule:: flim_phasors.gui.processing

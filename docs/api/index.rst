@@ -1,6 +1,8 @@
 API reference
 =============
 
+Full autodoc reference generated from the package Google-style docstrings.
+
 .. toctree::
    :maxdepth: 2
 
