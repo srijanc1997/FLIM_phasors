@@ -138,23 +138,30 @@ class PhasorData:
         """
         return self.real_cal is not None or self._lif_base_real is not None
 
-    def _pixel_size_from_lif_attrs(self, attrs):
-        """Set ``pixel_size_um`` from LIF coordinate steps or raw metadata.
+    def _pixel_size_from_attrs(self, attrs):
+        """Set ``pixel_size_um`` from coordinate steps or raw metadata.
 
-        LIF/XLEF coordinate arrays are stored in micrometers, so the pixel
-        size is simply the spacing between consecutive X coordinate samples
+        Shared by every load path (LIF/XLEF, PTU, Imspector TIFF) since
+        phasorpy's loaders all expose physical pixel spacing the same way:
+        an ``attrs["coords"]`` mapping with ``"X"``/``"Y"`` arrays already in
+        micrometers (LIF/XLEF coordinate arrays directly; PTU via the
+        ``ImgHdr_PixResol`` header tag; Imspector TIFF via the OME-XML
+        ``PhysicalSizeX``/``PhysicalSizeY`` attributes). The pixel size is
+        simply the spacing between consecutive X coordinate samples
         (falling back to Y if X is unavailable, since pixels are assumed
-        square). If neither axis yields a usable step, this falls back to
-        the ``VoxelSizeX``/``VoxelSizeY`` fields embedded in the raw
-        ``flim_rawdata`` block. Mutates ``self.pixel_size_um`` in place and
-        leaves it untouched (default) if no source yields a positive value.
+        square). If neither axis yields a usable step, falls back to the
+        ``VoxelSizeX``/``VoxelSizeY`` fields embedded in a LIF
+        ``flim_rawdata`` block, when present. Mutates ``self.pixel_size_um``
+        in place and leaves it untouched (default) if no source yields a
+        positive value — e.g. files whose acquisition metadata never
+        recorded a pixel size.
 
         Args:
-            attrs: Attribute dict from ``load_lif_phasor_maps`` (coords or
-                ``flim_rawdata`` VoxelSize fields).
+            attrs: Attribute dict with an optional ``"coords"`` mapping of
+                axis arrays and/or a LIF ``"flim_rawdata"`` VoxelSize block.
         """
         coords = attrs.get("coords") or {}
-        # LIF coords are in µm; X step alone is enough when pixels are square.
+        # Coords are in µm; X step alone is enough when pixels are square.
         for ax in ("X", "Y"):
             c = coords.get(ax)
             if c is not None and len(c) > 1:
@@ -204,7 +211,7 @@ class PhasorData:
         self.lif_uses_photon_intensity = bool(attrs.get("uses_photon_intensity", False))
         # Store (width, height) = (X, Y) for GUI layout; arrays remain (Y, X).
         self._shape_hint = (int(mean.shape[1]), int(mean.shape[0]))
-        self._pixel_size_from_lif_attrs(attrs)
+        self._pixel_size_from_attrs(attrs)
         # Base maps keep LAS X calibration/threshold state; Apply re-runs from here.
         self._lif_base_mean = np.asarray(mean, dtype=float)
         self._lif_base_real = np.asarray(real, dtype=float)
@@ -287,13 +294,14 @@ class PhasorData:
         yx = [s for d, s in zip(red.dims, red.shape) if d != "H"]
         shape = tuple(yx) if len(yx) == 2 else (red.shape[0], red.shape[1])
         self._shape_hint = shape
-        attrs = getattr(sig, "attrs", {}) or {}
-        ps = attrs.get("pixel_size") or attrs.get("PixelSize")
-        if ps is not None:
-            try:
-                self.pixel_size_um = float(ps)
-            except (TypeError, ValueError):
-                pass
+        # phasorpy exposes physical pixel spacing via sig.coords['X']/['Y'], not
+        # an attrs['pixel_size'] field — same shape of data the LIF path reads.
+        sig_coords = getattr(sig, "coords", {}) or {}
+        coords = {
+            ax: np.asarray(sig_coords[ax].values)
+            for ax in ("X", "Y") if ax in sig_coords
+        }
+        self._pixel_size_from_attrs({"coords": coords})
         return shape, self.n_channels
 
     def _sample_channel_signal(self):

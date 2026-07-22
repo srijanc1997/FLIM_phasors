@@ -104,6 +104,15 @@ from flim_phasors.gui.theme import (
 )
 
 
+def _signed_or_zero(value: int) -> str:
+    """Format a slider value as "0" at zero, or with an explicit +/- sign otherwise.
+
+    Used for the Brightness/Contrast readout labels so the neutral position
+    reads as a plain "0" instead of the "+0" that ``f"{0:+d}"`` would give.
+    """
+    return "0" if value == 0 else f"{value:+d}"
+
+
 class EnhancementsMixin:
 
     """Mixin supplying MainWindow's "optional" UI features.
@@ -170,12 +179,22 @@ class EnhancementsMixin:
         phasor preview canvas (``self.ref_preview``, a
         :class:`RefPreviewCanvas`); a metadata label (``self.lbl_metadata``)
         that later shows memory/pixel-size/version info; a pixel-size spin box
-        (``self.sp_pixel_um``) used for the optional image scale bar; and a
-        display-options row with "Log photons" and "Auto contrast" checkboxes
+        (``self.sp_pixel_um``, wired to ``_on_pixel_size_changed`` so edits
+        redraw immediately) used for the image scale bar, alongside a "Show
+        scale bar" checkbox (``self.chk_show_scale_bar``, default on) that
+        lets the bar be hidden even when a pixel size is known; a scale-bar
+        row with a length spin box (``self.sp_scalebar_um``, default 10 µm)
+        and a corner combo box (``self.cb_scalebar_loc``: bottom/top ×
+        left/right), both wired to ``refresh_image``; and a display-options
+        row with "Log photons" and "Auto contrast" checkboxes
         (``self.chk_log_display``, ``self.chk_auto_contrast``) both wired to
-        ``refresh_image``. Also appends an Undo/Save cursors/Load cursors button
-        row to ``self.cursor_box`` and an Export table CSV/Copy table button row
-        to ``self.gb_act``. Creates new instance attributes on ``self`` for every
+        ``refresh_image``; and Brightness/Contrast sliders (``self.sl_brightness``,
+        ``self.sl_contrast``, range -100..100, centered on 0 = no change) that
+        adjust the intensity display window on top of whatever Auto
+        contrast/Log photons compute, plus a Reset button that zeros both.
+        Also appends an Undo/Save cursors/Load cursors button row to
+        ``self.cursor_box`` and an Export table CSV/Copy table button row to
+        ``self.gb_act``. Creates new instance attributes on ``self`` for every
         widget it adds; does not remove or reflow any pre-existing widgets.
         """
 
@@ -238,7 +257,21 @@ class EnhancementsMixin:
 
         self.sp_pixel_um.setMinimumWidth(88)
 
-        self.sp_pixel_um.setToolTip("Optional pixel size for scale bar on images (0 = off).")
+        self.sp_pixel_um.setToolTip(
+            "Pixel size in µm — auto-filled from file metadata when available, "
+            "or enter manually (0 = off). Used for the image scale bar.")
+
+        self.sp_pixel_um.valueChanged.connect(self._on_pixel_size_changed)
+
+        self.chk_show_scale_bar = QtWidgets.QCheckBox("Show scale bar")
+
+        self.chk_show_scale_bar.setChecked(True)
+
+        self.chk_show_scale_bar.setToolTip(
+            "Draw a scale bar on the image when pixel size is known "
+            "(length/corner set below).")
+
+        self.chk_show_scale_bar.stateChanged.connect(self.refresh_image)
 
         row_px = QtWidgets.QHBoxLayout()
 
@@ -246,7 +279,51 @@ class EnhancementsMixin:
 
         row_px.addWidget(self.sp_pixel_um)
 
+        row_px.addWidget(self.chk_show_scale_bar)
+
         self.proc_grid.addLayout(row_px, 14, 0, 1, 4)
+
+
+
+        self.sp_scalebar_um = QtWidgets.QDoubleSpinBox()
+
+        self.sp_scalebar_um.setRange(0.1, 1000)
+
+        self.sp_scalebar_um.setDecimals(1)
+
+        self.sp_scalebar_um.setValue(10.0)
+
+        self.sp_scalebar_um.setSuffix(" µm")
+
+        self.sp_scalebar_um.setButtonSymbols(
+
+            QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+
+        self.sp_scalebar_um.setMinimumWidth(70)
+
+        self.sp_scalebar_um.setToolTip("Scale bar length.")
+
+        self.sp_scalebar_um.valueChanged.connect(self.refresh_image)
+
+        self.cb_scalebar_loc = QtWidgets.QComboBox()
+
+        self.cb_scalebar_loc.addItems(
+
+            ["Bottom left", "Bottom right", "Top left", "Top right"])
+
+        self.cb_scalebar_loc.setToolTip("Scale bar corner.")
+
+        self.cb_scalebar_loc.currentIndexChanged.connect(self.refresh_image)
+
+        row_scalebar = QtWidgets.QHBoxLayout()
+
+        row_scalebar.addWidget(QtWidgets.QLabel("Scale bar"))
+
+        row_scalebar.addWidget(self.sp_scalebar_um)
+
+        row_scalebar.addWidget(self.cb_scalebar_loc)
+
+        self.proc_grid.addLayout(row_scalebar, 15, 0, 1, 4)
 
 
 
@@ -266,7 +343,89 @@ class EnhancementsMixin:
 
         row_disp.addWidget(self.chk_auto_contrast)
 
-        self.proc_grid.addLayout(row_disp, 15, 0, 1, 4)
+        self.proc_grid.addLayout(row_disp, 16, 0, 1, 4)
+
+
+
+        _bc_label_width = 62
+
+        lbl_bright = QtWidgets.QLabel("Brightness")
+
+        lbl_bright.setFixedWidth(_bc_label_width)
+
+        self.sl_brightness = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+
+        self.sl_brightness.setRange(-100, 100)
+
+        self.sl_brightness.setValue(0)
+
+        self.sl_brightness.setToolTip("Shift the display window brighter/darker.")
+
+        self.lbl_brightness_val = QtWidgets.QLabel("0")
+
+        self.lbl_brightness_val.setFixedWidth(28)
+
+        self.lbl_brightness_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self.sl_brightness.valueChanged.connect(self._on_brightness_changed)
+
+        row_bright = QtWidgets.QHBoxLayout()
+
+        row_bright.addWidget(lbl_bright)
+
+        row_bright.addWidget(self.sl_brightness)
+
+        row_bright.addWidget(self.lbl_brightness_val)
+
+        self.proc_grid.addLayout(row_bright, 17, 0, 1, 4)
+
+
+
+        lbl_contrast = QtWidgets.QLabel("Contrast")
+
+        lbl_contrast.setFixedWidth(_bc_label_width)
+
+        self.sl_contrast = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+
+        self.sl_contrast.setRange(-100, 100)
+
+        self.sl_contrast.setValue(0)
+
+        self.sl_contrast.setToolTip("Narrow/widen the display window (more/less contrast).")
+
+        self.lbl_contrast_val = QtWidgets.QLabel("0")
+
+        self.lbl_contrast_val.setFixedWidth(28)
+
+        self.lbl_contrast_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self.sl_contrast.valueChanged.connect(self._on_contrast_changed)
+
+        row_contrast = QtWidgets.QHBoxLayout()
+
+        row_contrast.addWidget(lbl_contrast)
+
+        row_contrast.addWidget(self.sl_contrast)
+
+        row_contrast.addWidget(self.lbl_contrast_val)
+
+        self.proc_grid.addLayout(row_contrast, 18, 0, 1, 4)
+
+
+
+        btn_reset_bc = QtWidgets.QPushButton("Reset brightness/contrast")
+
+        btn_reset_bc.setToolTip("Reset brightness and contrast to 0.")
+
+        btn_reset_bc.clicked.connect(self._reset_brightness_contrast)
+
+        row_reset = QtWidgets.QHBoxLayout()
+
+        row_reset.addStretch(1)
+
+        row_reset.addWidget(btn_reset_bc)
+
+        self.proc_grid.addLayout(row_reset, 19, 0, 1, 4)
 
 
 
@@ -312,8 +471,60 @@ class EnhancementsMixin:
 
         self.gb_act.layout().addLayout(row_exp)
 
+    def _on_pixel_size_changed(self, _value: float):
+        """Redraw the image and metadata line after the Pixel spin box changes.
 
+        Connected to ``sp_pixel_um.valueChanged``. The spin box has no other
+        listener, so without this the scale bar and the "pixel X µm
+        (manual)" metadata line would only catch up the next time something
+        else happened to trigger a repaint (e.g. Apply) rather than
+        immediately as the user types.
 
+        Args:
+            _value: New spin box value (unused; both refreshed methods read
+                the widget directly).
+        """
+        self.refresh_image()
+        if hasattr(self, "_update_metadata_panel"):
+            self._update_metadata_panel()
+
+    def _on_brightness_changed(self, value: int):
+        """Update the brightness readout label and repaint the image.
+
+        Connected to ``sl_brightness.valueChanged``. The slider's raw -100..100
+        integer is what :meth:`~flim_phasors.gui.main_window.MainWindow._show_base_image`
+        reads (normalized to -1.0..1.0) when building the intensity display
+        window; this handler only updates the adjacent numeric label and
+        triggers a repaint via ``refresh_image``.
+
+        Args:
+            value: New slider value.
+        """
+        self.lbl_brightness_val.setText(_signed_or_zero(value))
+        self.refresh_image()
+
+    def _on_contrast_changed(self, value: int):
+        """Update the contrast readout label and repaint the image.
+
+        Connected to ``sl_contrast.valueChanged``. See
+        :meth:`_on_brightness_changed` for how the slider value is consumed.
+
+        Args:
+            value: New slider value.
+        """
+        self.lbl_contrast_val.setText(_signed_or_zero(value))
+        self.refresh_image()
+
+    def _reset_brightness_contrast(self):
+        """Zero both brightness and contrast sliders, bound to the Reset button.
+
+        Setting ``sl_brightness``/``sl_contrast`` back to 0 fires their
+        ``valueChanged`` signals, which update the readout labels and repaint
+        the image via :meth:`_on_brightness_changed`/:meth:`_on_contrast_changed`,
+        so no separate repaint call is needed here.
+        """
+        self.sl_brightness.setValue(0)
+        self.sl_contrast.setValue(0)
 
 
     def _build_menus(self):

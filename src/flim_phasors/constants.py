@@ -48,10 +48,11 @@ CHANNEL_PRESELECT_MAX = 7
 
 IMAGE_VIEW_ITEMS = (
     "Photons (masked)",
-    "Brightfield (all photons)",
+    "Photon counts",
     "τφ phase (ns)",
     "τmod (ns)",
     "τ normal (ns)",
+    "Segmentation",
 )
 
 CURSOR_SHAPES = ("Circle", "Ellipse")

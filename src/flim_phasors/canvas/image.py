@@ -14,6 +14,67 @@ from matplotlib.patches import Rectangle
 from PySide6.QtCore import Signal
 
 
+def _adjust_window(lo: float, hi: float, brightness: float, contrast: float) -> tuple[float, float]:
+    """Shift/scale a display window by brightness and contrast amounts.
+
+    Shared by :meth:`ImageCanvas.show_intensity` (applied to the grayscale
+    ``vmin``/``vmax`` clim) and :meth:`ImageCanvas.show_overlay`/
+    :meth:`~ImageCanvas.update_overlay` (applied to the normalized ``[0, 1]``
+    RGB range of a pseudo-color segmentation overlay), so both views respond
+    to the same Brightness/Contrast sliders identically.
+
+    Args:
+        lo: Lower bound of the window before adjustment.
+        hi: Upper bound of the window before adjustment.
+        brightness: Shifts the window's center, as a fraction of its own
+            (post-contrast) half-width. ``0`` leaves it unchanged.
+        contrast: Scales the window's width by ``10 ** -contrast``. ``0``
+            leaves it unchanged; positive narrows (more contrast), negative
+            widens (less contrast).
+
+    Returns:
+        Adjusted ``(lo, hi)``; unchanged if both ``brightness`` and
+        ``contrast`` are falsy.
+    """
+    if not brightness and not contrast:
+        return lo, hi
+    center = (lo + hi) / 2.0
+    half = (hi - lo) / 2.0 * (10.0 ** (-contrast))
+    center += brightness * half
+    return center - half, center + half
+
+
+def _adjust_rgb(overlay: np.ndarray, brightness: float, contrast: float) -> np.ndarray:
+    """Apply a brightness/contrast window adjustment to an RGB(A) overlay array.
+
+    ``imshow`` ignores ``vmin``/``vmax`` for RGB(A) arrays (unlike the
+    grayscale intensity view), so a pseudo-color segmentation overlay needs
+    its own per-channel remap to respond to the same Brightness/Contrast
+    sliders as :meth:`ImageCanvas.show_intensity`. Reuses :func:`_adjust_window`
+    over the normalized ``[0, 1]`` color range to get an adjusted window,
+    then linearly stretches every RGB channel through it (clipped to
+    ``[0, 1]``). An alpha channel, if present, passes through unchanged —
+    only color, not transparency, should respond to these sliders.
+
+    Args:
+        overlay: RGB or RGBA array with values in ``[0, 1]``.
+        brightness: See :func:`_adjust_window`.
+        contrast: See :func:`_adjust_window`.
+
+    Returns:
+        Adjusted array, or ``overlay`` unchanged if both ``brightness`` and
+        ``contrast`` are falsy.
+    """
+    if not brightness and not contrast:
+        return overlay
+    lo, hi = _adjust_window(0.0, 1.0, brightness, contrast)
+    span = (hi - lo) or 1.0
+    out = np.array(overlay, dtype=float, copy=True)
+    n_color = min(3, out.shape[-1]) if out.ndim else 0
+    out[..., :n_color] = np.clip((out[..., :n_color] - lo) / span, 0.0, 1.0)
+    return out
+
+
 class ImageCanvas(FigureCanvas):
     """Matplotlib canvas for FLIM intensity images and derived scalar maps.
 
@@ -240,12 +301,16 @@ class ImageCanvas(FigureCanvas):
         *,
         log_scale: bool = False,
         auto_contrast: bool = True,
+        brightness: float = 0.0,
+        contrast: float = 0.0,
         title: str | None = None,
     ):
         """Show a photon-count intensity image.
 
         NaN values are masked and shown dark. Contrast limits are derived from
-        finite pixels only. Reuses the existing image artist when possible.
+        finite pixels only, then adjusted by ``brightness``/``contrast`` (see
+        below) before being applied. Reuses the existing image artist when
+        possible.
 
         Args:
             mean: 2-D (or squeezable) intensity array.
@@ -253,6 +318,14 @@ class ImageCanvas(FigureCanvas):
             vmax: Optional upper display limit; auto-computed when ``None``.
             log_scale: When ``True``, apply log10 scaling to positive values.
             auto_contrast: When ``True``, use 2nd–98th percentile for limits.
+            brightness: Shifts the display window's center, as a fraction of
+                its own (post-contrast) half-width. ``0`` leaves it
+                unchanged; ``+1``/``-1`` shift by a full half-width toward
+                brighter/darker.
+            contrast: Scales the display window's width by ``10 ** -contrast``.
+                ``0`` leaves it unchanged; positive values narrow the window
+                (more contrast, more clipping), negative values widen it
+                (less contrast).
             title: Optional axes title.
         """
         arr = np.squeeze(np.asarray(mean, dtype=float))
@@ -280,6 +353,7 @@ class ImageCanvas(FigureCanvas):
             vmax = hi if vmax is None else vmax
         if vmax <= vmin:
             vmax = vmin + 1.0
+        vmin, vmax = _adjust_window(vmin, vmax, brightness, contrast)
         masked = np.ma.masked_invalid(display)
         self._set_or_create_image(
             masked, kind="intensity", cmap="gray", vmin=vmin, vmax=vmax,
@@ -381,20 +455,26 @@ class ImageCanvas(FigureCanvas):
         self._redraw_click_marker()
         self.draw_idle()
 
-    def show_overlay(self, overlay, title=None):
+    def show_overlay(self, overlay, title=None, *, brightness: float = 0.0, contrast: float = 0.0):
         """Display an RGB or RGBA overlay image.
 
         Used for segmentation-mask and lifetime-colored overlays drawn on
-        top of the intensity image. Delegates to
-        :meth:`_set_or_create_image` with ``kind="overlay"`` and no
-        colormap or color limits (the array is expected to already carry
-        RGB/RGBA values), then refreshes the click marker so it remains
-        visible above the new overlay.
+        top of the intensity image. ``brightness``/``contrast`` (see
+        :func:`_adjust_window`) are applied to the RGB channels via
+        :func:`_adjust_rgb` before display, since ``imshow`` has no
+        vmin/vmax-style adjustment for RGB(A) arrays the way it does for the
+        grayscale intensity view. Delegates to :meth:`_set_or_create_image`
+        with ``kind="overlay"`` and no colormap or color limits, then
+        refreshes the click marker so it remains visible above the new
+        overlay.
 
         Args:
             overlay: Image array accepted by ``Axes.imshow``.
             title: Optional axes title.
+            brightness: Passed to :func:`_adjust_rgb`.
+            contrast: Passed to :func:`_adjust_rgb`.
         """
+        overlay = _adjust_rgb(overlay, brightness, contrast)
         self._set_or_create_image(
             overlay, kind="overlay", cmap=None, vmin=None, vmax=None,
             with_cbar=False, title=title,
@@ -402,7 +482,9 @@ class ImageCanvas(FigureCanvas):
         self._redraw_click_marker()
         self.draw_idle()
 
-    def draw_scale_bar(self, bar_pixels: float, *, label: str = "10 µm"):
+    def draw_scale_bar(
+        self, bar_pixels: float, *, label: str = "10 µm", location: str = "bottom left",
+    ):
         """Draw a horizontal scale bar on the current image.
 
         Previous scale-bar artists are removed first so reuse-based redraws
@@ -410,42 +492,61 @@ class ImageCanvas(FigureCanvas):
 
         Args:
             bar_pixels: Bar width in image pixel units.
-            label: Text shown below the bar.
+            label: Text shown below (or above, near the top) the bar.
+            location: One of ``"bottom left"``, ``"bottom right"``,
+                ``"top left"``, ``"top right"`` — corner of the image the bar
+                is anchored to. The label sits on the side facing away from
+                the corresponding edge (above the bar when anchored to the
+                bottom, below it when anchored to the top) so it never runs
+                off the image.
         """
         if self._im is None:
             return
         self._clear_scale_bar()
         h, w = self._im.get_array().shape[:2]
-        x0 = w * 0.05
-        y0 = h * 0.92
+        margin_x, margin_y, gap = w * 0.05, h * 0.08, h * 0.03
+        bar_h = max(2, h * 0.01)
+        x0 = (w - margin_x - bar_pixels) if "right" in location else margin_x
+        if "top" in location:
+            y0 = margin_y
+            text_y, va = y0 + bar_h + gap, "bottom"
+        else:
+            y0 = h - margin_y
+            text_y, va = y0 - gap, "top"
         rect = Rectangle(
-            (x0, y0), bar_pixels, max(2, h * 0.01),
+            (x0, y0), bar_pixels, bar_h,
             fc="white", ec="black", lw=0.8)
         self.ax.add_patch(rect)
         txt = self.ax.text(
-            x0 + bar_pixels / 2, y0 - h * 0.03, label, color="white",
-            ha="center", va="top", fontsize=8,
+            x0 + bar_pixels / 2, text_y, label, color="white",
+            ha="center", va=va, fontsize=8,
             bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.6))
         self._scale_artists = [rect, txt]
         self.draw_idle()
 
-    def update_overlay(self, overlay, title=None):
+    def update_overlay(self, overlay, title=None, *, brightness: float = 0.0, contrast: float = 0.0):
         """Fast path for live overlay updates via ``AxesImage.set_data``.
 
-        Reuses the existing axes when shape matches; otherwise rebuilds the view.
+        Reuses the existing axes when shape matches; otherwise rebuilds the
+        view. ``brightness``/``contrast`` are applied the same way as in
+        :meth:`show_overlay` (see :func:`_adjust_rgb`); the reuse check runs
+        against the raw, pre-adjustment array since the adjustment never
+        changes its shape.
 
         Args:
             overlay: New overlay array.
             title: Optional title.
+            brightness: Passed to :func:`_adjust_rgb`.
+            contrast: Passed to :func:`_adjust_rgb`.
         """
         # Called on every cursor drag frame — set_data avoids fig.clear when shape is stable.
         if self._can_reuse("overlay", overlay, with_cbar=False):
             self._clear_scale_bar()
-            self._im.set_data(overlay)
+            self._im.set_data(_adjust_rgb(overlay, brightness, contrast))
             if title:
                 self.ax.set_title(title, fontsize=9)
         else:
-            self.show_overlay(overlay, title=title)
+            self.show_overlay(overlay, title=title, brightness=brightness, contrast=contrast)
             return
         self._redraw_click_marker()
         self.draw_idle()

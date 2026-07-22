@@ -85,10 +85,13 @@ def stylesheet_for(theme: str) -> str:
     ``self.setStyleSheet(stylesheet_for(theme))`` to restyle every widget in
     the window at once. The returned string is a single Qt stylesheet covering
     generic widget backgrounds/text, group boxes, buttons (including the
-    ``[primary="true"]`` accent-button variant), combo/spin boxes, tab bars,
-    text edits, the table widget, header sections, scroll bars, and the
-    matplotlib toolbar container — see ``_PHASOR_LAB_DARK_STYLESHEET`` and
-    ``_PHASOR_LAB_LIGHT_STYLESHEET`` for the concrete rule sets.
+    ``[primary="true"]`` accent-button variant), combo/spin boxes, sliders,
+    tab bars, text edits, the table widget, header sections, scroll bars, and
+    the matplotlib toolbar container — see ``_PHASOR_LAB_DARK_STYLESHEET`` and
+    ``_PHASOR_LAB_LIGHT_STYLESHEET`` for the concrete rule sets. The slider
+    rules exist specifically so the Brightness/Contrast sliders pick up the
+    theme's accent color instead of the platform's default (often clashing)
+    highlight color.
 
     Args:
         theme: Theme id, tolerant of legacy/typo'd values via
@@ -232,6 +235,15 @@ _PHASOR_LAB_DARK_STYLESHEET = (
     " background-color: #252a3d; color: #e8eaf0; selection-background-color: #3db8c4;"
     " selection-color: #0d1a1c;"
     " }"
+    "QSlider::groove:horizontal, QSlider::sub-page:horizontal, QSlider::add-page:horizontal {"
+    " height: 4px; background: #252a3d; border: 1px solid #3d4563; border-radius: 2px;"
+    " }"
+    "QSlider::handle:horizontal {"
+    " background: #3db8c4; border: 1px solid #2e9aa5;"
+    " width: 14px; height: 14px; margin: -6px 0; border-radius: 7px;"
+    " }"
+    "QSlider::handle:horizontal:hover { background: #4dcad6; }"
+    "QSlider::handle:horizontal:pressed { background: #2e9aa5; }"
     "QTabBar::tab {"
     " background: #252a3d; color: #a8b0c8; border: 1px solid #3d4563;"
     " padding: 5px 14px; margin-right: 2px; border-bottom: none;"
@@ -287,6 +299,15 @@ _PHASOR_LAB_LIGHT_STYLESHEET = (
     " background-color: #ffffff; color: #1a2a33; selection-background-color: #2a9dad;"
     " selection-color: #ffffff;"
     " }"
+    "QSlider::groove:horizontal, QSlider::sub-page:horizontal, QSlider::add-page:horizontal {"
+    " height: 4px; background: #ffffff; border: 1px solid #b8c5d9; border-radius: 2px;"
+    " }"
+    "QSlider::handle:horizontal {"
+    " background: #2a9dad; border: 1px solid #1f7f8d;"
+    " width: 14px; height: 14px; margin: -6px 0; border-radius: 7px;"
+    " }"
+    "QSlider::handle:horizontal:hover { background: #35b0c0; }"
+    "QSlider::handle:horizontal:pressed { background: #1f7f8d; }"
     "QTabBar::tab {"
     " background: #e8eef5; color: #5a6a7a; border: 1px solid #c8d5e3;"
     " padding: 5px 14px; margin-right: 2px; border-bottom: none;"

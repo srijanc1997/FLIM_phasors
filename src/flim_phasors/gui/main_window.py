@@ -777,7 +777,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.cb_image_view.setToolTip(
             "Pixel maps from Apply settings. "
             "Photons (masked) hides pixels below Min N / invalid phasors; "
-            "Brightfield (all photons) shows the full intensity including filtered-out pixels. "
+            "Photon counts shows the full intensity including filtered-out pixels. "
             "τ maps need Apply. Selecting a view turns Overlay off so the map is visible.")
         self.cb_image_view.currentIndexChanged.connect(self._on_image_view_changed)
         row_img_view.addWidget(self.cb_image_view, 1)
@@ -2350,9 +2350,11 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         frequency/harmonic spinboxes, applies LIF-specific defaults (intensity
         threshold, forcing the image view to the first entry), loads
         per-sample processing settings into the Setup tab controls, updates
-        the frame spinbox range/value, and populates the display-name/group
-        fields and their placeholders. Finishes by syncing table/combo
-        selection to match.
+        the frame spinbox range/value, mirrors the dataset's own
+        ``pixel_size_um`` (auto-detected at load or a prior manual entry)
+        into the Pixel spin box, and populates the display-name/group fields
+        and their placeholders. Finishes by syncing table/combo selection to
+        match.
         """
         d = self.data
         self.lbl_sample.setText(self._compact_filename(d.sample_path, "(no sample)"))
@@ -2398,6 +2400,12 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self.sp_harm.blockSignals(False)
             self.cb_filter.blockSignals(False)
         self._update_frame_control()
+        if hasattr(self, "sp_pixel_um"):
+            # Mirror this sample's own pixel size (auto-detected at load, or a
+            # prior manual entry committed via Apply) into the spin box.
+            self.sp_pixel_um.blockSignals(True)
+            self.sp_pixel_um.setValue(float(getattr(d, "pixel_size_um", 0.0) or 0.0))
+            self.sp_pixel_um.blockSignals(False)
         if hasattr(self, "edit_display_name"):
             self.edit_display_name.blockSignals(True)
             self.edit_display_name.setText((d.display_name or "").strip())
@@ -2513,9 +2521,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._refresh_compare_group_filter()
         self._update_phasor_display()
         # Segmentation masks are stale until Paint; show the fresh base map instead.
-        self.chk_overlay.blockSignals(True)
-        self.chk_overlay.setChecked(False)
-        self.chk_overlay.blockSignals(False)
+        self._sync_segmentation_view(False)
         self.refresh_image()
         if hasattr(self, "_update_metadata_panel"):
             self._update_metadata_panel()
@@ -3365,10 +3371,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         overlay = getattr(d, "last_overlay", None) if d is not None else None
         self.last_overlay = None if overlay is None else np.asarray(overlay).copy()
         self._fill_table()
-        has_overlay = self.last_overlay is not None
-        self.chk_overlay.blockSignals(True)
-        self.chk_overlay.setChecked(has_overlay)
-        self.chk_overlay.blockSignals(False)
+        self._sync_segmentation_view(self.last_overlay is not None)
         self.refresh_image()
 
     def apply_settings_to_all(self):
@@ -3842,9 +3845,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self.last_overlay = None
             self.cluster_stats = []
             self._fill_table()
-            self.chk_overlay.blockSignals(True)
-            self.chk_overlay.setChecked(False)
-            self.chk_overlay.blockSignals(False)
+            self._sync_segmentation_view(False)
             self.refresh_image()
 
     def _on_phasor_key_press(self, event):
@@ -3881,9 +3882,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.cluster_stats = []
         self._clear_segmentation_on_dataset(self.data)
         self._fill_table()
-        self.chk_overlay.blockSignals(True)
-        self.chk_overlay.setChecked(False)
-        self.chk_overlay.blockSignals(False)
+        self._sync_segmentation_view(False)
         self.refresh_image()
         self._log("GMM cleared.")
 
@@ -3998,8 +3997,9 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         scaled by the segmentation intensity image, and either updates the
         existing ``AxesImage`` in place (when the array shape matches, to
         avoid an expensive full figure clear/colorbar rebuild during
-        dragging) or falls back to ``show_overlay``. Also auto-enables the
-        overlay checkbox if it was off.
+        dragging) or falls back to ``show_overlay``. Also auto-selects
+        "Segmentation" (checking `chk_overlay`) if it wasn't already active,
+        via `_sync_segmentation_view`.
         """
         if not self._live_active() or not self.phasor.cursors:
             return
@@ -4011,9 +4011,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
                                intensity=intensity, colors=np.array(colors))
         self.last_overlay = np.clip(np.asarray(overlay), 0, 1)
         if not self.chk_overlay.isChecked():
-            self.chk_overlay.blockSignals(True)
-            self.chk_overlay.setChecked(True)
-            self.chk_overlay.blockSignals(False)
+            self._sync_segmentation_view(True)
         title = f"Segmentation ({self.mode})"
         # Reuse AxesImage when shape matches — avoids fig.clear and colorbar churn during drag.
         arr = None if self.image._im is None else self.image._im.get_array()
@@ -4601,9 +4599,10 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
         Combines the per-cluster boolean masks with `_segmentation_intensity`
         via `pseudo_color`, clips the result to [0, 1], stores it as
-        `self.last_overlay`, checks the "Overlay" toggle, and calls
-        `refresh_image` to draw it. Called by `_compute_cursor` and
-        `_compute_gmm` after they finish aggregating cluster statistics.
+        `self.last_overlay`, switches the view to "Segmentation" via
+        `_sync_segmentation_view`, and calls `refresh_image` to draw it.
+        Called by `_compute_cursor` and `_compute_gmm` after they finish
+        aggregating cluster statistics.
 
         Args:
             masks: Boolean array of shape ``(n_clusters, H, W)`` selecting
@@ -4615,24 +4614,73 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         overlay = pseudo_color(*[masks[k] for k in range(len(masks))],
                                intensity=intensity, colors=np.array(colors))
         self.last_overlay = np.clip(np.asarray(overlay), 0, 1)
-        self.chk_overlay.setChecked(True); self.refresh_image()
+        self._sync_segmentation_view(True)
+        self.refresh_image()
 
     def _on_image_view_changed(self):
-        """Switch the image panel to the selected base view, hiding the overlay.
+        """Switch the image panel to the selected base view.
 
         Connected to the image-view combo box's change signal. Since the
         tau/photon maps and the segmentation overlay share a single
-        `AxesImage` (`self.image`), only one can be visible at a time; this
-        unchecks "Overlay" (without re-triggering its own handler, via
-        `blockSignals`) before calling `refresh_image` to draw the newly
-        selected view.
+        `AxesImage` (`self.image`), only one can be visible at a time;
+        `_sync_segmentation_view` checks/unchecks `chk_overlay` to match
+        whether "Segmentation" is now selected, before `refresh_image` draws
+        the newly selected view.
         """
-        # τ/photon maps and RGB overlay share one AxesImage — only one can be visible.
-        if hasattr(self, "chk_overlay") and self.chk_overlay.isChecked():
-            self.chk_overlay.blockSignals(True)
-            self.chk_overlay.setChecked(False)
-            self.chk_overlay.blockSignals(False)
+        self._sync_segmentation_view(self.cb_image_view.currentText() == "Segmentation")
         self.refresh_image()
+
+    def _sync_segmentation_view(self, show: bool):
+        """Keep `chk_overlay` and the "Segmentation" combo entry in sync.
+
+        Overlay display is driven by `chk_overlay` (see `refresh_image`), but
+        the image-view combo box should always reflect what is actually on
+        screen rather than silently disagreeing with it — previously,
+        painting a GMM/cursor segmentation just checked "Overlay" on top of
+        whatever base view the combo happened to show (typically "Photons
+        (masked)"), so the dropdown kept saying "Photons (masked)" while a
+        completely different image was displayed. Every place that turns the
+        segmentation overlay on or off now goes through this one method
+        instead, so combo and checkbox can never drift apart. Each widget's
+        own change signal is blocked while the other is updated, since
+        callers are responsible for the actual `refresh_image` call
+        afterward (syncing both here and letting each fire its own signal
+        would cause redundant redraws).
+
+        Args:
+            show: True to show segmentation (checks `chk_overlay`, selects
+                "Segmentation" in the combo); False to hide it (unchecks
+                `chk_overlay`, and if the combo was on "Segmentation", moves
+                it back to the first entry so *something* is visible).
+        """
+        self.chk_overlay.blockSignals(True)
+        self.chk_overlay.setChecked(show)
+        self.chk_overlay.blockSignals(False)
+        if not hasattr(self, "cb_image_view"):
+            return
+        self.cb_image_view.blockSignals(True)
+        if show:
+            idx = self.cb_image_view.findText("Segmentation")
+            if idx >= 0:
+                self.cb_image_view.setCurrentIndex(idx)
+        elif self.cb_image_view.currentText() == "Segmentation":
+            self.cb_image_view.setCurrentIndex(0)
+        self.cb_image_view.blockSignals(False)
+
+    def _current_brightness_contrast(self):
+        """Read the Brightness/Contrast sliders, normalized to -1.0..1.0.
+
+        Shared by :meth:`refresh_image` (segmentation overlay) and
+        :meth:`_show_base_image` (grayscale intensity) so both views apply
+        the same adjustment. Falls back to ``(0.0, 0.0)`` (no-op) if the
+        sliders don't exist yet.
+
+        Returns:
+            ``(brightness, contrast)`` tuple.
+        """
+        brightness = self.sl_brightness.value() / 100.0 if hasattr(self, "sl_brightness") else 0.0
+        contrast = self.sl_contrast.value() / 100.0 if hasattr(self, "sl_contrast") else 0.0
+        return brightness, contrast
 
     def refresh_image(self):
         """Redraw the image panel with either the overlay or the base view.
@@ -4643,16 +4691,26 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         existing `AxesImage` via `image.update_overlay` when the array shape
         is unchanged (avoids a full `fig.clear`/colorbar rebuild, which is
         expensive during interactive dragging), falling back to
-        `image.show_overlay` otherwise. When unchecked, delegates to
-        `_show_base_image`.
+        `image.show_overlay` otherwise — both with the current
+        Brightness/Contrast sliders applied via `_current_brightness_contrast`,
+        so segmentation overlays respond to them the same as the base
+        intensity view. Either way, `_draw_scale_bar` is called afterward:
+        drawing an image always clears any existing scale bar (it's in data
+        coordinates tied to the previous image), so the overlay branch has
+        to redraw it too, same as `_show_base_image` already does for the
+        non-overlay views. When unchecked, delegates to `_show_base_image`.
         """
         if self.chk_overlay.isChecked() and self.last_overlay is not None:
             title = f"Segmentation ({self.mode})"
+            brightness, contrast = self._current_brightness_contrast()
             arr = None if self.image._im is None else self.image._im.get_array()
             if arr is not None and tuple(arr.shape) == tuple(self.last_overlay.shape):
-                self.image.update_overlay(self.last_overlay, title=title)
+                self.image.update_overlay(
+                    self.last_overlay, title=title, brightness=brightness, contrast=contrast)
             else:
-                self.image.show_overlay(self.last_overlay, title=title)
+                self.image.show_overlay(
+                    self.last_overlay, title=title, brightness=brightness, contrast=contrast)
+            self._draw_scale_bar()
         else:
             self._show_base_image()
 
@@ -4662,11 +4720,13 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         Reads the image-view combo box (defaulting to the first item if the
         widget does not exist yet) and dispatches to the appropriate
         renderer: photon counts (masked or raw brightfield) via
-        `image.show_intensity` with the log-scale/auto-contrast toggles
-        applied, or one of the tau maps (phase, modulation, normal) via
-        `image.show_map` with a robust 2nd-98th percentile color range from
-        `_robust_range`. Draws the scale bar afterward when a map is shown.
-        No-op if the selected tau source has no data yet.
+        `image.show_intensity` with the log-scale/auto-contrast toggles and
+        the Brightness/Contrast sliders (normalized from their -100..100
+        range to -1.0..1.0) applied, or one of the tau maps (phase,
+        modulation, normal) via `image.show_map` with a robust 2nd-98th
+        percentile color range from `_robust_range`. Draws the scale bar
+        afterward when a map is shown. No-op if the selected tau source has
+        no data yet.
         """
         choice = (
             self.cb_image_view.currentText()
@@ -4679,12 +4739,14 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
                 title = "Photons (masked)"
             else:
                 disp = self.data.intensity_brightfield()
-                title = "Brightfield (all photons)"
+                title = "Photon counts"
             if disp is not None:
                 log_scale = getattr(self, "chk_log_display", None) and self.chk_log_display.isChecked()
                 auto_c = not getattr(self, "chk_auto_contrast", None) or self.chk_auto_contrast.isChecked()
+                brightness, contrast = self._current_brightness_contrast()
                 self.image.show_intensity(
-                    disp, log_scale=log_scale, auto_contrast=auto_c, title=title)
+                    disp, log_scale=log_scale, auto_contrast=auto_c,
+                    brightness=brightness, contrast=contrast, title=title)
                 self._draw_scale_bar()
             return
         tau_sources = {
@@ -4705,23 +4767,36 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._draw_scale_bar()
 
     def _draw_scale_bar(self):
-        """Draw a 10 µm scale bar on the image view if pixel size is known.
+        """Draw a scale bar on the image view if pixel size is known.
 
-        Reads the pixel-size spin box, falling back to the dataset's stored
-        `pixel_size_um` if the spin box is zero/absent. Skips drawing if no
-        pixel size is available, no phasor data exists, or the resulting bar
-        would exceed 40% of the image width (avoids an overly dominant bar
-        on very high-magnification or very narrow images).
+        No-op if the "Show scale bar" checkbox is unchecked. Otherwise reads
+        the pixel-size spin box, falling back to the dataset's stored
+        `pixel_size_um` if the spin box is zero/absent (auto-detected from
+        LIF/XLEF, PTU, or Imspector TIFF acquisition metadata when present).
+        Bar length comes from `sp_scalebar_um` (default 10 µm) and corner
+        placement from `cb_scalebar_loc` (default bottom left), both falling
+        back to their defaults if the widgets don't exist yet. Skips drawing
+        if no pixel size is available, no phasor data exists, or the
+        resulting bar would exceed 40% of the image width (avoids an overly
+        dominant bar on very high-magnification or very narrow images, e.g.
+        after shrinking a too-long manually entered bar length).
         """
+        show = not hasattr(self, "chk_show_scale_bar") or self.chk_show_scale_bar.isChecked()
+        if not show:
+            return
         um = self.sp_pixel_um.value() if hasattr(self, "sp_pixel_um") else 0.0
         if um <= 0 and getattr(self.data, "pixel_size_um", 0) > 0:
             um = self.data.pixel_size_um
         if um > 0 and self.data.real_cal is not None:
             h, w = self.data.real_cal.shape
-            bar_um = 10.0
+            bar_um = self.sp_scalebar_um.value() if hasattr(self, "sp_scalebar_um") else 10.0
+            loc = (
+                self.cb_scalebar_loc.currentText().lower()
+                if hasattr(self, "cb_scalebar_loc") else "bottom left"
+            )
             bar_px = bar_um / um
             if bar_px < w * 0.4:
-                self.image.draw_scale_bar(bar_px, label=f"{bar_um:g} µm")
+                self.image.draw_scale_bar(bar_px, label=f"{bar_um:g} µm", location=loc)
 
     @staticmethod
     def _robust_range(arr):
