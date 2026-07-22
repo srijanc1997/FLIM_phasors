@@ -66,18 +66,28 @@ def select_gmm_clusters_bic(
     k_max: int,
     covariance_type: str = "full",
     random_state: int = 0,
+    max_points: int = 20_000,
 ) -> tuple[int, float]:
     """Choose GMM component count by minimum Bayesian Information Criterion (BIC).
 
     Evaluates sklearn ``GaussianMixture`` models with ``n_components`` from 1
     through ``k_max`` on phasor coordinates (typically stacked g and s values)
-    and returns the count with the lowest BIC.
+    and returns the count with the lowest BIC. When ``X`` has more than
+    ``max_points`` rows, a random (but reproducible, seeded by
+    ``random_state``) subsample is scanned instead of the full pixel set —
+    a full-resolution image can have hundreds of thousands of valid pixels,
+    and fitting up to ``k_max`` separate GMMs on all of them is slow without
+    meaningfully changing which component count wins, since a few thousand
+    points are already enough to estimate cluster structure.
 
     Args:
         X: 2-D array of shape ``(n_pixels, 2)`` with columns ``[g, s]``.
         k_max: Upper bound on the number of clusters to try.
         covariance_type: Sklearn GMM covariance type passed to each fit.
-        random_state: Random seed for reproducible GMM initialization.
+        random_state: Random seed for reproducible GMM initialization and
+            subsampling.
+        max_points: Maximum number of points to scan; larger inputs are
+            randomly subsampled down to this many.
 
     Returns:
         ``(best_n, best_bic)`` where ``best_n`` is the selected component
@@ -89,6 +99,10 @@ def select_gmm_clusters_bic(
     pts = np.asarray(X, dtype=float)
     if pts.ndim != 2 or pts.shape[0] < 2:
         return 1, float("inf")
+    if pts.shape[0] > max_points:
+        rng = np.random.default_rng(random_state)
+        idx = rng.choice(pts.shape[0], size=max_points, replace=False)
+        pts = pts[idx]
     k_hi = max(1, min(int(k_max), int(pts.shape[0])))
     best_n, best_bic = 1, float("inf")
     for n in range(1, k_hi + 1):

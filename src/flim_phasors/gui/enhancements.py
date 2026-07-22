@@ -1225,6 +1225,8 @@ class EnhancementsMixin:
 
         self._settings.setValue("session_dir", os.path.dirname(path))
 
+        self._mark_clean()
+
         self._log(
 
             f"Session bundle loaded ({n} sample{'s' if n != 1 else ''}, "
@@ -1324,6 +1326,8 @@ class EnhancementsMixin:
 
         self._settings.setValue("session_dir", os.path.dirname(path))
 
+        self._mark_clean()
+
         self._log(f"Session JSON loaded from {os.path.basename(path)} — load/decode samples and Apply.")
 
 
@@ -1394,6 +1398,8 @@ class EnhancementsMixin:
             return
 
         self._settings.setValue("session_dir", os.path.dirname(result["path"]))
+
+        self._mark_clean()
 
         self._log(
 

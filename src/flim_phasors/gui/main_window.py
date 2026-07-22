@@ -85,6 +85,10 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
     by :func:`flim_phasors.app.main`.
     """
 
+    # Seeds both the BIC component-count search and the final GMM fit so
+    # repeated fits of the same data are reproducible.
+    _GMM_RANDOM_STATE = 0
+
     def __init__(self):
         """Construct the main window: session state, timers, UI, and enhancements.
 
@@ -104,6 +108,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._settings = QtCore.QSettings("FLIMPhasors", "FLIMPhasorAnalyzer")
         self.data = PhasorData()
         self.datasets = []        # multi-image mode: list of PhasorData
+        self._dirty = False       # unsaved work since the last session save/load
         self._loading_proc_ui = False
         self.active_idx = -1
         self.shared_ref_path = ""
@@ -825,6 +830,53 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             sb.setValue(sb.maximum())
         if update_status and hasattr(self, "status"):
             self.status.showMessage(message)
+
+    def _mark_dirty(self):
+        """Flag that there is unsaved work, so closing the window warns first.
+
+        Called after any action that changes results a user could lose —
+        loading/removing a sample, running Apply, or committing a cursor/GMM
+        edit. Cleared again by :meth:`_mark_clean` once that work is written
+        to disk (session save/export) or a session is freshly opened.
+        """
+        self._dirty = True
+
+    def _mark_clean(self):
+        """Clear the unsaved-work flag after a successful save/export/open."""
+        self._dirty = False
+
+    def closeEvent(self, event):
+        """Warn about unsaved work before the window closes.
+
+        Triggered by the window's close button, Alt+F4, or File → Exit. If
+        there is unsaved work (:attr:`_dirty`), asks whether to save a
+        session bundle first, discard it, or cancel the close. Saving
+        delegates to :meth:`~flim_phasors.gui.enhancements.EnhancementsMixin.save_session`;
+        if that dialog is cancelled or the save fails, the window stays open
+        rather than closing with unsaved work still lost.
+        """
+        if not getattr(self, "_dirty", False):
+            event.accept()
+            return
+        btn = QtWidgets.QMessageBox.question(
+            self, "Unsaved work",
+            "You have unsaved processing, cursor, or GMM results. "
+            "Save a session bundle before closing?",
+            QtWidgets.QMessageBox.StandardButton.Save
+            | QtWidgets.QMessageBox.StandardButton.Discard
+            | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Save,
+        )
+        if btn == QtWidgets.QMessageBox.StandardButton.Cancel:
+            event.ignore()
+            return
+        if btn == QtWidgets.QMessageBox.StandardButton.Save:
+            self.save_session()
+            if getattr(self, "_dirty", False):
+                # Save dialog was cancelled or failed — don't close and lose work.
+                event.ignore()
+                return
+        event.accept()
 
     def _form_row(self, form, label, widget):
         """Add a labelled row and return a (label_widget, field_widget) tuple for show/hide.
@@ -2210,6 +2262,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._init_dataset_proc_settings(d)
         self._apply_lif_dataset_defaults(d)
         self.data = d
+        self._mark_dirty()
         self._restore_ui_for_active()
         if self.chk_multi.isChecked() and refresh_table:
             self._refresh_compare_list()
@@ -3347,18 +3400,31 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
     def remove_image(self):
         """Remove the active sample from the multi-image list.
 
-        Pops the active dataset out of ``self.datasets`` and logs which
-        sample was removed. If the list becomes empty, clears the active
-        index, resets ``self.data`` to a blank dataset, and refreshes the
-        (now empty) sample combo, image panel, and phasor plot so the UI
-        actually returns to a "no sample loaded" state. Otherwise clamps
-        the active index into bounds and activates the resulting sample so
-        the UI always has a valid selection.
+        Asks for confirmation first, since the sample's processing/cursor/GMM
+        state is not recoverable once popped. Pops the active dataset out of
+        ``self.datasets`` and logs which sample was removed. If the list
+        becomes empty, clears the active index, resets ``self.data`` to a
+        blank dataset, and refreshes the (now empty) sample combo, image
+        panel, and phasor plot so the UI actually returns to a "no sample
+        loaded" state. Otherwise clamps the active index into bounds and
+        activates the resulting sample so the UI always has a valid
+        selection.
         """
         if not (0 <= self.active_idx < len(self.datasets)):
             return
         name = dataset_short_label(self.data, self.active_idx)
+        btn = QtWidgets.QMessageBox.question(
+            self, "Remove sample",
+            f"Remove \"{name}\" from the sample list? Its processing, cursors, "
+            "and GMM results will be lost.",
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if btn != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
         self.datasets.pop(self.active_idx)
+        self._mark_dirty()
         self._log(f"Removed sample: {name}")
         if not self.datasets:
             self.active_idx = -1
@@ -3620,6 +3686,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self.last_overlay = None
             self.cluster_stats = []
             self.phasor.clear_gmm()
+        self._mark_dirty()
         self._refresh_views_after_processing()
         if self.ref_calibration.is_active:
             ch = self._ref_channel_for_dataset(self.data)
@@ -4002,6 +4069,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         and repaint the segmentation overlay.
         """
         self._cursor_debounce_timer.stop()
+        self._mark_dirty()
         self._refresh_active_cursor_combo()
         self._sync_radius_slider()
         self._refresh_after_cursor_edit()
@@ -4071,9 +4139,12 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
         Reads valid pixels from the active dataset, optionally runs BIC-based
         component-count selection when "Auto (BIC)" is checked, then fits
-        `fit_phasor_gmm` with the chosen covariance type and sigma. Called
-        from `fit_gmm` and `fit_gmm_all` via `_run_busy` so the GUI stays
-        responsive during the (potentially slow) sklearn fit.
+        `fit_phasor_gmm` with the chosen covariance type and sigma. The final
+        fit is seeded with the same random state as the BIC search
+        (`_GMM_RANDOM_STATE`) so repeated fits of the same data are
+        reproducible rather than landing on a different EM local optimum
+        each time. Called from `fit_gmm` and `fit_gmm_all` via `_run_busy` so
+        the GUI stays responsive during the (potentially slow) sklearn fit.
 
         Returns:
             Tuple ``(fit, n_clusters, sigma)`` where ``fit`` is the ellipse
@@ -4089,12 +4160,14 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             X = np.column_stack([g[m], s[m]])
             n_clusters, best_bic = select_gmm_clusters_bic(
                 X, k_max=self._gmm_k_max(), covariance_type=cov,
+                random_state=self._GMM_RANDOM_STATE,
             )
             self._log(f"GMM auto-selected {n_clusters} components (BIC={best_bic:.0f}).")
         else:
             n_clusters = self._gmm_k_max()
         fit = fit_phasor_gmm(
-            g, s, clusters=n_clusters, sigma=sigma, covariance_type=cov)
+            g, s, clusters=n_clusters, sigma=sigma, covariance_type=cov,
+            random_state=self._GMM_RANDOM_STATE)
         return fit, n_clusters, sigma
 
     def fit_gmm(self):
@@ -4126,6 +4199,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "GMM fit failed", str(e)); return
         self._gmm_fit = fit
+        self._mark_dirty()
         self._log(f"phasorpy GMM: {n_clusters} cluster(s), σ={sigma:.1f}.")
         n = len(self._gmm_fit[0])
         colors = [categorical_rgb(k) for k in range(n)]
@@ -4187,6 +4261,8 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
                 f"GMM on {dataset_short_label(d, i)}: {n_clusters} cluster(s), σ={sigma:.1f}.")
         self.data = saved_data
         self.active_idx = saved_idx
+        if ok:
+            self._mark_dirty()
         self._restore_ui_for_active()
         self._update_phasor_display()
         self._restore_segmentation_from_dataset(self.data)
@@ -4825,6 +4901,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             return
         n = result["n_samples"]
         nf = len(result["files"])
+        self._mark_clean()
         self._log(f"Exported {nf} file(s) for {n} sample(s) → {result['directory']}")
         QtWidgets.QMessageBox.information(
             self,
