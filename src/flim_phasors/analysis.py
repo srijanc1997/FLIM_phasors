@@ -196,3 +196,72 @@ def lifetimes_at_phasor(g, s, frequency_mhz):
     tp, tm = phasor_to_apparent_lifetime(g, s, freq)
     tn = phasor_to_normal_lifetime(g, s, freq)
     return float(tp), float(tm), float(tn)
+
+
+def apply_gmm_to_dataset(
+    d,
+    *,
+    clusters: int = 3,
+    sigma: float = 2.0,
+    covariance_type: str = "full",
+    use_bic: bool = False,
+    random_state: int = 0,
+):
+    """Fit GMM on calibrated maps and stash fit/stats/overlay on ``d``.
+
+    Same labeling/stats path as the GUI's Fit GMM → Paint, without Qt.
+
+    Returns:
+        ``(fit, cluster_stats)``.
+    """
+    from flim_phasors.utils import categorical_name, categorical_rgb
+
+    if getattr(d, "real_cal", None) is None:
+        raise ValueError("No calibrated phasor maps on dataset")
+    valid = d.valid_mask()
+    if int(valid.sum()) < 10:
+        raise ValueError("Not enough valid pixels for GMM")
+    g, s = d.real_cal, d.imag_cal
+    n = max(1, min(12, int(clusters)))
+    cov = str(covariance_type or "full")
+    sig = max(0.5, min(6.0, float(sigma)))
+    if use_bic:
+        X = np.column_stack([g[valid], s[valid]])
+        n, _bic = select_gmm_clusters_bic(
+            X, k_max=n, covariance_type=cov, random_state=random_state)
+    fit = fit_phasor_gmm(
+        g, s, clusters=n, sigma=sig, covariance_type=cov, random_state=random_state)
+    cr, ci, rm, _ri, _ang = fit
+    n_comp = len(cr)
+    labelmap = label_pixels_by_gmm(g, s, cr, ci, rm)
+    masks = np.stack([(labelmap == k) & valid for k in range(n_comp)])
+    colors = [categorical_rgb(k) for k in range(n_comp)]
+    total_valid = max(int(valid.sum()), 1)
+    freq = float(d.work_frequency)
+    stats = []
+    for k in range(n_comp):
+        cg, cs = float(cr[k]), float(ci[k])
+        tp, tm, tn = lifetimes_at_phasor(cg, cs, freq)
+        nk = int(masks[k].sum())
+        stats.append(dict(
+            idx=k + 1, color=colors[k], label=categorical_name(k),
+            tp=tp, tm=tm, tn=tn, g=cg, s=cs, n=nk,
+            area=100.0 * nk / total_valid,
+        ))
+    d.gmm_fit = fit
+    d.cluster_stats = stats
+    try:
+        from phasorpy.cursor import pseudo_color
+
+        intensity = getattr(d, "mean_thr", None)
+        if intensity is None:
+            intensity = getattr(d, "mean_raw", None)
+        overlay = pseudo_color(
+            *[masks[k] for k in range(n_comp)],
+            intensity=intensity,
+            colors=np.array(colors),
+        )
+        d.last_overlay = np.clip(np.asarray(overlay), 0, 1)
+    except Exception:
+        d.last_overlay = None
+    return fit, stats

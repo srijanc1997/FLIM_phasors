@@ -33,6 +33,82 @@ from flim_phasors.utils import (
     effective_reference_path,
     sample_core_metadata,
 )
+from flim_phasors.constants import PHASOR_HIST_BINS, PHASOR_HIST_MAX_POINTS
+
+
+def _phasor_hist_counts(d, *, bins: int = PHASOR_HIST_BINS):
+    """2-D histogram of valid phasor pixels (empty bins → NaN)."""
+    from flim_phasors.canvas.phasor import _subsample_phasor_points
+
+    g, s = d.real_cal, d.imag_cal
+    m = d.valid_mask()
+    if m is None or int(m.sum()) == 0:
+        return (
+            np.full((bins, bins), np.nan),
+            np.linspace(0, 1.05, bins + 1),
+            np.linspace(0, 0.75, bins + 1),
+        )
+    gv, sv = _subsample_phasor_points(g[m].ravel(), s[m].ravel(), PHASOR_HIST_MAX_POINTS)
+    counts, xedges, yedges = np.histogram2d(
+        gv, sv, bins=bins, range=[[0, 1.05], [0, 0.75]])
+    counts = counts.astype(float)
+    counts[counts < 1] = np.nan
+    return counts, xedges, yedges
+
+
+def save_phasor_plot(
+    path: Path,
+    d,
+    *,
+    gmm_fit=None,
+    title: str = "",
+    dpi: int = 200,
+) -> bool:
+    """Save a phasor density PNG (semicircle + cloud; optional GMM ellipses).
+
+    Works headless (no Qt canvas). Returns ``True`` if the file was written.
+    """
+    if getattr(d, "real_cal", None) is None:
+        return False
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Ellipse
+    from phasorpy.lifetime import phasor_semicircle
+
+    fig, ax = plt.subplots(figsize=(5.5, 4.2))
+    try:
+        ax.set_xlabel("g")
+        ax.set_ylabel("s")
+        g_uni, s_uni = phasor_semicircle(201)
+        ax.plot(g_uni, s_uni, "k-", lw=1, alpha=0.6)
+        counts, xedges, yedges = _phasor_hist_counts(d)
+        if np.any(np.isfinite(counts)):
+            ax.pcolormesh(
+                xedges, yedges, counts.T, cmap="turbo", shading="auto", rasterized=True)
+        if gmm_fit is not None:
+            cr, ci, rm, ri, ang = gmm_fit
+            for k in range(len(cr)):
+                color = categorical_rgb(k)
+                ax.add_patch(Ellipse(
+                    (float(cr[k]), float(ci[k])),
+                    2 * float(rm[k]), 2 * float(ri[k]),
+                    angle=float(np.degrees(ang[k])),
+                    fill=False, edgecolor=color, lw=1.5, alpha=0.9,
+                ))
+                ax.plot(float(cr[k]), float(ci[k]), "x", color=color, ms=8, mew=2)
+        ax.set_xlim(0, 1.05)
+        ax.set_ylim(0, 0.75)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(alpha=0.2)
+        if title:
+            ax.set_title(title)
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(path, dpi=dpi, bbox_inches="tight")
+        return True
+    except Exception:
+        return False
+    finally:
+        plt.close(fig)
 
 
 def _safe_name(text: str, max_len: int = 80) -> str:
@@ -683,23 +759,70 @@ def export_sample_maps(sample_dir: Path, d, *, prefix: str | None = None, index:
     return written
 
 
+def export_one_sample(win, out_dir: str | Path, d, index: int) -> dict:
+    """Write one sample's export folder (maps, phasor PNGs, masks, cluster CSV).
+
+    Intended for streaming / low-RAM headless runs: call once per sample, then
+    discard ``d``. Returns metadata rows for the shared summary tables.
+
+    Returns:
+        Dict with ``sample_row``, ``cluster_rows``, ``written`` (paths), ``folder``.
+    """
+    out = Path(out_dir)
+    samples_root = out / "samples"
+    samples_root.mkdir(parents=True, exist_ok=True)
+    written: list[str] = []
+    prefix = _sample_stem(d, index)
+    sub = samples_root / _sample_folder_name(d, index)
+    sub.mkdir(parents=True, exist_ok=True)
+    _clear_dir(sub)
+
+    maps = export_sample_maps(sub, d, prefix=prefix, index=index)
+    written.extend(str(sub / m) for m in maps)
+
+    plain_phasor = sub / f"{prefix}_phasor.png"
+    if save_phasor_plot(plain_phasor, d, gmm_fit=None, title=prefix):
+        written.append(str(plain_phasor))
+    fit = getattr(d, "gmm_fit", None) or getattr(win, "_gmm_fit", None)
+    if fit is not None:
+        gmm_phasor = sub / f"{prefix}_phasor_gmm.png"
+        if save_phasor_plot(gmm_phasor, d, gmm_fit=fit, title=f"{prefix} (GMM)"):
+            written.append(str(gmm_phasor))
+
+    sample_row = sample_metadata_row(win, d, index)
+    stats, masks = cluster_stats_and_masks_for_dataset(win, d, is_active=True)
+    cluster_rows: list[dict] = []
+    if stats:
+        cluster_rows = cluster_rows_for_dataset(win, d, stats)
+        csv_name = f"{prefix}_clusters.csv"
+        write_clusters_csv(sub / csv_name, cluster_rows)
+        written.append(str(sub / csv_name))
+    if masks is not None and masks.size:
+        _export_cluster_masks(sub, masks, written, prefix=prefix)
+    overlay = getattr(d, "last_overlay", None)
+    if overlay is not None:
+        import matplotlib.pyplot as plt
+
+        seg_name = f"{prefix}_segmentation.png"
+        plt.imsave(sub / seg_name, np.clip(np.asarray(overlay), 0, 1))
+        written.append(str(sub / seg_name))
+
+    return {
+        "sample_row": sample_row,
+        "cluster_rows": cluster_rows,
+        "written": written,
+        "folder": str(sub),
+        "prefix": prefix,
+    }
+
+
 def export_analysis_bundle(win, out_dir: str | Path) -> dict:
     """Write a complete FLIM phasor analysis export folder.
 
-    Creates phasor figure exports (PNG/PDF/SVG), active segmentation overlay,
-    per-sample map subfolders (PNG + ``maps.npz`` + masks), CSV tables for all
-    computed samples, optional Excel workbook, session JSON (including GMM and
-    cluster stats), and a README describing contents.
-
-    Args:
-        win: ``MainWindow`` with phasor canvas, cluster stats, and datasets.
-        out_dir: Destination directory (created if missing).
-
-    Returns:
-        Log dict with ``directory``, ``files`` (paths written), and ``n_samples``.
-
-    Raises:
-        ValueError: When no loaded sample is available to export.
+    Creates per-sample subfolders (maps, phasor PNGs ± GMM, masks, cluster CSV),
+    plus shared root tables: ``samples_summary.csv``, ``clusters.csv``, Excel,
+    ``session.json``, and a README. Phasor/segmentation images live only under
+    ``samples/`` (not duplicated at the export root).
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -723,51 +846,26 @@ def export_analysis_bundle(win, out_dir: str | Path) -> dict:
     active = getattr(win, "data", None)
     active_stem = _sample_stem(active, getattr(win, "active_idx", 0) or 0) if active else "session"
 
-    # Phasor plot named for the active sample (overwrite on re-export)
-    if hasattr(win, "phasor") and getattr(win.phasor, "fig", None) is not None:
-        for obsolete in ("phasor_plot.png", "phasor_plot.pdf", "phasor_plot.svg"):
-            old = out / obsolete
-            if old.is_file():
-                try:
-                    old.unlink()
-                except OSError:
-                    pass
-        for ext, fmt in (
-            (f"{active_stem}_phasor.png", "png"),
-            (f"{active_stem}_phasor.pdf", "pdf"),
-            (f"{active_stem}_phasor.svg", "svg"),
-        ):
-            try:
-                p = out / ext
-                kwargs = {"bbox_inches": "tight"}
-                if fmt == "png":
-                    kwargs["dpi"] = 200
-                else:
-                    kwargs["format"] = fmt
-                win.phasor.fig.savefig(p, **kwargs)
-                written.append(str(p))
-            except Exception:
-                pass
-
-    # Active segmentation overlay (root) + per-sample overlays
+    # Stash active overlay onto the dataset so it is written only under samples/
     if hasattr(win, "_stash_segmentation_to_dataset"):
         try:
             win._stash_segmentation_to_dataset(win.data)
         except Exception:
             pass
 
-    if getattr(win, "last_overlay", None) is not None:
-        import matplotlib.pyplot as plt
-
-        old = out / "segmentation_active.png"
+    # Remove obsolete root-level duplicates from older exports
+    for obsolete in (
+        "phasor_plot.png", "phasor_plot.pdf", "phasor_plot.svg",
+        "segmentation_active.png",
+        f"{active_stem}_phasor.png", f"{active_stem}_phasor.pdf", f"{active_stem}_phasor.svg",
+        f"{active_stem}_phasor_gmm.png", f"{active_stem}_segmentation.png",
+    ):
+        old = out / obsolete
         if old.is_file():
             try:
                 old.unlink()
             except OSError:
                 pass
-        seg_path = out / f"{active_stem}_segmentation.png"
-        plt.imsave(seg_path, np.clip(np.asarray(win.last_overlay), 0, 1))
-        written.append(str(seg_path))
 
     # Per-sample subfolders (cleared so re-exports do not accumulate duplicates)
     sample_rows = []
@@ -787,6 +885,19 @@ def export_analysis_bundle(win, out_dir: str | Path) -> dict:
         written.extend(str(sub / m) for m in maps)
 
         is_active = d is active
+
+        # Phasor density without GMM (always) + with GMM ellipses when fitted
+        plain_phasor = sub / f"{prefix}_phasor.png"
+        if save_phasor_plot(plain_phasor, d, gmm_fit=None, title=prefix):
+            written.append(str(plain_phasor))
+        fit = getattr(d, "gmm_fit", None)
+        if fit is None and is_active:
+            fit = getattr(win, "_gmm_fit", None)
+        if fit is not None:
+            gmm_phasor = sub / f"{prefix}_phasor_gmm.png"
+            if save_phasor_plot(gmm_phasor, d, gmm_fit=fit, title=f"{prefix} (GMM)"):
+                written.append(str(gmm_phasor))
+
         stats, masks = cluster_stats_and_masks_for_dataset(win, d, is_active=is_active)
         if stats:
             rows = cluster_rows_for_dataset(win, d, stats)
@@ -797,6 +908,8 @@ def export_analysis_bundle(win, out_dir: str | Path) -> dict:
         if masks is not None and masks.size:
             _export_cluster_masks(sub, masks, written, prefix=prefix)
         overlay = getattr(d, "last_overlay", None)
+        if overlay is None and is_active:
+            overlay = getattr(win, "last_overlay", None)
         if overlay is not None:
             import matplotlib.pyplot as plt
             seg_name = f"{prefix}_segmentation.png"
@@ -843,8 +956,6 @@ def export_analysis_bundle(win, out_dir: str | Path) -> dict:
         f"Generated: {datetime.now().isoformat(timespec='seconds')}\n"
         f"{openpyxl_note}\n"
         "Contents:\n"
-        f"  {active_stem}_phasor.png/.pdf/.svg — phasor plot (active sample)\n"
-        f"  {active_stem}_segmentation.png     — paint overlay (if present)\n"
         "  samples_summary.csv               — metadata for all loaded samples\n"
         "  clusters.csv                      — cluster stats for all samples\n"
         "  analysis.xlsx                     — one workbook for this session\n"
@@ -852,6 +963,9 @@ def export_analysis_bundle(win, out_dir: str | Path) -> dict:
         "  session.json                      — settings, cursors, GMM, stats\n"
         "  samples/<name>/                   — per-sample outputs (cleared &\n"
         "                                      rewritten on each export):\n"
+        "    <file>_phasor.png               — phasor density (no GMM ellipses)\n"
+        "    <file>_phasor_gmm.png           — phasor density + GMM ellipses\n"
+        "    <file>_segmentation.png         — paint / GMM overlay (if present)\n"
         "    <file>_maps.npz                 — quantitative arrays:\n"
         f"                                     {keys_line}\n"
         "    <file>_photons.png              — masked intensity (no colorbar)\n"
