@@ -99,33 +99,6 @@ def reduce_signal(sig, channel):
     return sig
 
 
-def photon_count_from_signal(sig):
-    """Compute per-pixel photon counts from a TCSPC histogram.
-
-    Sums the time-bin axis (``H`` for xarray input, or the last axis for a
-    plain NumPy array) to collapse the full decay curve into a single
-    intensity value per pixel, in raw photon counts (not normalized or
-    scaled). This is the quantity thresholded against the "Min photons"
-    setting during calibration, and the basis for the raw brightfield/photon
-    maps shown in the GUI and export.
-
-    Args:
-        sig: xarray DataArray with ``H`` dimension, or a raw histogram array
-            whose last axis is time bins.
-
-    Returns:
-        2D array of total photon counts per pixel.
-    """
-    if hasattr(sig, "sum") and "H" in getattr(sig, "dims", ()):
-        pc = sig.sum(dim="H")
-        for d in list(pc.dims):
-            if d != "H" and pc.sizes.get(d, 1) == 1:
-                pc = pc.squeeze(d, drop=True)
-        return to_2d(np.asarray(pc.values, dtype=float))
-    arr = np.asarray(sig, dtype=float)
-    return to_2d(np.sum(arr, axis=-1))
-
-
 def dataset_has_sample(d) -> bool:
     """Return whether a dataset holds loadable FLIM or LIF phasor data.
 
@@ -243,3 +216,25 @@ def dataset_display_label(d, index=0):
         Same as :func:`dataset_phasor_legend_label` with group included.
     """
     return dataset_phasor_legend_label(d, index, include_group=True)
+
+
+def effective_reference_path(win, d) -> str:
+    """Resolve the reference FLIM path for a dataset (shared-ref aware)."""
+    if hasattr(win, "_effective_ref_path"):
+        return win._effective_ref_path(d) or ""
+    return getattr(d, "ref_path", None) or ""
+
+
+def sample_core_metadata(d, index: int, *, reference_path: str = "") -> dict:
+    """Shared sample identity / acquisition / reference fields for export and bundles."""
+    return {
+        "label": dataset_display_label(d, index),
+        "display_name": (getattr(d, "display_name", "") or "").strip(),
+        "group": (getattr(d, "group_name", "") or "").strip(),
+        "channel": d.channel,
+        "frequency_MHz": d.frequency,
+        "harmonic": d.harmonic,
+        "work_frequency_MHz": d.work_frequency,
+        "reference_path": reference_path or "",
+        "computed": d.real_cal is not None,
+    }

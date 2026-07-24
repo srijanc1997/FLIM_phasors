@@ -122,22 +122,6 @@ class PhasorData:
         return self.load_sample(
             self.sample_path, frame=frame, load_channel=self.fast_loaded_channel)
 
-    @property
-    def has_loaded_maps(self) -> bool:
-        """Return whether calibrated or base phasor maps are present.
-
-        Covers two distinct sources: a regular sample that has been through
-        Apply/calibration (``real_cal`` set), or a LIF phasor import whose
-        maps were decoded directly from LAS X exports and never needed a raw
-        histogram (``_lif_base_real`` set). Used to decide whether
-        map-dependent UI (phasor plot, export, cluster stats) can be enabled
-        for this dataset.
-
-        Returns:
-            True if ``real_cal`` or LIF base real component is set.
-        """
-        return self.real_cal is not None or self._lif_base_real is not None
-
     def _pixel_size_from_attrs(self, attrs):
         """Set ``pixel_size_um`` from coordinate steps or raw metadata.
 

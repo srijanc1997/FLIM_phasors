@@ -15,31 +15,7 @@ from pathlib import Path
 from flim_phasors.calibration import compute_reference_phasor
 from flim_phasors.data import PhasorData
 from flim_phasors.export_bundle import export_sample_maps
-# export_analysis_bundle  # unused (focused cleanup)
 from flim_phasors.io import is_supported_flim_path
-
-
-# --- unused (focused cleanup): uncomment if needed ---
-# class _BatchWin:
-#     """Minimal stand-in for MainWindow export helpers."""
-#
-#     def __init__(self, args):
-#         self.cb_filter = type("F", (), {"currentText": lambda s: args.filter})()
-#         self.data = PhasorData()
-#         self.datasets = []
-#         self.active_idx = -1
-#         self.cluster_stats = []
-#         self.last_overlay = None
-#         self.mode = ""
-#         self.shared_ref_path = args.reference or ""
-#         self.chk_shared_ref = type("C", (), {"isChecked": lambda s: bool(args.reference)})()
-#         self.ref_calibration = None
-#
-#     def _effective_ref_path(self, d=None):
-#         return self.shared_ref_path or (d.ref_path if d else "")
-#
-#     def _all_datasets(self):
-#         return self.datasets if self.datasets else [self.data]
 
 
 def _collect_paths(folder: Path) -> list[str]:

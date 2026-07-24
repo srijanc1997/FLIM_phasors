@@ -14,6 +14,7 @@ from PySide6.QtCore import Qt
 
 from flim_phasors import __version__
 from flim_phasors.analysis import (
+    cursor_masks_for_dataset,
     fit_phasor_gmm,
     label_pixels_by_gmm,
     lifetimes_at_phasor,
@@ -33,7 +34,6 @@ from flim_phasors.constants import (
     LEGEND_SIZE_MIN,
 )
 from flim_phasors.calibration import ReferenceCalibration, compute_reference_phasor
-from flim_phasors.calibration import clear_calibration_cache
 from flim_phasors.data import PhasorData
 from flim_phasors.io import flim_channel_count, is_supported_flim_path
 from flim_phasors.lif_io import LifPhasorSeries, is_lif_path, list_lif_phasor_series
@@ -67,7 +67,7 @@ try:
 except ImportError:
     HAVE_SKLEARN = False
 
-from phasorpy.cursor import mask_from_circular_cursor, mask_from_elliptic_cursor, pseudo_color
+from phasorpy.cursor import pseudo_color
 
 
 class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
@@ -877,26 +877,6 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
                 event.ignore()
                 return
         event.accept()
-
-    def _form_row(self, form, label, widget):
-        """Add a labelled row and return a (label_widget, field_widget) tuple for show/hide.
-
-        Small helper for building ``QFormLayout`` sections whose rows need to
-        be toggled together later (e.g. showing/hiding a group of options based
-        on filter mode); returning both widgets lets the caller store them in a
-        tuple and call ``setVisible`` on each.
-
-        Args:
-            form: ``QFormLayout`` to append the row to.
-            label: Text for the row's label.
-            widget: Field widget placed next to the label.
-
-        Returns:
-            ``(label_widget, widget)`` pair for later visibility toggling.
-        """
-        lbl = QtWidgets.QLabel(label)
-        form.addRow(lbl, widget)
-        return (lbl, widget)
 
     def _run_busy(self, message: str, fn, *, cancellable: bool = True):
         """Run heavy work off the GUI thread while showing a busy indicator.
@@ -2027,15 +2007,13 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
     def _clear_calibration(self):
         """Reset reference calibration, paths, and per-sample ref assignments.
 
-        Connected to the "Clear cal" button. Clears ``self.ref_calibration``
-        and the module-level reference decode cache, resets the shared
-        reference path/channel count, turns off manual calibration, and clears
-        ``ref_path`` on every dataset via :meth:`_all_datasets` — a full reset
-        so the next Reference… pick starts from a clean slate rather than
-        merging with stale state.
+        Connected to the "Clear cal" button. Clears ``self.ref_calibration``,
+        resets the shared reference path/channel count, turns off manual
+        calibration, and clears ``ref_path`` on every dataset via
+        :meth:`_all_datasets` — a full reset so the next Reference… pick
+        starts from a clean slate rather than merging with stale state.
         """
         self.ref_calibration.clear()
-        clear_calibration_cache()
         self.shared_ref_path = ""
         self.shared_ref_n_channels = 1
         pref_rch = int(self._settings.value("preferred_ref_channel", self.shared_ref_channel))
@@ -4403,42 +4381,11 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         return "—" if not np.isfinite(value) else f"{value:.3f}"
 
     def _cursor_masks_colors(self):
-        """Build boolean pixel masks and colors for the current phasor cursors.
-
-        For each cursor circle/ellipse in `self.phasor.cursors`, computes a
-        per-pixel inclusion mask via `mask_from_elliptic_cursor` (ellipse
-        cursors) or `mask_from_circular_cursor` (circle cursors) over the
-        active dataset's (g, s) maps, intersected with the valid-pixel mask.
-        Used by `_compute_cursor` to aggregate per-cluster statistics and by
-        `_paint` to build the pseudo-color overlay.
-
-        Returns:
-            Tuple ``(masks, colors)`` where ``masks`` is a stacked boolean
-            array of shape ``(n_cursors, H, W)`` and ``colors`` is the list
-            of each cursor's RGB color. Returns ``(None, None)`` if there are
-            no cursors or no phasor data.
-        """
+        """Build boolean pixel masks and colors for the current phasor cursors."""
         cur = self.phasor.cursors
-        if not cur or self.data.real_cal is None:
+        masks = cursor_masks_for_dataset(self.data, cur)
+        if masks is None:
             return None, None
-        g, s = self.data.real_cal, self.data.imag_cal
-        valid = self.data.valid_mask()
-        masks = []
-        for c in cur:
-            if c.get("kind") == "ellipse":
-                mk = mask_from_elliptic_cursor(
-                    g, s, [c["center_real"]], [c["center_imag"]],
-                    radius=[c["radius"]],
-                    radius_minor=[c.get("radius_minor", c["radius"] * 0.65)],
-                    angle=[c.get("angle", 0.0)],
-                )
-            else:
-                mk = mask_from_circular_cursor(
-                    g, s, [c["center_real"]], [c["center_imag"]], radius=[c["radius"]])
-            if mk.ndim == 3:
-                mk = mk[0]
-            masks.append(mk & valid)
-        masks = np.stack(masks)
         return masks, [c["color"] for c in cur]
 
     def _compute_cursor(self):

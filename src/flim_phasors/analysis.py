@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import numpy as np
 from phasorpy.cluster import phasor_cluster_gmm
-from phasorpy.cursor import mask_from_elliptic_cursor
+from phasorpy.cursor import mask_from_circular_cursor, mask_from_elliptic_cursor
 from phasorpy.lifetime import (
     phasor_to_apparent_lifetime,
     phasor_to_normal_lifetime,
@@ -151,58 +151,45 @@ def label_pixels_by_gmm(
     return np.asarray(labels, dtype=int)
 
 
-def masks_from_gmm_ellipses(real, imag, gmm_fit, valid_mask):
-    """Build boolean masks for each GMM ellipse intersected with a valid region.
+def cursor_masks_for_dataset(d, cursors) -> np.ndarray | None:
+    """Boolean masks for phasor cursors on one dataset's calibrated g/s maps.
 
-    Converts fitted ellipse parameters into per-pixel inclusion masks using
-    phasorpy's elliptic cursor geometry, then restricts to ``valid_mask``
-    (e.g. finite, above-threshold pixels).
+    Shared by the GUI and export so circle/ellipse geometry stays identical.
 
     Args:
-        real: Real (g) phasor map.
-        imag: Imaginary (s) phasor map.
-        gmm_fit: Tuple ``(center_real, center_imag, radius_major, radius_minor,
-            angle)`` from ``fit_phasor_gmm``.
-        valid_mask: Boolean mask of pixels eligible for segmentation.
+        d: ``PhasorData`` with calibrated g/s (``real_cal`` / ``imag_cal``).
+        cursors: Iterable of cursor dicts from the phasor canvas.
 
     Returns:
-        Boolean array of shape ``(n_clusters, *spatial_shape)``. Empty leading
-        dimension when no clusters are present.
+        Stacked boolean array ``(n_cursors, H, W)``, or ``None`` if unavailable.
     """
-    cr, ci, rm, ri, ang = gmm_fit
+    if not cursors or getattr(d, "real_cal", None) is None:
+        return None
+    g, s = d.real_cal, d.imag_cal
+    valid = d.valid_mask()
     masks = []
-    for k in range(len(cr)):
-        mk = mask_from_elliptic_cursor(
-            real,
-            imag,
-            [cr[k]],
-            [ci[k]],
-            radius=[rm[k]],
-            radius_minor=[ri[k]],
-            angle=[ang[k]],
-        )
+    for c in cursors:
+        if c.get("kind") == "ellipse":
+            radius_minor = c.get("radius_minor")
+            if radius_minor is None:
+                radius_minor = c["radius"] * 0.65
+            mk = mask_from_elliptic_cursor(
+                g, s, [c["center_real"]], [c["center_imag"]],
+                radius=[c["radius"]],
+                radius_minor=[radius_minor],
+                angle=[c.get("angle", 0.0)],
+            )
+        else:
+            mk = mask_from_circular_cursor(
+                g, s, [c["center_real"]], [c["center_imag"]], radius=[c["radius"]])
         if mk.ndim == 3:
             mk = mk[0]
-        masks.append(mk & valid_mask)
-    return np.stack(masks) if masks else np.zeros((0,) + np.shape(real), dtype=bool)
+        masks.append(mk & valid)
+    return np.stack(masks) if masks else None
 
 
 def lifetimes_at_phasor(g, s, frequency_mhz):
-    """Compute apparent lifetimes at a single phasor coordinate.
-
-    Converts one (g, s) point to the three common FLIM lifetime metrics at the
-    given modulation frequency: phase lifetime τ_φ, modulation lifetime τ_m,
-    and normal (mean) lifetime τ_n.
-
-    Args:
-        g: Real phasor component at the point of interest.
-        s: Imaginary phasor component.
-        frequency_mhz: Laser modulation frequency in MHz (fundamental, not
-            harmonic-scaled).
-
-    Returns:
-        Tuple ``(tau_phi_ns, tau_mod_ns, tau_normal_ns)`` in nanoseconds.
-    """
+    """Return (τ_φ, τ_m, τ_n) in ns for one (g, s) at ``frequency_mhz``."""
     g = float(g)
     s = float(s)
     freq = float(frequency_mhz)

@@ -146,77 +146,34 @@ def apply_processing_settings_to_ui(win, settings: dict) -> None:
         win.cb_channel.blockSignals(False)
 
 
-def processing_params_from_ui(win, d: PhasorData) -> dict:
-    """Build keyword arguments for :meth:`PhasorData.apply_processing` from the UI.
-
-    Reads filter mode, median/pawFLIM parameters, intensity threshold,
-    and harmonic-detection toggle directly from the main window's current
-    widget values (ignoring any per-sample stash), then resolves the
-    active reference calibration and reference file path for ``d``. This
-    is the "single image" / UI-driven path used directly by
-    :func:`processing_params_for_dataset` when per-sample processing is
-    not active.
-
-    Args:
-        win: Main window with current control values.
-        d: Target dataset (used for effective reference path resolution).
-
-    Returns:
-        Dict of kwargs accepted by :meth:`PhasorData.apply_processing`.
-    """
-    mode = win.cb_filter.currentText()
-    ref_path = win._effective_ref_path(d)
+def _apply_kwargs_from_settings(win, d: PhasorData, settings: dict) -> dict:
+    """Map filter/threshold settings (+ live ref) to ``apply_processing`` kwargs."""
     return {
         "ref_calibration": win._active_calibration(),
-        "ref_path": ref_path,
-        "ref_lifetime": win.sp_reflt.value(),
-        "filter_mode": mode,
-        "median_size": win.sp_msize.value(),
-        "median_repeat": win.sp_mrep.value(),
-        "paw_sigma": win.sp_psigma.value(),
-        "paw_levels": win.sp_plevels.value(),
-        "intensity_min": float(win.sp_thr.value()),
-        "detect_harmonics": win.chk_detect_harm.isChecked(),
+        "ref_path": win._effective_ref_path(d),
+        "ref_lifetime": float(settings.get("ref_lifetime", win.sp_reflt.value())),
+        "filter_mode": settings.get("filter_mode", "median"),
+        "median_size": int(settings.get("median_size", win.sp_msize.value())),
+        "median_repeat": int(settings.get("median_repeat", win.sp_mrep.value())),
+        "paw_sigma": float(settings.get("paw_sigma", win.sp_psigma.value())),
+        "paw_levels": int(settings.get("paw_levels", win.sp_plevels.value())),
+        "intensity_min": float(settings.get("intensity_min", win.sp_thr.value())),
+        "detect_harmonics": bool(
+            settings.get("detect_harmonics", win.chk_detect_harm.isChecked())),
     }
 
 
+def processing_params_from_ui(win, d: PhasorData) -> dict:
+    """Build ``apply_processing`` kwargs from the current UI widgets."""
+    return _apply_kwargs_from_settings(win, d, capture_processing_from_ui(win))
+
+
 def processing_params_for_dataset(win, d: PhasorData) -> dict:
-    """Return processing kwargs for a dataset, honoring per-sample stash when active.
-
-    When :func:`per_sample_processing` is true and ``d`` has a non-empty
-    ``processing_settings`` stash, builds kwargs from that stash (falling
-    back field-by-field to current UI values for anything missing);
-    otherwise defers entirely to :func:`processing_params_from_ui`. This
-    lets each dataset in a multi-sample session keep its own filter and
-    harmonic choices while still sharing the currently-active reference
-    calibration.
-
-    Args:
-        win: Main window instance.
-        d: Dataset to process.
-
-    Returns:
-        Dict of kwargs for :meth:`PhasorData.apply_processing`.
-    """
+    """Return processing kwargs for a dataset, honoring per-sample stash when active."""
     if per_sample_processing(win):
         stash = getattr(d, "processing_settings", None) or {}
         if stash:
-            # UI shows the active sample; other rows use their stashed settings when processing.
-            mode = stash.get("filter_mode", "median")
-            ref_path = win._effective_ref_path(d)
-            return {
-                "ref_calibration": win._active_calibration(),
-                "ref_path": ref_path,
-                "ref_lifetime": float(stash.get("ref_lifetime", win.sp_reflt.value())),
-                "filter_mode": mode,
-                "median_size": int(stash.get("median_size", win.sp_msize.value())),
-                "median_repeat": int(stash.get("median_repeat", win.sp_mrep.value())),
-                "paw_sigma": float(stash.get("paw_sigma", win.sp_psigma.value())),
-                "paw_levels": int(stash.get("paw_levels", win.sp_plevels.value())),
-                "intensity_min": float(stash.get("intensity_min", win.sp_thr.value())),
-                "detect_harmonics": bool(
-                    stash.get("detect_harmonics", win.chk_detect_harm.isChecked())),
-            }
+            return _apply_kwargs_from_settings(win, d, stash)
     return processing_params_from_ui(win, d)
 
 

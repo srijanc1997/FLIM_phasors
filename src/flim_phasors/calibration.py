@@ -366,28 +366,3 @@ def compute_reference_phasor(
     else:
         cal.set_maps(rmean, rreal, rimag)
     return cal
-
-
-# Reserved for LRU reuse of compute_reference_phasor; currently unused (see commented getter).
-_CAL_CACHE: dict[tuple, ReferenceCalibration] = {}
-
-
-# --- unused (focused cleanup): uncomment if needed ---
-# def get_cached_reference_phasor(ref_path: str, channel: int, harmonic) -> ReferenceCalibration:
-#     harm_key = tuple(harmonic) if isinstance(harmonic, (list, tuple)) else (int(harmonic),)
-#     import os
-#
-#     key = (os.path.normcase(os.path.abspath(ref_path)), int(channel), harm_key)
-#     if key not in _CAL_CACHE:
-#         _CAL_CACHE[key] = compute_reference_phasor(ref_path, channel, harmonic)
-#     return _CAL_CACHE[key]
-
-
-def clear_calibration_cache():
-    """Clear the in-memory cache of computed ``ReferenceCalibration`` objects.
-
-    ``_CAL_CACHE`` is currently unused (reserved for a future LRU reuse of
-    :func:`compute_reference_phasor`); this function empties it defensively
-    so a stale entry cannot outlive a closed session or reloaded reference.
-    """
-    _CAL_CACHE.clear()

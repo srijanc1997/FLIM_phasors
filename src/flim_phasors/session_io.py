@@ -11,8 +11,6 @@ import os
 from pathlib import Path
 
 from flim_phasors.calibration import ReferenceCalibration
-# from flim_phasors.calibration_io import calibration_from_dict  # unused (focused cleanup)
-# from flim_phasors.cursors_io import load_cursors  # unused (focused cleanup)
 from flim_phasors.data import PhasorData
 
 

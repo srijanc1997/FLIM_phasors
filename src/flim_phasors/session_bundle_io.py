@@ -17,9 +17,10 @@ from typing import Any
 import numpy as np
 
 from flim_phasors import __version__
+from flim_phasors.cursors_io import cursors_to_list
 from flim_phasors.data import PhasorData
 from flim_phasors.gui.processing import PROC_SETTING_KEYS
-from flim_phasors.utils import dataset_display_label
+from flim_phasors.utils import effective_reference_path, sample_core_metadata
 
 BUNDLE_FORMAT = "flim_phasors_session_bundle"
 BUNDLE_VERSION = 1
@@ -134,46 +135,31 @@ def _apply_maps_to_dataset(d: PhasorData, maps: dict[str, np.ndarray]) -> None:
 
 
 def _sample_meta_row(win, d: PhasorData, index: int, maps_file: str) -> dict:
-    """Build one manifest ``samples`` entry for a dataset.
-
-    Gathers acquisition parameters (frequency, harmonic, channel selection),
-    calibration/reference bookkeeping, cached intensity statistics, and the
-    processing-settings stash into a single JSON-serializable row. This row
-    is what :func:`dataset_from_bundle_sample` later reads back to rebuild an
-    equivalent dataset without re-loading the raw histogram file.
-
-    Args:
-        win: Main window used to resolve effective reference paths.
-        d: Dataset being serialized.
-        index: Zero-based sample index in the bundle.
-        maps_file: Relative zip path to the sample's ``maps.npz``.
-
-    Returns:
-        JSON-serializable metadata dict for the manifest.
-    """
-    ref = win._effective_ref_path(d) if hasattr(win, "_effective_ref_path") else d.ref_path
+    """Build one manifest ``samples`` entry for a dataset."""
+    ref = effective_reference_path(win, d)
     st = getattr(d, "_intensity_stats", {}) or {}
     stash = getattr(d, "processing_settings", None) or {}
+    core = sample_core_metadata(d, index, reference_path=ref)
     return {
         "index": index,
-        "label": dataset_display_label(d, index),
+        "label": core["label"],
         "original_sample_path": d.sample_path or "",
-        "display_name": (getattr(d, "display_name", "") or "").strip(),
-        "group": (getattr(d, "group_name", "") or "").strip(),
-        "channel": int(d.channel),
+        "display_name": core["display_name"],
+        "group": core["group"],
+        "channel": int(core["channel"]),
         "n_channels": max(1, int(getattr(d, "n_channels", 1))),
         "frame_index": int(getattr(d, "frame_index", -1)),
-        "frequency_MHz": float(d.frequency),
-        "harmonic": int(d.harmonic),
-        "work_frequency_MHz": float(d.work_frequency),
+        "frequency_MHz": float(core["frequency_MHz"]),
+        "harmonic": int(core["harmonic"]),
+        "work_frequency_MHz": float(core["work_frequency_MHz"]),
         "pixel_size_um": float(getattr(d, "pixel_size_um", 0.0) or 0.0),
-        "reference_path": ref or "",
+        "reference_path": core["reference_path"],
         "reference_channel": int(d.ref_channel) if ref else 0,
         "reference_n_channels": max(1, int(getattr(d, "ref_n_channels", 1))),
         "processing_settings": {k: stash[k] for k in PROC_SETTING_KEYS if k in stash},
         "intensity_stats": dict(st),
         "maps_file": maps_file,
-        "computed": d.real_cal is not None,
+        "computed": core["computed"],
         "gmm_fit": _serialize_gmm_fit(getattr(d, "gmm_fit", None)),
         "cluster_stats": _serialize_cluster_stats(getattr(d, "cluster_stats", None) or []),
     }
@@ -300,19 +286,7 @@ def build_bundle_manifest(win) -> dict:
         d for d in (win._all_datasets() if hasattr(win, "_all_datasets") else [win.data])
         if d.real_cal is not None  # raw histograms are not stored in the zip
     ]
-    cursors = []
-    if hasattr(win, "phasor"):
-        for c in win.phasor.cursors:
-            cursors.append({
-                "kind": c.get("kind", "circle"),
-                "center_real": float(c["center_real"]),
-                "center_imag": float(c["center_imag"]),
-                "radius": float(c["radius"]),
-                "radius_minor": c.get("radius_minor"),
-                "angle": float(c.get("angle", 0.0)),
-                "label": c.get("label", ""),
-                "color": [float(x) for x in c.get("color", ())[:3]] if c.get("color") else None,
-            })
+    cursors = cursors_to_list(list(win.phasor.cursors)) if hasattr(win, "phasor") else []
     try:
         import phasorpy
         pp_ver = getattr(phasorpy, "__version__", "")

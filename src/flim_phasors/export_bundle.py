@@ -18,7 +18,9 @@ from pathlib import Path
 import numpy as np
 
 from flim_phasors import __version__
-from flim_phasors.analysis import label_pixels_by_gmm, lifetimes_at_phasor
+from flim_phasors.analysis import cursor_masks_for_dataset, label_pixels_by_gmm, lifetimes_at_phasor
+from flim_phasors.cursors_io import cursors_to_list
+from flim_phasors.gui.processing import filter_label_for_dataset
 from flim_phasors.session_bundle_io import (
     MAP_KEYS,
     _maps_from_dataset,
@@ -28,35 +30,9 @@ from flim_phasors.session_bundle_io import (
 from flim_phasors.utils import (
     categorical_name,
     categorical_rgb,
-    dataset_display_label,
+    effective_reference_path,
+    sample_core_metadata,
 )
-
-
-def _filter_for_export(win, d) -> str:
-    """Resolve the human-readable filter label for one dataset in the export.
-
-    Prefers the per-sample filter recorded during processing (via
-    :func:`~flim_phasors.gui.processing.filter_label_for_dataset`) so that
-    exports remain accurate for samples with per-sample filter overrides,
-    even if the active combo box currently shows a different sample's
-    setting. Falls back to the live combo box text only if that lookup
-    raises, which keeps export generation from failing outright.
-
-    Args:
-        win: Main window with processing UI state.
-        d: ``PhasorData`` instance for the sample.
-
-    Returns:
-        Filter name string (e.g. ``"median"``); falls back to combo box text.
-    """
-    try:
-        from flim_phasors.gui.processing import filter_label_for_dataset
-        return filter_label_for_dataset(win, d)
-    except Exception:
-        cb = getattr(win, "cb_filter", None)
-        if cb is not None:
-            return cb.currentText()
-        return "median"
 
 
 def _safe_name(text: str, max_len: int = 80) -> str:
@@ -319,7 +295,7 @@ def cluster_rows_for_dataset(win, d, stats):
     """
     rows = []
     # Shared ref checkbox overrides per-sample ref_path when resolving export metadata.
-    ref = win._effective_ref_path(d) if hasattr(win, "_effective_ref_path") else d.ref_path
+    ref = effective_reference_path(win, d)
     ref_base = os.path.basename(ref) if ref else ""
     sample_base = os.path.basename(d.sample_path) if d.sample_path else ""
     group = (getattr(d, "group_name", "") or "").strip()
@@ -340,78 +316,41 @@ def cluster_rows_for_dataset(win, d, stats):
             "harmonic": d.harmonic,
             "sample_channel": d.channel,
             "ref_channel": d.ref_channel if d.ref_path else "",
-            "filter": _filter_for_export(win, d),
+            "filter": filter_label_for_dataset(win, d),
             "reference": ref_base,
         })
     return rows
 
 
 def sample_metadata_row(win, d, index: int) -> dict:
-    """Build one row of sample-level metadata for summary CSV and session JSON.
-
-    Covers acquisition parameters, the effective reference (accounting for
-    the shared-reference override), applied filter, and thresholding
-    statistics used to compute masked-pixel percentages. The same dict shape
-    is reused both as a CSV row (via :func:`write_samples_summary`) and as
-    the ``"samples"`` entries of :func:`build_session_dict`, so its keys
-    double as both column headers and JSON field names.
-
-    Args:
-        win: Main window for shared reference and filter state.
-        d: ``PhasorData`` instance.
-        index: Zero-based sample index.
-
-    Returns:
-        Dict with paths, channels, frequencies, threshold stats, and flags.
-    """
-    ref = win._effective_ref_path(d) if hasattr(win, "_effective_ref_path") else d.ref_path
+    """Build one row of sample-level metadata for summary CSV and session JSON."""
+    ref = effective_reference_path(win, d)
     st = getattr(d, "_intensity_stats", {}) or {}
+    core = sample_core_metadata(d, index, reference_path=ref)
     return {
         "index": index + 1,
-        "label": dataset_display_label(d, index),
+        "label": core["label"],
         "sample_path": d.sample_path,
-        "display_name": (getattr(d, "display_name", "") or "").strip(),
-        "group": (getattr(d, "group_name", "") or "").strip(),
-        "channel": d.channel,
-        "frequency_MHz": d.frequency,
-        "harmonic": d.harmonic,
-        "work_frequency_MHz": d.work_frequency,
-        "reference_path": ref or "",
+        "display_name": core["display_name"],
+        "group": core["group"],
+        "channel": core["channel"],
+        "frequency_MHz": core["frequency_MHz"],
+        "harmonic": core["harmonic"],
+        "work_frequency_MHz": core["work_frequency_MHz"],
+        "reference_path": core["reference_path"],
         "reference_channel": d.ref_channel if ref else "",
-        "filter": _filter_for_export(win, d),
+        "filter": filter_label_for_dataset(win, d),
         "min_photons": st.get("threshold", 0),
         "pixels_total": st.get("n_pixels", ""),
         "pixels_masked": st.get("n_below", ""),
-        "computed": d.real_cal is not None,
+        "computed": core["computed"],
     }
 
 
 def build_session_dict(win) -> dict:
-    """Serialize GUI session state for ``session.json`` in the export bundle.
-
-    Captures app and phasorpy versions, segmentation mode, shared reference
-    settings, manual/scalar calibration g/s, per-sample metadata, active index,
-    phasor cursor geometry, GMM fit, and active cluster statistics.
-
-    Args:
-        win: Main window instance (``MainWindow``).
-
-    Returns:
-        JSON-serializable dictionary describing the exported session.
-    """
+    """Serialize GUI session state for ``session.json`` in the export bundle."""
     datasets = win._all_datasets() if hasattr(win, "_all_datasets") else [win.data]
-    cursors = []
-    if hasattr(win, "phasor"):
-        for c in win.phasor.cursors:
-            cursors.append({
-                "kind": c.get("kind", "circle"),
-                "center_real": c["center_real"],
-                "center_imag": c["center_imag"],
-                "radius": c["radius"],
-                "radius_minor": c.get("radius_minor"),
-                "angle": c.get("angle", 0.0),
-                "label": c.get("label", ""),
-            })
+    cursors = cursors_to_list(list(win.phasor.cursors)) if hasattr(win, "phasor") else []
     try:
         import phasorpy
         pp_ver = getattr(phasorpy, "__version__", "")
@@ -429,7 +368,7 @@ def build_session_dict(win) -> dict:
             "frequency_MHz": win.sp_freq.value(),
             "harmonic": win.sp_harm.value(),
             "reference_lifetime_ns": win.sp_reflt.value(),
-            "filter": _filter_for_export(win, win.data),
+            "filter": filter_label_for_dataset(win, win.data),
             "min_photons": win.sp_thr.value(),
             "harmonic_mask": win.chk_detect_harm.isChecked() if hasattr(win, "chk_detect_harm") else True,
             "reference_path": getattr(win, "shared_ref_path", "") or getattr(win.data, "ref_path", ""),
@@ -454,19 +393,8 @@ def build_session_dict(win) -> dict:
     }
 
 
-def write_clusters_csv(path: Path, rows: list[dict]):
-    """Write cluster statistics rows to a UTF-8 CSV file.
-
-    Column order follows the key order of the first row, so all rows passed
-    in must share the same keys (as produced by
-    :func:`cluster_rows_for_dataset`). This is a no-op when ``rows`` is
-    empty, which lets callers skip writing a ``clusters.csv`` for samples
-    that have no cursors or GMM clusters defined.
-
-    Args:
-        path: Destination ``.csv`` path.
-        rows: Non-empty list of homogeneous row dicts from ``cluster_rows_for_dataset``.
-    """
+def write_dict_csv(path: Path, rows: list[dict]):
+    """Write homogeneous row dicts to a UTF-8 CSV (no-op when ``rows`` is empty)."""
     if not rows:
         return
     fields = list(rows[0].keys())
@@ -474,28 +402,16 @@ def write_clusters_csv(path: Path, rows: list[dict]):
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(rows)
+
+
+def write_clusters_csv(path: Path, rows: list[dict]):
+    """Write cluster statistics rows to a UTF-8 CSV file."""
+    write_dict_csv(path, rows)
 
 
 def write_samples_summary(path: Path, rows: list[dict]):
-    """Write per-sample metadata rows to a UTF-8 CSV summary file.
-
-    Mirrors :func:`write_clusters_csv` but for the one-row-per-sample
-    summary table (acquisition settings, reference info, thresholding
-    stats) rather than per-cluster rows; column order again follows the key
-    order of the first row. Writing is skipped entirely when ``rows`` is
-    empty.
-
-    Args:
-        path: Destination ``samples_summary.csv`` path.
-        rows: Non-empty list of dicts from ``sample_metadata_row``.
-    """
-    if not rows:
-        return
-    fields = list(rows[0].keys())
-    with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        w.writerows(rows)
+    """Write per-sample metadata rows to a UTF-8 CSV summary file."""
+    write_dict_csv(path, rows)
 
 
 def write_excel_bundle(path: Path, win, all_cluster_rows: list[dict], sample_rows: list[dict]):
@@ -524,7 +440,7 @@ def write_excel_bundle(path: Path, win, all_cluster_rows: list[dict], sample_row
         ("Exported (UTC)", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")),
         ("Samples", len(sample_rows)),
         ("Segmentation mode", getattr(win, "mode", "")),
-        ("Filter", _filter_for_export(win, win.data)),
+        ("Filter", filter_label_for_dataset(win, win.data)),
     ]
     for k, v in meta:
         summary.append([k, v])
@@ -561,50 +477,6 @@ def write_excel_bundle(path: Path, win, all_cluster_rows: list[dict], sample_row
                     "solid", fgColor=win._rgb_hex(color))
 
     wb.save(path)
-
-
-def _cursor_masks_for_dataset(d, cursors) -> np.ndarray | None:
-    """Boolean masks for phasor cursors on one dataset.
-
-    Cursor geometry (circular or elliptic) is defined in phasor (g, s)
-    space, so each cursor's mask is computed with ``phasorpy``'s
-    ``mask_from_circular_cursor``/``mask_from_elliptic_cursor`` helpers
-    against the dataset's calibrated ``real_cal``/``imag_cal`` maps, then
-    intersected with the sample's valid-pixel mask (finite g/s that passed
-    the photon threshold) so cursor regions never include masked-out pixels.
-
-    Args:
-        d: ``PhasorData`` with calibrated g/s.
-        cursors: Iterable of cursor dicts from the phasor canvas.
-
-    Returns:
-        Stacked boolean array ``(n_cursors, H, W)``, or ``None`` if unavailable.
-    """
-    from phasorpy.cursor import mask_from_circular_cursor, mask_from_elliptic_cursor
-
-    if not cursors or d.real_cal is None:
-        return None
-    g, s = d.real_cal, d.imag_cal  # cursor masks live in phasor (g, s) space
-    valid = d.valid_mask()
-    masks = []
-    for c in cursors:
-        if c.get("kind") == "ellipse":
-            radius_minor = c.get("radius_minor")
-            if radius_minor is None:
-                radius_minor = c["radius"] * 0.65
-            mk = mask_from_elliptic_cursor(
-                g, s, [c["center_real"]], [c["center_imag"]],
-                radius=[c["radius"]],
-                radius_minor=[radius_minor],
-                angle=[c.get("angle", 0.0)],
-            )
-        else:
-            mk = mask_from_circular_cursor(
-                g, s, [c["center_real"]], [c["center_imag"]], radius=[c["radius"]])
-        if mk.ndim == 3:
-            mk = mk[0]
-        masks.append(mk & valid)  # intersect with thresholded finite g/s pixels
-    return np.stack(masks) if masks else None
 
 
 def cluster_stats_and_masks_for_dataset(win, d, *, is_active: bool = False):
@@ -678,11 +550,11 @@ def cluster_stats_and_masks_for_dataset(win, d, *, is_active: bool = False):
 
     if stored_stats and mode == "cursor":
         cursors = getattr(getattr(win, "phasor", None), "cursors", None) or []
-        masks = _cursor_masks_for_dataset(d, cursors)
+        masks = cursor_masks_for_dataset(d, cursors)
         return stored_stats, masks
 
     cursors = getattr(getattr(win, "phasor", None), "cursors", None) or []
-    masks = _cursor_masks_for_dataset(d, cursors)
+    masks = cursor_masks_for_dataset(d, cursors)
     if masks is None:
         if is_active and getattr(win, "cluster_stats", None):
             return list(win.cluster_stats), None

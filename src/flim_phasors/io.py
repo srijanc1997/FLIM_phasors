@@ -11,42 +11,9 @@ import os
 import numpy as np
 from phasorpy.io import signal_from_imspector_tiff, signal_from_ptu
 
-# --- unused (focused cleanup): uncomment if needed ---
-# Legacy alias — phasor maps only, no full histogram cache
-# def reference_phasor(ref_path: str, channel: int, harmonic):
-#     """Return (mean, real, imag) reference phasor maps (histogram not kept in RAM)."""
-#     from flim_phasors.calibration import get_cached_reference_phasor
-#
-#     cal = get_cached_reference_phasor(ref_path, channel, harmonic)
-#     if cal._maps is None:
-#         raise ValueError(f"No reference phasor for {ref_path}")
-#     return cal._maps
-#
-#
-# def clear_signal_caches():
-#     from flim_phasors.calibration import clear_calibration_cache
-#
-#     clear_calibration_cache()
-#
-#
-# def _cache_key(path: str) -> str:
-#     return os.path.normcase(os.path.abspath(path))
-
 
 def file_extension(path: str) -> str:
-    """Return the lower-case file extension including the leading dot.
-
-    Used throughout this module to branch on file type before attempting to
-    open a file, so unsupported formats can be rejected early (via
-    :func:`is_supported_flim_path`) without depending on case-sensitive
-    comparisons that would otherwise miss e.g. ``.PTU`` on Windows.
-
-    Args:
-        path: File path or name.
-
-    Returns:
-        Extension string, e.g. ``".ptu"`` or ``".tif"``.
-    """
+    """Return the lower-case file extension including the leading dot."""
     return os.path.splitext(path)[1].lower()
 
 
