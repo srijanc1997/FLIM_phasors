@@ -1,0 +1,71 @@
+# Headless GMM batch config for FLIM Phasors 
+#
+# Copy this file and edit your paths:
+#   copy examples\headless_gmm.sample.txt examples\headless_gmm.txt
+#   (examples/headless_gmm.txt is gitignored — keep your real paths there)
+#
+# Run:  flim-phasor-batch examples/headless_gmm.txt
+#   or: python -m flim_phasors.batch_cli examples/headless_gmm.txt
+#
+# Format: key=value  (one per line). Blank lines and # comments are ignored.
+# Booleans: true/false, yes/no, 1/0, on/off
+
+# =============================================================================
+# Paths
+# =============================================================================
+input_folder=C:/path/to/samples
+output_folder=C:/path/to/export_out
+reference=C:/path/to/reference.ptu
+
+# =============================================================================
+# Channels & acquisition
+# =============================================================================
+# channel      — SAMPLE emission channel (0-based), same as GUI "Ch"
+# ref_channel  — REFERENCE emission channel (0-based)
+channel=0
+ref_channel=0
+ref_lifetime=4.0
+harmonic=1
+frequency=80.0
+
+# =============================================================================
+# Choose ONE filter mode (set filter=...)
+# =============================================================================
+# none              → no filter knobs needed
+# median            → use SET A (median_size, median_repeat)
+# gaussian          → use SET A
+# signal median     → use SET A  (filter histogram, then compute phasor)
+# signal gaussian   → use SET A
+# pawflim           → use SET B (paw_sigma, paw_levels); needs: pip install pawflim
+#                     SET A is ignored when filter=pawflim
+#
+filter=median
+
+# --- SET A: median / gaussian / signal median / signal gaussian ---
+# Turn these on (edit values) when filter is one of:
+#   median | gaussian | signal median | signal gaussian
+median_size=3
+median_repeat=1
+
+# --- SET B: pawflim only ---
+# Turn these on when filter=pawflim (SET A above is ignored)
+# Requires optional dependency: pip install "flim-phasors[pawflim]"  or  pip install pawflim
+paw_sigma=2.0
+paw_levels=1
+
+# --- always apply (any filter) ---
+min_photons=30
+detect_harmonics=true
+
+# =============================================================================
+# GMM segmentation
+# =============================================================================
+# gmm=true  → fit GMM + export cluster masks/stats
+# gmm=false → calibrate + export maps only (no clusters)
+gmm=true
+gmm_clusters=3
+gmm_sigma=2.0
+gmm_covariance=full
+gmm_bic=false
+# gmm_covariance: full | tied | diag | spherical
+# gmm_bic=true → auto-pick cluster count by BIC (searches 1..gmm_clusters)

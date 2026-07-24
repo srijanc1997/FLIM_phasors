@@ -45,4 +45,9 @@ CODEBASE.md
 
 # Sphinx build output
 docs/_build/
+# Local scratch notes
 *.txt
+# Committed sample configs only; personal run configs stay local
+!examples/
+!examples/**/*.sample.txt
+examples/headless_gmm.txt
