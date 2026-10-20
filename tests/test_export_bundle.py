@@ -120,6 +120,7 @@ def test_export_analysis_bundle_multi_sample_clusters(tmp_path: Path):
     assert result["n_samples"] == 2
     assert (tmp_path / "clusters.csv").is_file()
     assert (tmp_path / "session.json").is_file()
+    assert not (tmp_path / "s1_session.json").exists()
     assert (tmp_path / "analysis.xlsx").is_file()
     assert not (tmp_path / "analysis_results.xlsx").exists()
     assert (tmp_path / "README_export.txt").is_file()
@@ -129,6 +130,7 @@ def test_export_analysis_bundle_multi_sample_clusters(tmp_path: Path):
     assert "s2.ptu" in text
 
     session = json.loads((tmp_path / "session.json").read_text(encoding="utf-8"))
+    assert len(session["samples"]) == 2
     assert "gmm_fit" in session
     assert "cluster_stats" in session
     assert session["maps_npz_keys"] == list(MAP_KEYS)
@@ -142,9 +144,22 @@ def test_export_analysis_bundle_multi_sample_clusters(tmp_path: Path):
         assert (sub / f"{stem}_brightfield_colorbar.png").is_file()
         assert (sub / f"{stem}_clusters.csv").is_file()
         assert (sub / f"{stem}_mask_01.png").is_file()
+        assert not (sub / f"{stem}_session.json").exists()
         # No leftover unprefixed duplicates
         assert not (sub / "photons.png").exists()
         assert not (sub / "maps.npz").exists()
+
+
+def test_single_image_export_puts_session_beside_the_images(tmp_path: Path):
+    """One sample keeps <file>_session.json in its image folder."""
+    d = _make_dataset("only")
+    win = _fake_win([d])
+    export_analysis_bundle(win, tmp_path)
+    sample_dirs = list((tmp_path / "samples").iterdir())
+    assert len(sample_dirs) == 1
+    assert (sample_dirs[0] / "only_session.json").is_file()
+    assert not (tmp_path / "only_session.json").exists()
+    assert not (tmp_path / "session.json").exists()
 
 
 def test_export_rewrites_same_excel_and_clears_sample_dir(tmp_path: Path):

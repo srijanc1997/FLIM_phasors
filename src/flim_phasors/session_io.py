@@ -149,6 +149,7 @@ def register_sample_from_session_row(row: dict) -> PhasorData:
     d = PhasorData()
     path = row.get("sample_path", "")
     d.sample_path = path
+    d.lif_image_key = str(row.get("lif_image_key") or "")
     d.display_name = (row.get("display_name") or "").strip()
     d.group_name = (row.get("group") or "").strip()
     d.channel = int(row.get("channel", 0))

@@ -30,6 +30,26 @@ from flim_phasors.lif_io import load_lif_phasor_maps
 from flim_phasors.utils import reduce_signal, to_2d
 
 
+def _um_per_pixel(value, *, from_coords: bool = False):
+    """Return a pixel size in micrometers, or None when ``value`` is unusable.
+
+    Coordinate steps from PTU files are in meters. A step below 0.001 is not
+    a real FLIM pixel in micrometers, so those steps are scaled by 1e6.
+    Explicit metadata values are already in micrometers.
+    """
+    try:
+        step = abs(float(value))
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(step) or step <= 0:
+        return None
+    if from_coords and step < 1e-3:
+        step *= 1e6
+    if step > 1000:
+        return None
+    return float(step)
+
+
 class PhasorData:
     """Mutable container for one FLIM sample's histogram or phasor maps.
 
@@ -123,47 +143,47 @@ class PhasorData:
             self.sample_path, frame=frame, load_channel=self.fast_loaded_channel)
 
     def _pixel_size_from_attrs(self, attrs):
-        """Set ``pixel_size_um`` from coordinate steps or raw metadata.
+        """Set ``pixel_size_um`` from file metadata or coordinate spacing.
 
-        Shared by every load path (LIF/XLEF, PTU, Imspector TIFF) since
-        phasorpy's loaders all expose physical pixel spacing the same way:
-        an ``attrs["coords"]`` mapping with ``"X"``/``"Y"`` arrays already in
-        micrometers (LIF/XLEF coordinate arrays directly; PTU via the
-        ``ImgHdr_PixResol`` header tag; Imspector TIFF via the OME-XML
-        ``PhysicalSizeX``/``PhysicalSizeY`` attributes). The pixel size is
-        simply the spacing between consecutive X coordinate samples
-        (falling back to Y if X is unavailable, since pixels are assumed
-        square). If neither axis yields a usable step, falls back to the
-        ``VoxelSizeX``/``VoxelSizeY`` fields embedded in a LIF
-        ``flim_rawdata`` block, when present. Mutates ``self.pixel_size_um``
-        in place and leaves it untouched (default) if no source yields a
-        positive value — e.g. files whose acquisition metadata never
-        recorded a pixel size.
+        Prefers an explicit micrometers-per-pixel value: PicoQuant
+        ``ImgHdr_PixResol``, a ``pixel_resolution`` attribute, or a LIF
+        ``VoxelSize`` field. Otherwise uses the spacing of the X coordinate
+        (then Y). LIF and Imspector coordinates are already in micrometers.
+        PTU coordinates are in meters, so a step smaller than 0.001 is
+        converted from meters to micrometers. Leaves ``pixel_size_um``
+        unchanged when nothing usable is present.
 
         Args:
-            attrs: Attribute dict with an optional ``"coords"`` mapping of
-                axis arrays and/or a LIF ``"flim_rawdata"`` VoxelSize block.
+            attrs: Attribute dict. May include ``coords``, ``ptu_tags``,
+                ``pixel_resolution``, and a LIF ``flim_rawdata`` block.
         """
+        tags = attrs.get("ptu_tags") or {}
+        for value in (
+            tags.get("ImgHdr_PixResol"),
+            attrs.get("pixel_resolution"),
+        ):
+            um = _um_per_pixel(value)
+            if um is not None:
+                self.pixel_size_um = um
+                return
         coords = attrs.get("coords") or {}
-        # Coords are in µm; X step alone is enough when pixels are square.
         for ax in ("X", "Y"):
             c = coords.get(ax)
-            if c is not None and len(c) > 1:
-                try:
-                    step = float(c[1] - c[0])
-                    if step > 0:
-                        self.pixel_size_um = step
-                        return  # stop after first positive axis step
-                except (TypeError, ValueError):
-                    pass
+            if c is None or len(c) < 2:
+                continue
+            try:
+                um = _um_per_pixel(float(c[1] - c[0]), from_coords=True)
+            except (TypeError, ValueError):
+                um = None
+            if um is not None:
+                self.pixel_size_um = um
+                return
         raw = attrs.get("flim_rawdata") or {}
         for key in ("VoxelSizeX", "VoxelSizeY"):
-            if key in raw:
-                try:
-                    self.pixel_size_um = float(raw[key])
-                    return
-                except (TypeError, ValueError):
-                    pass
+            um = _um_per_pixel(raw.get(key))
+            if um is not None:
+                self.pixel_size_um = um
+                return
 
     def load_lif_phasor(self, path, image_key=None, *, channel=0):
         """Load pre-computed phasor maps from a Leica LIF/XLEF file.
@@ -285,7 +305,9 @@ class PhasorData:
             ax: np.asarray(sig_coords[ax].values)
             for ax in ("X", "Y") if ax in sig_coords
         }
-        self._pixel_size_from_attrs({"coords": coords})
+        attrs = dict(getattr(sig, "attrs", {}) or {})
+        attrs["coords"] = coords
+        self._pixel_size_from_attrs(attrs)
         return shape, self.n_channels
 
     def _sample_channel_signal(self):

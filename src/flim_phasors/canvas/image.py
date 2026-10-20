@@ -27,7 +27,9 @@ def _adjust_window(lo: float, hi: float, brightness: float, contrast: float) -> 
         lo: Lower bound of the window before adjustment.
         hi: Upper bound of the window before adjustment.
         brightness: Shifts the window's center, as a fraction of its own
-            (post-contrast) half-width. ``0`` leaves it unchanged.
+            (post-contrast) half-width. ``0`` leaves it unchanged. Positive
+            lowers the window so the same pixels draw brighter; negative
+            raises it so they draw darker.
         contrast: Scales the window's width by ``10 ** -contrast``. ``0``
             leaves it unchanged; positive narrows (more contrast), negative
             widens (less contrast).
@@ -40,7 +42,8 @@ def _adjust_window(lo: float, hi: float, brightness: float, contrast: float) -> 
         return lo, hi
     center = (lo + hi) / 2.0
     half = (hi - lo) / 2.0 * (10.0 ** (-contrast))
-    center += brightness * half
+    # Lowering the window maps the same intensities higher on the colormap.
+    center -= brightness * half
     return center - half, center + half
 
 
@@ -500,28 +503,31 @@ class ImageCanvas(FigureCanvas):
                 bottom, below it when anchored to the top) so it never runs
                 off the image.
         """
-        if self._im is None:
+        if self._im is None or bar_pixels <= 0:
             return
         self._clear_scale_bar()
         h, w = self._im.get_array().shape[:2]
-        margin_x, margin_y, gap = w * 0.05, h * 0.08, h * 0.03
-        bar_h = max(2, h * 0.01)
+        margin_x, margin_y, gap = w * 0.04, h * 0.06, max(2.0, h * 0.015)
+        bar_h = max(1.5, h * 0.006)
+        bar_pixels = min(float(bar_pixels), w - 2 * margin_x)
         x0 = (w - margin_x - bar_pixels) if "right" in location else margin_x
         if "top" in location:
             y0 = margin_y
             text_y, va = y0 + bar_h + gap, "bottom"
         else:
-            y0 = h - margin_y
+            y0 = h - margin_y - bar_h
             text_y, va = y0 - gap, "top"
-        rect = Rectangle(
-            (x0, y0), bar_pixels, bar_h,
-            fc="white", ec="black", lw=0.8)
+        outline = Rectangle(
+            (x0 - 0.6, y0 - 0.6), bar_pixels + 1.2, bar_h + 1.2,
+            fc="black", ec="none")
+        rect = Rectangle((x0, y0), bar_pixels, bar_h, fc="white", ec="none")
+        self.ax.add_patch(outline)
         self.ax.add_patch(rect)
         txt = self.ax.text(
             x0 + bar_pixels / 2, text_y, label, color="white",
             ha="center", va=va, fontsize=8,
-            bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.6))
-        self._scale_artists = [rect, txt]
+            bbox=dict(boxstyle="round,pad=0.15", fc="black", ec="white", lw=0.4, alpha=0.75))
+        self._scale_artists = [outline, rect, txt]
         self.draw_idle()
 
     def update_overlay(self, overlay, title=None, *, brightness: float = 0.0, contrast: float = 0.0):

@@ -147,3 +147,62 @@ def test_load_rejects_missing_manifest(tmp_path):
         raised = True
         assert "manifest" in str(e).lower()
     assert raised
+
+
+def test_session_json_decodes_the_sample_file(tmp_path):
+    """Opening a session JSON reads the PTU so Apply no longer says nothing is loaded."""
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtWidgets
+
+    from flim_phasors.data import PhasorData
+    from flim_phasors.gui.main_window import MainWindow
+    from flim_phasors.utils import dataset_has_sample
+
+    sample = tmp_path / "Chamber2_inlet1.ptu"
+    sample.write_bytes(b"")
+    session_path = tmp_path / "Chamber2_inlet1_session.json"
+    session_path.write_text(
+        json.dumps({
+            "active_sample_index": 0,
+            "samples": [{
+                "sample_path": str(sample),
+                "display_name": "inlet",
+                "channel": 1,
+                "harmonic": 1,
+                "frequency_MHz": 80.0,
+            }],
+            "calibration": {"frequency_MHz": 80.0, "harmonic": 1, "min_photons": 0},
+        }),
+        encoding="utf-8",
+    )
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    win = MainWindow()
+
+    def immediate(_message, fn, **_kwargs):
+        return fn(), 0.0
+
+    def fake_load(self, path, frame=None, load_channel=None):
+        self.sample_path = path
+        self.signal_full = type("Sig", (), {"dims": ()})()
+        self.n_channels = 2
+        self.frequency = 80.0
+        self.channel = 0 if load_channel is None else int(load_channel)
+        return (8, 8), self.n_channels
+
+    original_load = PhasorData.load_sample
+    win._run_busy = immediate
+    win._process_uncalibrated_preview = lambda _datasets: None
+    PhasorData.load_sample = fake_load
+    try:
+        win._open_session_json(str(session_path))
+        app.processEvents()
+        assert dataset_has_sample(win.data)
+        assert win.data.display_name == "inlet"
+        assert win.data.channel == 1
+        assert win.lbl_panel_status.text() != "No sample loaded"
+    finally:
+        PhasorData.load_sample = original_load
+        win._dirty = False
+        win.close()

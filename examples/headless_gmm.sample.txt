@@ -69,3 +69,7 @@ gmm_covariance=full
 gmm_bic=false
 # gmm_covariance: full | tied | diag | spherical
 # gmm_bic=true → auto-pick cluster count by BIC (searches 1..gmm_clusters)
+# separate_clusters=true → also write one color image and one phasor plot per
+# cluster, plus a multi-channel TIFF of raw photon counts for Fiji.
+# Leave false for the usual combined export.
+separate_clusters=false

@@ -36,12 +36,14 @@ from flim_phasors.utils import (
 from flim_phasors.constants import PHASOR_HIST_BINS, PHASOR_HIST_MAX_POINTS
 
 
-def _phasor_hist_counts(d, *, bins: int = PHASOR_HIST_BINS):
+def _phasor_hist_counts(d, *, bins: int = PHASOR_HIST_BINS, mask=None):
     """2-D histogram of valid phasor pixels (empty bins → NaN)."""
     from flim_phasors.canvas.phasor import _subsample_phasor_points
 
     g, s = d.real_cal, d.imag_cal
     m = d.valid_mask()
+    if mask is not None and m is not None and np.shape(mask) == np.shape(m):
+        m = m & np.asarray(mask, dtype=bool)
     if m is None or int(m.sum()) == 0:
         return (
             np.full((bins, bins), np.nan),
@@ -56,6 +58,35 @@ def _phasor_hist_counts(d, *, bins: int = PHASOR_HIST_BINS):
     return counts, xedges, yedges
 
 
+def _masked_phasor_ellipse(g, s):
+    """2-standard-deviation ellipse of the phasor pixels that were saved.
+
+    Returns ``(center, ellipse)``. ``ellipse`` is ``(width, height, angle_deg)``
+    for a matplotlib patch, or None when there are too few points to fit one.
+    The function itself returns None when there are no finite points. The outline
+    follows the saved pixels, which is the cloud in the file, rather than a
+    GMM covariance that can be much larger than those pixels.
+    """
+    g = np.asarray(g, dtype=float).ravel()
+    s = np.asarray(s, dtype=float).ravel()
+    ok = np.isfinite(g) & np.isfinite(s)
+    g, s = g[ok], s[ok]
+    if g.size == 0:
+        return None
+    center = (float(np.mean(g)), float(np.mean(s)))
+    if g.size < 8:
+        return center, None
+    cov = np.cov(np.vstack([g, s]))
+    vals, vecs = np.linalg.eigh(np.atleast_2d(cov))
+    order = np.argsort(vals)[::-1]
+    vals = np.maximum(vals[order], 1e-12)
+    vecs = vecs[:, order]
+    width = 4.0 * float(np.sqrt(vals[0]))
+    height = 4.0 * float(np.sqrt(vals[1]))
+    angle = float(np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0])))
+    return center, (width, height, angle)
+
+
 def save_phasor_plot(
     path: Path,
     d,
@@ -63,14 +94,21 @@ def save_phasor_plot(
     gmm_fit=None,
     title: str = "",
     dpi: int = 200,
+    mask=None,
+    component: int | None = None,
+    cloud_color=None,
 ) -> bool:
     """Save a phasor density PNG (semicircle + cloud; optional GMM ellipses).
 
+    ``mask`` keeps only those pixels (the ones of ``cloud_color`` on the
+    image) and marks their mean. Without a mask, ``gmm_fit`` draws the
+    fitted ellipses.
     Works headless (no Qt canvas). Returns ``True`` if the file was written.
     """
     if getattr(d, "real_cal", None) is None:
         return False
     import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
     from matplotlib.patches import Ellipse
     from phasorpy.lifetime import phasor_semicircle
 
@@ -78,16 +116,39 @@ def save_phasor_plot(
     try:
         ax.set_xlabel("g")
         ax.set_ylabel("s")
+        ax.set_facecolor("white")
         g_uni, s_uni = phasor_semicircle(201)
         ax.plot(g_uni, s_uni, "k-", lw=1, alpha=0.6)
-        counts, xedges, yedges = _phasor_hist_counts(d)
+        counts, xedges, yedges = _phasor_hist_counts(d, mask=mask)
         if np.any(np.isfinite(counts)):
+            cmap = "turbo"
+            if cloud_color is not None:
+                rgb = np.clip(np.asarray(cloud_color[:3], dtype=float), 0, 1)
+                # Same hue as the image. Count only changes how solid the color is.
+                faint = (float(rgb[0]), float(rgb[1]), float(rgb[2]), 0.25)
+                solid = (float(rgb[0]), float(rgb[1]), float(rgb[2]), 1.0)
+                cmap = LinearSegmentedColormap.from_list("cluster", [faint, solid])
+                cmap.set_bad((1, 1, 1, 0))
             ax.pcolormesh(
-                xedges, yedges, counts.T, cmap="turbo", shading="auto", rasterized=True)
-        if gmm_fit is not None:
+                xedges, yedges, counts.T, cmap=cmap, shading="auto", rasterized=True)
+        if mask is not None:
+            # The cloud is the image pixels of this color. No second outline:
+            # a fitted ellipse sits on the dense core and leaves out pixels
+            # that are the same color on the image.
+            valid = d.valid_mask()
+            use = valid & np.asarray(mask, dtype=bool) if valid is not None else np.asarray(mask, dtype=bool)
+            outline = _masked_phasor_ellipse(d.real_cal[use], d.imag_cal[use])
+            color = cloud_color if cloud_color is not None else (0.8, 0.15, 0.15)
+            if outline is not None:
+                center, _ellipse = outline
+                ax.plot(center[0], center[1], "x", color=color, ms=8, mew=2)
+        elif gmm_fit is not None:
             cr, ci, rm, ri, ang = gmm_fit
-            for k in range(len(cr)):
-                color = categorical_rgb(k)
+            indices = range(len(cr)) if component is None else (int(component),)
+            for k in indices:
+                if k < 0 or k >= len(cr):
+                    continue
+                color = cloud_color if cloud_color is not None else categorical_rgb(k)
                 ax.add_patch(Ellipse(
                     (float(cr[k]), float(ci[k])),
                     2 * float(rm[k]), 2 * float(ri[k]),
@@ -193,6 +254,23 @@ def _clear_dir(path: Path) -> None:
                 child.unlink()
             except OSError:
                 pass
+
+
+def _session_json_path(out: Path, stem: str) -> Path:
+    """Return ``<file>_session.json`` and drop a leftover ``session.json``.
+
+    The name comes from the sample file stem so an export is identifiable
+    without opening it. The JSON itself still holds every sample in the run.
+    """
+    name = _safe_name(Path(str(stem or "session")).stem)
+    path = out / f"{name}_session.json"
+    legacy = out / "session.json"
+    if legacy.is_file() and legacy != path:
+        try:
+            legacy.unlink()
+        except OSError:
+            pass
+    return path
 
 
 def _session_excel_path(out: Path) -> Path:
@@ -388,6 +466,7 @@ def cluster_rows_for_dataset(win, d, stats):
             "tau_normal_ns": st["tn"],
             "pixels": st["n"],
             "area_percent": st["area"],
+            "brightness": float(st.get("brightness", 1.0) or 1.0),
             "frequency_MHz": d.work_frequency,
             "harmonic": d.harmonic,
             "sample_channel": d.channel,
@@ -415,6 +494,7 @@ def sample_metadata_row(win, d, index: int) -> dict:
         "work_frequency_MHz": core["work_frequency_MHz"],
         "reference_path": core["reference_path"],
         "reference_channel": d.ref_channel if ref else "",
+        "lif_image_key": getattr(d, "lif_image_key", "") or "",
         "filter": filter_label_for_dataset(win, d),
         "min_photons": st.get("threshold", 0),
         "pixels_total": st.get("n_pixels", ""),
@@ -659,6 +739,148 @@ def cluster_stats_and_masks_for_dataset(win, d, *, is_active: bool = False):
     return stats, masks
 
 
+def separate_clusters_enabled(win) -> bool:
+    """Whether this export should also write one file set per cluster.
+
+    The GUI checkbox is off by default. Headless runs set ``separate_clusters``
+    on the stand-in window.
+    """
+    chk = getattr(win, "chk_separate_clusters", None)
+    if chk is not None and hasattr(chk, "isChecked"):
+        return bool(chk.isChecked())
+    return bool(getattr(win, "separate_clusters", False))
+
+
+def _masks_for_image_colors(overlay, stats, masks):
+    """Masks of the pixels that have each cluster's color on the image.
+
+    Falls back to ``masks`` when no segmentation image was painted.
+    """
+    from flim_phasors.cluster_view import masks_shown_on_image
+
+    if masks is None or not np.size(masks):
+        return masks
+    n = int(np.shape(masks)[0])
+    colors = []
+    for k in range(n):
+        color = (1.0, 0.0, 0.0)
+        if stats is not None and k < len(stats):
+            color = stats[k].get("color") or color
+        colors.append(color)
+    shown = masks_shown_on_image(overlay, colors, masks)
+    return masks if shown is None else shown
+
+
+def _overlay_intensity(d):
+    """Photon image used to color cluster overlays, NaNs replaced with 0."""
+    raw = getattr(d, "mean_thr", None)
+    if raw is None:
+        raw = getattr(d, "mean_raw", None)
+    if raw is None:
+        return None
+    out = np.zeros(np.shape(raw), dtype=np.float32)
+    finite = np.isfinite(raw)
+    out[finite] = np.asarray(raw, dtype=np.float32)[finite]
+    return out
+
+
+TIFF_INSTALL_COMMAND = "pip install tifffile"
+
+
+def _tiff_missing_warning() -> str:
+    """Text shown when the color-image TIFF was skipped because tifffile is missing."""
+    return (
+        "The TIFF of the cluster color images was not written because tifffile "
+        "is not installed. The rest of the export was saved.\n"
+        f"In a terminal:\n{TIFF_INSTALL_COMMAND}"
+    )
+
+
+def _write_cluster_color_tiff(
+    sample_dir: Path, d, masks, stats, written: list[str], *, prefix: str,
+) -> str | None:
+    """Write one TIFF of the cluster color images, one page per color.
+
+    Each page is the same picture as that color on the image: the photon
+    image painted with the cluster color, including its brightness multiplier.
+    Photons, lifetime maps, and phasor plots stay in their own files.
+    Returns a warning string when tifffile is missing, otherwise None.
+    """
+    from flim_phasors.cluster_view import cluster_color_image, cluster_gains
+
+    intensity = _overlay_intensity(d)
+    if intensity is None or masks is None or not np.size(masks):
+        return None
+    try:
+        import tifffile
+    except ImportError:
+        return _tiff_missing_warning()
+    gains = cluster_gains(stats, int(np.shape(masks)[0]))
+    frames = []
+    labels = []
+    for k in range(int(np.shape(masks)[0])):
+        color = (1.0, 0.0, 0.0)
+        label = f"cluster {k + 1}"
+        if stats is not None and k < len(stats):
+            color = stats[k].get("color") or color
+            label = str(stats[k].get("label") or label)
+        image = cluster_color_image(intensity, masks[k], color, gains[k])
+        frames.append((np.clip(image, 0.0, 1.0) * 255.0).round().astype(np.uint8))
+        labels.append(label)
+    stack = np.stack(frames)
+    path = sample_dir / f"{prefix}_colors.tif"
+    tifffile.imwrite(
+        path,
+        stack,
+        photometric="rgb",
+        metadata={"axes": "ZYXS", "Labels": labels},
+    )
+    written.append(str(path))
+    return None
+
+
+def _note_warning(warnings: list[str], note: str | None) -> None:
+    """Keep one copy of an export warning."""
+    if note and note not in warnings:
+        warnings.append(note)
+
+
+def _export_separate_clusters(sample_dir: Path, d, masks, stats, written: list[str], *, prefix: str):
+    """Write per-cluster color PNGs and phasor PNGs.
+
+    Color images use each cluster's brightness multiplier. The same pictures
+    are also stored together in ``<prefix>_colors.tif``.
+    """
+    import matplotlib.pyplot as plt
+
+    from flim_phasors.cluster_view import cluster_color_image, cluster_gains
+
+    intensity = _overlay_intensity(d)
+    if intensity is None or masks is None or not np.size(masks):
+        return
+    gains = cluster_gains(stats, int(masks.shape[0]))
+    for k in range(masks.shape[0]):
+        color = (1.0, 0.0, 0.0)
+        label = f"cluster {k + 1}"
+        if stats is not None and k < len(stats):
+            color = stats[k].get("color") or color
+            label = str(stats[k].get("label") or label)
+        image = cluster_color_image(intensity, masks[k], color, gains[k])
+        name = f"{prefix}_cluster_{k + 1:02d}.png"
+        plt.imsave(sample_dir / name, np.clip(image, 0, 1))
+        written.append(str(sample_dir / name))
+        phasor_name = f"{prefix}_phasor_cluster_{k + 1:02d}.png"
+        n_px = int(np.asarray(masks[k]).sum())
+        if save_phasor_plot(
+            sample_dir / phasor_name,
+            d,
+            title=f"{prefix} — {label} ({n_px} image pixels)",
+            mask=masks[k],
+            cloud_color=color,
+        ):
+            written.append(str(sample_dir / phasor_name))
+
+
 def _export_cluster_masks(
     sample_dir: Path, masks: np.ndarray, written: list[str], *, prefix: str,
 ):
@@ -772,6 +994,7 @@ def export_one_sample(win, out_dir: str | Path, d, index: int) -> dict:
     samples_root = out / "samples"
     samples_root.mkdir(parents=True, exist_ok=True)
     written: list[str] = []
+    warnings: list[str] = []
     prefix = _sample_stem(d, index)
     sub = samples_root / _sample_folder_name(d, index)
     sub.mkdir(parents=True, exist_ok=True)
@@ -797,9 +1020,14 @@ def export_one_sample(win, out_dir: str | Path, d, index: int) -> dict:
         csv_name = f"{prefix}_clusters.csv"
         write_clusters_csv(sub / csv_name, cluster_rows)
         written.append(str(sub / csv_name))
-    if masks is not None and masks.size:
-        _export_cluster_masks(sub, masks, written, prefix=prefix)
     overlay = getattr(d, "last_overlay", None)
+    shown = _masks_for_image_colors(overlay, stats, masks)
+    if shown is not None and np.size(shown):
+        _export_cluster_masks(sub, shown, written, prefix=prefix)
+        _note_warning(warnings, _write_cluster_color_tiff(
+            sub, d, shown, stats, written, prefix=prefix))
+        if separate_clusters_enabled(win):
+            _export_separate_clusters(sub, d, shown, stats, written, prefix=prefix)
     if overlay is not None:
         import matplotlib.pyplot as plt
 
@@ -811,6 +1039,7 @@ def export_one_sample(win, out_dir: str | Path, d, index: int) -> dict:
         "sample_row": sample_row,
         "cluster_rows": cluster_rows,
         "written": written,
+        "warnings": warnings,
         "folder": str(sub),
         "prefix": prefix,
     }
@@ -821,13 +1050,14 @@ def export_analysis_bundle(win, out_dir: str | Path) -> dict:
 
     Creates per-sample subfolders (maps, phasor PNGs ± GMM, masks, cluster CSV),
     plus shared root tables: ``samples_summary.csv``, ``clusters.csv``, Excel,
-    ``session.json``, and a README. Phasor/segmentation images live only under
+    ``session.json`` (several samples) or ``<file>_session.json`` (one sample), and a README. Phasor/segmentation images live only under
     ``samples/`` (not duplicated at the export root).
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     written: list[str] = []
+    warnings: list[str] = []
     datasets = win._all_datasets() if hasattr(win, "_all_datasets") else [win.data]
     datasets = [
         d for d in datasets
@@ -870,6 +1100,7 @@ def export_analysis_bundle(win, out_dir: str | Path) -> dict:
     # Per-sample subfolders (cleared so re-exports do not accumulate duplicates)
     sample_rows = []
     all_cluster_rows: list[dict] = []
+    sample_folders: list[tuple[Path, str]] = []
     samples_root = out / "samples"
     samples_root.mkdir(parents=True, exist_ok=True)
 
@@ -881,6 +1112,7 @@ def export_analysis_bundle(win, out_dir: str | Path) -> dict:
         sub = samples_root / _sample_folder_name(d, i)
         sub.mkdir(parents=True, exist_ok=True)
         _clear_dir(sub)
+        sample_folders.append((sub, prefix))
         maps = export_sample_maps(sub, d, prefix=prefix, index=i)
         written.extend(str(sub / m) for m in maps)
 
@@ -905,11 +1137,16 @@ def export_analysis_bundle(win, out_dir: str | Path) -> dict:
             csv_name = f"{prefix}_clusters.csv"
             write_clusters_csv(sub / csv_name, rows)
             written.append(str(sub / csv_name))
-        if masks is not None and masks.size:
-            _export_cluster_masks(sub, masks, written, prefix=prefix)
         overlay = getattr(d, "last_overlay", None)
         if overlay is None and is_active:
             overlay = getattr(win, "last_overlay", None)
+        shown = _masks_for_image_colors(overlay, stats, masks)
+        if shown is not None and np.size(shown):
+            _export_cluster_masks(sub, shown, written, prefix=prefix)
+            _note_warning(warnings, _write_cluster_color_tiff(
+                sub, d, shown, stats, written, prefix=prefix))
+            if separate_clusters_enabled(win):
+                _export_separate_clusters(sub, d, shown, stats, written, prefix=prefix)
         if overlay is not None:
             import matplotlib.pyplot as plt
             seg_name = f"{prefix}_segmentation.png"
@@ -941,12 +1178,32 @@ def export_analysis_bundle(win, out_dir: str | Path) -> dict:
             "\nNote: Install openpyxl for Excel export: pip install openpyxl\n"
         )
 
-    # Session JSON
-    session_path = out / "session.json"
-    session_path.write_text(
-        json.dumps(build_session_dict(win), indent=2),
-        encoding="utf-8",
-    )
+    # Session JSON, named from the active sample's file name
+    session_stem = active_stem
+    active_path = getattr(active, "sample_path", None) or ""
+    if active_path:
+        session_stem = _safe_name(Path(active_path).stem)
+    session_text = json.dumps(build_session_dict(win), indent=2)
+    if len(sample_folders) == 1:
+        sub, prefix = sample_folders[0]
+        session_path = sub / f"{prefix}_session.json"
+        # A single image keeps the session file with its pictures.
+        root_copy = _session_json_path(out, session_stem)
+        if root_copy.is_file():
+            try:
+                root_copy.unlink()
+            except OSError:
+                pass
+    else:
+        # One file for every sample in this export, separate from the image folders.
+        session_path = out / "session.json"
+        named = out / f"{session_stem}_session.json"
+        if named.is_file():
+            try:
+                named.unlink()
+            except OSError:
+                pass
+    session_path.write_text(session_text, encoding="utf-8")
     written.append(str(session_path))
 
     keys_line = ", ".join(MAP_KEYS)
@@ -960,7 +1217,8 @@ def export_analysis_bundle(win, out_dir: str | Path) -> dict:
         "  clusters.csv                      — cluster stats for all samples\n"
         "  analysis.xlsx                     — one workbook for this session\n"
         "                                      (rewritten on each Export all)\n"
-        "  session.json                      — settings, cursors, GMM, stats\n"
+        "  session.json                     — one shared session when several\n"
+        "                                      samples are exported\n"
         "  samples/<name>/                   — per-sample outputs (cleared &\n"
         "                                      rewritten on each export):\n"
         "    <file>_phasor.png               — phasor density (no GMM ellipses)\n"
@@ -975,9 +1233,21 @@ def export_analysis_bundle(win, out_dir: str | Path) -> dict:
         "    <file>_tau_*_ns.png             — lifetime map (no colorbar)\n"
         "    <file>_tau_*_ns_colorbar.png    — lifetime map + colorbar\n"
         "    <file>_clusters.csv             — cluster table for this sample\n"
-        "    <file>_mask_XX.png              — cursor or GMM masks\n",
+        "    <file>_mask_XX.png              — cursor or GMM masks\n"
+        "    <file>_cluster_XX.png          — one colored cloud (optional)\n"
+        "    <file>_phasor_cluster_XX.png   — phasor plot of the image pixels\n"
+        "                                      of that color (optional)\n"
+        "    <file>_colors.tif              — one TIFF of the cluster color\n"
+        "                                      images, one page per color\n"
+        "    <file>_session.json            — session file when this export\n"
+        "                                      contains only this image\n",
         encoding="utf-8",
     )
     written.append(str(readme))
 
-    return {"directory": str(out), "files": written, "n_samples": len(datasets)}
+    return {
+        "directory": str(out),
+        "files": written,
+        "n_samples": len(datasets),
+        "warnings": warnings,
+    }

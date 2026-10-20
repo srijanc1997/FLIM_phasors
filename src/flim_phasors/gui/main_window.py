@@ -67,7 +67,30 @@ try:
 except ImportError:
     HAVE_SKLEARN = False
 
-from phasorpy.cursor import pseudo_color
+from flim_phasors.cluster_view import cluster_gains, compose_cluster_overlay
+
+
+def _fitted_scale_bar_um(width_px: int, um_per_px: float, requested: float) -> float:
+    """Pick a scale-bar length that stays a modest fraction of the image.
+
+    Keeps ``requested`` when it already spans about 8–35% of the field.
+    Otherwise snaps to a 1-2-5 length near one fifth of the field, so a
+    50 µm bar does not run off a small field of view.
+    """
+    field = float(width_px) * float(um_per_px)
+    if field <= 0 or requested <= 0:
+        return float(requested or 10.0)
+    fraction = requested / field
+    if 0.08 <= fraction <= 0.35:
+        return float(requested)
+    target = field * 0.2
+    exp = int(np.floor(np.log10(target)))
+    base = target / 10 ** exp
+    nice = 1.0 if base < 1.5 else 2.0 if base < 3.5 else 5.0 if base < 7.5 else 10.0
+    snapped = nice * 10 ** exp
+    if snapped > field * 0.35:
+        snapped /= 2.0
+    return float(max(snapped, field * 0.05))
 
 
 class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
@@ -153,7 +176,10 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         main = QtWidgets.QHBoxLayout(central)
 
         _small = "font-size: 10px;"
-        _lbl_file = f"color: gray; {_small}"
+        # background transparent: a local stylesheet replaces the theme sheet,
+        # and without this the label paints an opaque platform color that can
+        # cover the field next to it.
+        _lbl_file = f"color: gray; background: transparent; {_small}"
 
         def _tab_page():
             """Create a scrollable tab page with a top-aligned vertical layout.
@@ -169,7 +195,10 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             """
             scroll = QtWidgets.QScrollArea()
             scroll.setWidgetResizable(True)
-            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            # AsNeeded: if a large OS font makes the form wider than the panel,
+            # the user can still scroll to the clipped controls instead of
+            # losing them off the right edge.
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
             inner = QtWidgets.QWidget()
             lay = QtWidgets.QVBoxLayout(inner)
@@ -205,7 +234,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         btn_sample.clicked.connect(self.choose_sample)
         self.cb_channel = QtWidgets.QComboBox()
         self.cb_channel.addItems([str(i) for i in range(CHANNEL_PRESELECT_MAX + 1)])
-        self.cb_channel.setMinimumWidth(48)
+        self._combo_in_panel(self.cb_channel, min_chars=2)
         pref_ch = 0
         if hasattr(self, "_settings"):
             pref_ch = int(self._settings.value("preferred_sample_channel", 0))
@@ -250,7 +279,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         btn_ref.clicked.connect(self.choose_ref)
         self.cb_ref_channel = QtWidgets.QComboBox()
         self.cb_ref_channel.addItems([str(i) for i in range(CHANNEL_PRESELECT_MAX + 1)])
-        self.cb_ref_channel.setMinimumWidth(48)
+        self._combo_in_panel(self.cb_ref_channel, min_chars=2)
         pref_rch = 0
         if hasattr(self, "_settings"):
             pref_rch = int(self._settings.value("preferred_ref_channel", 0))
@@ -275,16 +304,6 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         io_row.addWidget(sample_col, 1)
         io_row.addWidget(ref_col, 1)
         io_main.addLayout(io_row)
-        self.btn_calibrate = QtWidgets.QPushButton("Recalibrate")
-        self.btn_calibrate.setToolTip(
-            "Optional: reference g/s are computed automatically when you pick a "
-            "reference and when you Apply. Use this to force a re-decode / refresh "
-            "the reference preview without processing samples.")
-        self.btn_calibrate.clicked.connect(self.calibrate_reference)
-        row_cal_io = QtWidgets.QHBoxLayout()
-        row_cal_io.addWidget(self.btn_calibrate)
-        row_cal_io.addStretch(1)
-        io_main.addLayout(row_cal_io)
         self.txt_log = QtWidgets.QPlainTextEdit()
         self.txt_log.setObjectName("activity_log")
         self.txt_log.setReadOnly(True)
@@ -306,11 +325,8 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.cb_sample.setToolTip(
             "Sample shown in the plots and used for Apply below.")
         self.cb_sample.currentIndexChanged.connect(self._on_sample_combo_change)
+        self._combo_in_panel(self.cb_sample, min_chars=12)
         proc_active_l.addWidget(self.cb_sample, 1)
-        self.lbl_proc_active = QtWidgets.QLabel("")
-        self.lbl_proc_active.setStyleSheet(_lbl_file)
-        self.lbl_proc_active.setWordWrap(True)
-        proc_active_l.addWidget(self.lbl_proc_active, 1)
         self._proc_active_row.setVisible(False)
         proc_vl.addWidget(self._proc_active_row)
         self.proc_inner = QtWidgets.QWidget()
@@ -318,6 +334,9 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.proc_grid = prg
         prg.setHorizontalSpacing(6)
         prg.setVerticalSpacing(3)
+        # Value columns take the spare width; label columns stay at their text.
+        prg.setColumnStretch(1, 1)
+        prg.setColumnStretch(3, 1)
         self.sp_harm = QtWidgets.QSpinBox(); self.sp_harm.setRange(1, 8); self.sp_harm.setValue(1)
         self.sp_freq = QtWidgets.QDoubleSpinBox(); self.sp_freq.setRange(1, 1000)
         self.sp_freq.setDecimals(3); self.sp_freq.setValue(80.0); self.sp_freq.setSuffix(" MHz")
@@ -330,6 +349,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.cb_filter.addItems(list(FILTER_MODES))
         self.cb_filter.setCurrentText("median")
         self.cb_filter.currentTextChanged.connect(self.on_filter_change)
+        self._combo_in_panel(self.cb_filter, min_chars=10)
         self.chk_detect_harm = QtWidgets.QCheckBox("Harmonic mask")
         self.chk_detect_harm.setChecked(True)
         self.chk_detect_harm.setToolTip(
@@ -384,24 +404,25 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             "Time index for stacks with a T dimension (-1 = sum all frames). Reloads the active sample.")
         self.sp_frame.valueChanged.connect(self.on_frame_change)
         prg.addWidget(self.sp_frame, 5, 1)
-        for sp in (
-            self.sp_harm, self.sp_msize, self.sp_mrep, self.sp_plevels,
-            self.sp_thr, self.sp_frame,
-        ):
-            self._spin_for_typing(sp, min_width=76)
-        for sp in (self.sp_freq, self.sp_reflt, self.sp_psigma):
-            self._spin_for_typing(sp, min_width=88)
-        self.sp_thr.setMinimumWidth(96)
+        self._spin_for_typing(self.sp_harm, sample="8", min_width=48)
+        self._spin_for_typing(self.sp_freq, sample="1000.000", min_width=96)
+        self._spin_for_typing(self.sp_reflt, sample="100.000", min_width=88)
+        self._spin_for_typing(self.sp_msize, sample="11", min_width=48)
+        self._spin_for_typing(self.sp_mrep, sample="10", min_width=48)
+        self._spin_for_typing(self.sp_psigma, sample="6.00", min_width=56)
+        self._spin_for_typing(self.sp_plevels, sample="6", min_width=48)
+        self._spin_for_typing(self.sp_thr, sample="0000000", min_width=88)
+        self._spin_for_typing(self.sp_frame, sample="all", min_width=56)
         prg.addWidget(self.lbl_photon_range, 6, 0, 1, 4)
         prg.addWidget(QtWidgets.QLabel("Ref g"), 7, 0)
         self.edit_ref_g = QtWidgets.QLineEdit("0")
         self.edit_ref_g.setValidator(QtGui.QDoubleValidator(-0.05, 1.05, 5, self))
-        self.edit_ref_g.setFixedWidth(56)
+        self._fit_control(self.edit_ref_g, "-0.00000", expanding=True)
         prg.addWidget(self.edit_ref_g, 7, 1)
         prg.addWidget(QtWidgets.QLabel("s"), 7, 2)
         self.edit_ref_s = QtWidgets.QLineEdit("0")
         self.edit_ref_s.setValidator(QtGui.QDoubleValidator(-0.05, 1.05, 5, self))
-        self.edit_ref_s.setFixedWidth(56)
+        self._fit_control(self.edit_ref_s, "-0.00000", expanding=True)
         prg.addWidget(self.edit_ref_s, 7, 3)
         self.chk_manual_cal = QtWidgets.QCheckBox("Manual ref phasor")
         self.chk_manual_cal.setToolTip(
@@ -410,7 +431,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.chk_manual_cal.toggled.connect(self._on_manual_cal_toggled)
         prg.addWidget(self.chk_manual_cal, 8, 0, 1, 2)
         self.btn_set_manual_gs = QtWidgets.QPushButton("Set g/s")
-        self.btn_set_manual_gs.setFixedWidth(56)
+        self._fit_control(self.btn_set_manual_gs, "Set g/s", pad=16)
         self.btn_set_manual_gs.setToolTip(
             "Apply the manual g and s values to calibration (updates ref preview). "
             "Then click Apply to preprocess samples.")
@@ -418,7 +439,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.btn_set_manual_gs.setEnabled(False)
         prg.addWidget(self.btn_set_manual_gs, 8, 2)
         btn_clear_cal = QtWidgets.QPushButton("Clear cal")
-        btn_clear_cal.setFixedWidth(64)
+        self._fit_control(btn_clear_cal, "Clear cal", pad=16)
         btn_clear_cal.clicked.connect(self._clear_calibration)
         prg.addWidget(btn_clear_cal, 8, 3)
         self.lbl_cal_display = QtWidgets.QLabel("(uncalibrated — load a reference file)")
@@ -491,7 +512,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.table_compare.cellChanged.connect(self._on_compare_table_changed)
         self.table_compare.itemSelectionChanged.connect(self._on_sample_table_selection)
         self.btn_rmimg = QtWidgets.QPushButton("−")
-        self.btn_rmimg.setFixedWidth(28)
+        self._fit_control(self.btn_rmimg, "−", pad=12)
         self.btn_rmimg.setToolTip("Remove selected sample")
         self.btn_rmimg.clicked.connect(self.remove_image)
         row_tbl.addWidget(self.table_compare, 1)
@@ -501,14 +522,6 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.lbl_editing.setStyleSheet(_lbl_file)
         self.lbl_editing.setWordWrap(True)
         multi_l.addWidget(self.lbl_editing)
-        row_apply_all = QtWidgets.QHBoxLayout()
-        self.btn_apply_settings_all = QtWidgets.QPushButton("Apply settings to all")
-        self.btn_apply_settings_all.setToolTip(
-            "Copy the current filter settings from the Setup tab to every sample, "
-            "then preprocess all.")
-        self.btn_apply_settings_all.clicked.connect(self.apply_settings_to_all)
-        row_apply_all.addWidget(self.btn_apply_settings_all, 1)
-        multi_l.addLayout(row_apply_all)
         self._multi_strip.setVisible(False)
         mbl.addWidget(self._multi_strip)
         row_name = QtWidgets.QHBoxLayout()
@@ -516,27 +529,20 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.edit_display_name = QtWidgets.QLineEdit()
         self.edit_display_name.setPlaceholderText("Display name on phasor legend")
         self.edit_display_name.setToolTip(
-            "Rename the active sample for the phasor legend and sample table "
-            "(does not change the file on disk).")
+            "Rename the active sample for the phasor legend and sample table. "
+            "Applies when you leave the field. Does not change the file on disk.")
         self.edit_display_name.editingFinished.connect(self._apply_display_name_from_field)
-        btn_name = QtWidgets.QPushButton("Set")
-        btn_name.setFixedWidth(40)
-        btn_name.clicked.connect(self._apply_display_name_from_field)
         row_name.addWidget(self.edit_display_name, 1)
-        row_name.addWidget(btn_name)
         mbl.addLayout(row_name)
         row_grp = QtWidgets.QHBoxLayout()
         row_grp.addWidget(QtWidgets.QLabel("Group"))
         self.edit_group = QtWidgets.QLineEdit()
         self.edit_group.setPlaceholderText("e.g. condition A")
         self.edit_group.setToolTip(
-            "Group label for the active sample (overlay legend and table).")
+            "Group label for the active sample (overlay legend and table). "
+            "Applies when you leave the field.")
         self.edit_group.editingFinished.connect(self._apply_group_from_field)
-        btn_grp = QtWidgets.QPushButton("Set")
-        btn_grp.setFixedWidth(40)
-        btn_grp.clicked.connect(self._apply_group_from_field)
         row_grp.addWidget(self.edit_group, 1)
-        row_grp.addWidget(btn_grp)
         mbl.addLayout(row_grp)
         self.chk_compare = QtWidgets.QCheckBox("Multi-image phasor view")
         self.chk_compare.setToolTip(
@@ -547,12 +553,13 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.cb_compare_style = QtWidgets.QComboBox()
         self.cb_compare_style.addItems(list(COMPARE_STYLE_MAP.keys()))
         self.cb_compare_style.currentIndexChanged.connect(self._on_compare_ui_changed)
+        self._combo_in_panel(self.cb_compare_style, min_chars=12)
         btn_cmp_all = QtWidgets.QPushButton("All")
-        btn_cmp_all.setFixedWidth(32)
+        self._fit_control(btn_cmp_all, "All", pad=12)
         btn_cmp_all.setToolTip("Show every preprocessed sample on the phasor plot.")
         btn_cmp_all.clicked.connect(self._compare_select_all)
         btn_cmp_none = QtWidgets.QPushButton("None")
-        btn_cmp_none.setFixedWidth(36)
+        self._fit_control(btn_cmp_none, "None", pad=12)
         btn_cmp_none.clicked.connect(self._compare_select_none)
         row_cmp.addWidget(self.cb_compare_style, 1)
         row_cmp.addWidget(btn_cmp_all)
@@ -564,6 +571,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.cb_compare_group.addItem("All groups")
         self.cb_compare_group.setToolTip("Limit phasor overlay to one group name.")
         self.cb_compare_group.currentIndexChanged.connect(self._on_compare_ui_changed)
+        self._combo_in_panel(self.cb_compare_group, min_chars=10)
         row_grp_filt.addWidget(self.cb_compare_group, 1)
         mbl.addLayout(row_grp_filt)
         row_legend = QtWidgets.QHBoxLayout()
@@ -572,10 +580,12 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.cb_legend_format.addItems(list(LEGEND_FORMAT_ITEMS))
         self.cb_legend_format.setToolTip("How sample names appear in the phasor legend.")
         self.cb_legend_format.currentIndexChanged.connect(self._on_legend_ui_changed)
+        self._combo_in_panel(self.cb_legend_format, min_chars=10)
         self.cb_legend_loc = QtWidgets.QComboBox()
         self.cb_legend_loc.addItems(list(LEGEND_LOC_ITEMS))
         self.cb_legend_loc.setToolTip("Legend position on the phasor plot.")
         self.cb_legend_loc.currentIndexChanged.connect(self._on_legend_ui_changed)
+        self._combo_in_panel(self.cb_legend_loc, min_chars=10)
         row_legend.addWidget(self.cb_legend_format, 1)
         row_legend.addWidget(self.cb_legend_loc, 1)
         row_legend.addWidget(QtWidgets.QLabel("Size"))
@@ -585,16 +595,18 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.sp_legend_size.setToolTip(
             "Legend text and colour-marker size on the phasor plot.")
         self.sp_legend_size.valueChanged.connect(self._on_legend_ui_changed)
+        legend_w = self.sp_legend_size.fontMetrics().horizontalAdvance("22") + 36
+        self.sp_legend_size.setMinimumWidth(legend_w)
         row_legend.addWidget(self.sp_legend_size)
         mbl.addLayout(row_legend)
         self._compare_sel_buttons = (btn_cmp_all, btn_cmp_none)
         self._sample_label_widgets = (
-            self.edit_display_name, btn_name, self.edit_group, btn_grp,
+            self.edit_display_name, self.edit_group,
         )
         self._multi_detail_widgets = (
             self._proc_active_row, self.cb_sample,
             self._multi_strip, self.table_compare, self.btn_rmimg,
-            self.lbl_editing, self.btn_apply_settings_all,
+            self.lbl_editing,
             self.chk_compare, self.cb_compare_style, self.cb_compare_group,
             self.cb_legend_format, self.cb_legend_loc, self.sp_legend_size,
             btn_cmp_all, btn_cmp_none,
@@ -619,7 +631,8 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
         self.cursor_box = QtWidgets.QWidget()
         cbl = QtWidgets.QGridLayout(self.cursor_box); cbl.setContentsMargins(0, 0, 0, 0)
-        b_add = QtWidgets.QPushButton("+"); b_add.setFixedWidth(28); b_add.clicked.connect(self.add_cursor)
+        b_add = QtWidgets.QPushButton("+"); b_add.clicked.connect(self.add_cursor)
+        self._fit_control(b_add, "+", pad=12)
         b_del = QtWidgets.QPushButton("Del"); b_del.clicked.connect(self.remove_cursor)
         b_clr = QtWidgets.QPushButton("Clear"); b_clr.clicked.connect(self.clear_cursors)
         cbl.addWidget(b_add, 0, 0); cbl.addWidget(b_del, 0, 1); cbl.addWidget(b_clr, 0, 2)
@@ -629,6 +642,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.cb_active_cursor.setToolTip(
             "Choose which circle to move or resize. Drag anywhere on the phasor plot.")
         self.cb_active_cursor.currentIndexChanged.connect(self.on_active_cursor_change)
+        self._combo_in_panel(self.cb_active_cursor, min_chars=8)
         row_cur.addWidget(self.cb_active_cursor, 1)
         cbl.addLayout(row_cur, 1, 0, 1, 3)
         row_shape = QtWidgets.QHBoxLayout()
@@ -636,6 +650,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.cb_cursor_shape = QtWidgets.QComboBox()
         self.cb_cursor_shape.addItems(list(CURSOR_SHAPES))
         self.cb_cursor_shape.setToolTip("Circle or ellipse ROI on the phasor plot (phasorpy cursors).")
+        self._combo_in_panel(self.cb_cursor_shape, min_chars=8)
         row_shape.addWidget(self.cb_cursor_shape, 1)
         row_shape.addWidget(QtWidgets.QLabel("Aspect"))
         self.sld_aspect = QtWidgets.QSlider(Qt.Orientation.Horizontal)
@@ -659,7 +674,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.sp_radius.setSingleStep(0.005)
         self.sp_radius.setValue(0.050)
         self.sp_radius.setToolTip("Exact circle radius on the phasor plot (g, s units).")
-        self._spin_for_typing(self.sp_radius, min_width=56)
+        self._spin_for_typing(self.sp_radius, sample="0.400", min_width=64)
         self.sp_radius.valueChanged.connect(self.on_radius_spin)
         self.sp_radius.editingFinished.connect(self._on_radius_spin_committed)
         radius_entry = QtWidgets.QHBoxLayout()
@@ -674,26 +689,39 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
         self.gmm_box = QtWidgets.QWidget()
         gbl = QtWidgets.QGridLayout(self.gmm_box); gbl.setContentsMargins(0, 0, 0, 0)
-        gbl.addWidget(QtWidgets.QLabel("k"), 0, 0)
+        self._gmm_sample_row = QtWidgets.QWidget()
+        gmm_sample_l = QtWidgets.QHBoxLayout(self._gmm_sample_row)
+        gmm_sample_l.setContentsMargins(0, 0, 0, 0)
+        gmm_sample_l.addWidget(QtWidgets.QLabel("Image"))
+        self.cb_gmm_sample = QtWidgets.QComboBox()
+        self.cb_gmm_sample.setToolTip(
+            "Same list as Active sample on Setup. Shows this image and its saved GMM.")
+        self.cb_gmm_sample.currentIndexChanged.connect(self._on_sample_combo_change)
+        self._combo_in_panel(self.cb_gmm_sample, min_chars=12)
+        gmm_sample_l.addWidget(self.cb_gmm_sample, 1)
+        self._gmm_sample_row.setVisible(False)
+        gbl.addWidget(self._gmm_sample_row, 0, 0, 1, 4)
+        gbl.addWidget(QtWidgets.QLabel("k"), 1, 0)
         self.edit_ncomp = QtWidgets.QLineEdit("3")
         self.edit_ncomp.setValidator(QtGui.QIntValidator(1, 12, self))
-        self.edit_ncomp.setFixedWidth(32)
+        self._fit_control(self.edit_ncomp, "12", pad=16, expanding=True)
         self.edit_ncomp.setToolTip("Number of GMM components (1–12), or max k when BIC auto-k is on.")
-        gbl.addWidget(self.edit_ncomp, 0, 1)
-        gbl.addWidget(QtWidgets.QLabel("Cov"), 0, 2)
+        gbl.addWidget(self.edit_ncomp, 1, 1)
+        gbl.addWidget(QtWidgets.QLabel("Cov"), 1, 2)
         self.cb_cov = QtWidgets.QComboBox(); self.cb_cov.addItems(["full", "tied", "diag", "spherical"])
-        gbl.addWidget(self.cb_cov, 0, 3)
+        self._combo_in_panel(self.cb_cov, min_chars=10)
+        gbl.addWidget(self.cb_cov, 1, 3)
         self.chk_bic = QtWidgets.QCheckBox("BIC auto-k")
         self.chk_bic.setToolTip("Search k = 1 … max k using BIC on valid phasor pixels.")
         self.chk_bic.toggled.connect(self._on_bic_toggled)
-        gbl.addWidget(self.chk_bic, 1, 0, 1, 2)
-        gbl.addWidget(QtWidgets.QLabel("σ"), 2, 0)
+        gbl.addWidget(self.chk_bic, 2, 0, 1, 2)
+        gbl.addWidget(QtWidgets.QLabel("σ"), 3, 0)
         self.edit_gmm_sigma = QtWidgets.QLineEdit("2.0")
         self.edit_gmm_sigma.setValidator(QtGui.QDoubleValidator(0.5, 6.0, 2, self))
-        self.edit_gmm_sigma.setFixedWidth(40)
+        self._fit_control(self.edit_gmm_sigma, "6.00", pad=16, expanding=True)
         self.edit_gmm_sigma.setToolTip(
             "Ellipse scale for phasorpy phasor_cluster_gmm (95% contour at 2.0).")
-        gbl.addWidget(self.edit_gmm_sigma, 2, 1)
+        gbl.addWidget(self.edit_gmm_sigma, 3, 1)
         b_fit = QtWidgets.QPushButton("Fit GMM"); b_fit.clicked.connect(self.fit_gmm)
         b_fit.setToolTip("Fit GMM on the active sample and paint (remembered per image).")
         b_fit_all = QtWidgets.QPushButton("Fit all")
@@ -702,9 +730,9 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             "then Export all to save them together.")
         b_fit_all.clicked.connect(self.fit_gmm_all)
         b_clr_gmm = QtWidgets.QPushButton("Clear"); b_clr_gmm.clicked.connect(self.clear_gmm)
-        gbl.addWidget(b_fit, 2, 2)
-        gbl.addWidget(b_fit_all, 3, 2)
-        gbl.addWidget(b_clr_gmm, 2, 3)
+        gbl.addWidget(b_fit, 3, 2)
+        gbl.addWidget(b_fit_all, 4, 2)
+        gbl.addWidget(b_clr_gmm, 3, 3)
         self.gmm_box.setVisible(False); ml.addWidget(self.gmm_box)
         analyze_l.addWidget(gb_mode)
 
@@ -716,16 +744,32 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self.btn_paint = QtWidgets.QPushButton("Paint")
         self.btn_paint.clicked.connect(self.compute_and_paint)
         self.chk_live = QtWidgets.QCheckBox("Live"); self.chk_live.setChecked(True)
-        self.chk_overlay = QtWidgets.QCheckBox("Overlay"); self.chk_overlay.setChecked(True)
-        self.chk_overlay.stateChanged.connect(self.refresh_image)
+        # Kept for session restore. The image View list is the control that
+        # shows or hides the segmentation picture.
+        self.chk_overlay = QtWidgets.QCheckBox("Overlay", self)
+        self.chk_overlay.setChecked(False)
+        self.chk_overlay.hide()
         row_paint.addWidget(self.btn_paint, 1)
         row_paint.addWidget(self.chk_live)
-        row_paint.addWidget(self.chk_overlay)
         al.addLayout(row_paint)
+        self.chk_separate_clusters = QtWidgets.QCheckBox("Save each cluster separately")
+        self.chk_separate_clusters.setToolTip(
+            "Also write, per cluster, a color image and a phasor plot of only that cloud, "
+            "plus one TIFF whose channels are the raw photon counts (for Fiji). "
+            "Leave this off for the usual combined export. Cluster brightness above "
+            "still applies to the on-screen overlay and the combined segmentation image.")
+        if hasattr(self, "_settings"):
+            self.chk_separate_clusters.setChecked(
+                self._settings.value("separate_clusters", False, type=bool))
+        self.chk_separate_clusters.toggled.connect(
+            lambda checked: self._settings.setValue("separate_clusters", bool(checked)))
+        al.addWidget(self.chk_separate_clusters)
         self.btn_export = QtWidgets.QPushButton("Export all…")
         self.btn_export.setToolTip(
             "Save one folder for the whole session: each sample's maps, remembered GMM/paint "
-            "results, tables, analysis.xlsx, and session.json.")
+            "results, tables, analysis.xlsx, and session.json "
+            "(or <file>_session.json beside the pictures when only one image is exported). "
+            "Turn on “Save each cluster separately” to also write per-cluster images.")
         self.btn_export.clicked.connect(self.export_all)
         al.addWidget(self.btn_export)
         analyze_l.addWidget(self.gb_act)
@@ -747,7 +791,19 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             "Cursors or GMM segmentation, paint, and export.")
 
         panel_wrap = QtWidgets.QWidget()
-        panel_wrap.setFixedWidth(420)
+        self.panel_wrap = panel_wrap
+        # A fixed 420px panel clipped the filter column when the OS font or
+        # control metrics were larger. Keep a readable width, but cap it so a
+        # huge font cannot push the plots off a small screen — the tab pages
+        # scroll instead of clipping.
+        fm = self.fontMetrics()
+        panel_min = min(520, max(400, fm.height() * 22))
+        panel_wrap.setMinimumWidth(panel_min)
+        panel_wrap.setMaximumWidth(max(560, panel_min))
+        panel_wrap.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
         pwl = QtWidgets.QVBoxLayout(panel_wrap)
         pwl.setContentsMargins(0, 0, 0, 0)
         pwl.setSpacing(4)
@@ -756,6 +812,8 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
 
         # ---- plots ----
         plots = QtWidgets.QSplitter(Qt.Orientation.Horizontal)
+        plots.setHandleWidth(8)
+        plots.setChildrenCollapsible(False)
         lw = QtWidgets.QWidget(); lv = QtWidgets.QVBoxLayout(lw)
         self.phasor = PhasorCanvas(self)
         # cursorMoving: cheap overlay during drag/scroll; cursorChanged: commit on mouseup/add/remove.
@@ -778,7 +836,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             "Pixel maps from Apply settings. "
             "Photons (masked) hides pixels below Min N / invalid phasors; "
             "Photon counts shows the full intensity including filtered-out pixels. "
-            "τ maps need Apply. Selecting a view turns Overlay off so the map is visible.")
+            "τ maps need Apply. Choose Segmentation to show the painted clusters.")
         self.cb_image_view.currentIndexChanged.connect(self._on_image_view_changed)
         row_img_view.addWidget(self.cb_image_view, 1)
         rv.addLayout(row_img_view)
@@ -790,16 +848,20 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         rv.addWidget(self.image)
         plots.addWidget(lw); plots.addWidget(rw); plots.setSizes([700, 700])
 
-        self.table = QtWidgets.QTableWidget(0, 10)
+        self.table = QtWidgets.QTableWidget(0, 11)
         self.table.setHorizontalHeaderLabels(
-            ["#", "Color", "Label (what you see)", "g", "s",
+            ["#", "Color", "Bright", "Label (what you see)", "g", "s",
              "tau_phi (ns)", "tau_mod (ns)", "tau_normal (ns)",
              "Pixels", "Area %"])
-        self.table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(
+            2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.table.setMaximumHeight(220)
         self.table.itemChanged.connect(self._label_edited)
 
         rightside = QtWidgets.QSplitter(Qt.Orientation.Vertical)
+        rightside.setHandleWidth(8)
+        rightside.setChildrenCollapsible(False)
         rightside.addWidget(plots); rightside.addWidget(self.table); rightside.setSizes([720, 220])
         main.addWidget(rightside, 1)
         main.addWidget(panel_wrap)
@@ -909,20 +971,83 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             raise
 
     @staticmethod
-    def _spin_for_typing(sp, *, min_width: int = 76):
-        """Hide stepper arrows so typed values are fully visible.
+    def _spin_for_typing(sp, *, sample: str = "0000", min_width: int = 64):
+        """Hide stepper arrows and reserve enough width to read a typed value.
 
         Applied to the numeric processing spinboxes (harmonic, frequency,
         reference lifetime, kernel size, threshold, frame index, etc.) so users
-        can type exact values without the up/down buttons truncating the field.
+        can type exact values. The buttons are hidden because, once a
+        stylesheet paints the field, some platform styles keep an empty arrow
+        gutter that covers the digits. The ``textEntry`` property tells the
+        theme stylesheet to collapse that gutter. The minimum width is the
+        wider of ``min_width`` and the current font's advance of ``sample``
+        plus the spin box suffix, so a larger OS font cannot clip the number.
 
         Args:
             sp: ``QAbstractSpinBox`` (or subclass) to reconfigure.
-            min_width: Minimum pixel width to reserve for the widened field.
+            sample: Widest value the field should show, without the suffix.
+            min_width: Floor on the reserved width, in pixels.
         """
         sp.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
-        sp.setMinimumWidth(min_width)
+        sp.setProperty("textEntry", True)
+        sp.setLocale(QtCore.QLocale.c())
+        sp.setKeyboardTracking(True)
+        sp.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        sp.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        shown = f"{sp.prefix()}{sample}{sp.suffix()}"
+        needed = sp.fontMetrics().horizontalAdvance(shown) + 20
+        sp.setMinimumWidth(max(min_width, needed))
         sp.setMaximumWidth(16777215)
+        sp.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.MinimumExpanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        editor = sp.lineEdit()
+        if editor is not None:
+            editor.setFrame(False)
+            editor.setAutoFillBackground(False)
+
+    def _fit_control(self, widget, text: str, *, pad: int = 20, expanding: bool = False):
+        """Give a field or button enough width for ``text`` in the current font.
+
+        Replaces hard-coded pixel widths, which clip labels and typed values
+        when another computer uses a larger font or display scale.
+
+        Args:
+            widget: Widget whose minimum width is set.
+            text: String that must remain fully visible.
+            pad: Extra pixels for padding and the stylesheet border.
+            expanding: When ``True``, the widget may grow to fill its cell.
+        """
+        widget.setMinimumWidth(widget.fontMetrics().horizontalAdvance(text) + pad)
+        widget.setMaximumWidth(16777215)
+        horizontal = (
+            QtWidgets.QSizePolicy.Policy.MinimumExpanding
+            if expanding
+            else QtWidgets.QSizePolicy.Policy.Minimum
+        )
+        widget.setSizePolicy(horizontal, QtWidgets.QSizePolicy.Policy.Fixed)
+
+    def _combo_in_panel(self, cb, *, min_chars: int = 8):
+        """Let a panel combo box shrink instead of forcing the form wider.
+
+        The size hint of a combo box is the longest item, which on a narrow
+        panel pushes later columns (the filter and its values) past the edge.
+        ``AdjustToMinimumContentsLengthWithIcon`` sizes it from ``min_chars``
+        and the dropdown still shows the full item text.
+
+        Args:
+            cb: Combo box embedded in the control panel.
+            min_chars: Minimum number of characters to keep visible when closed.
+        """
+        cb.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        cb.setMinimumContentsLength(min_chars)
+        cb.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        cb.setMinimumWidth(cb.fontMetrics().horizontalAdvance("0" * min_chars) + 28)
 
     @staticmethod
     def _fmt_elapsed(seconds: float) -> str:
@@ -1114,8 +1239,8 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self._multi_strip.setVisible(show_strip)
         if hasattr(self, "_proc_active_row"):
             self._proc_active_row.setVisible(show_active)
-            if hasattr(self, "lbl_proc_active"):
-                self.lbl_proc_active.setVisible(not show_active)
+        if hasattr(self, "_gmm_sample_row"):
+            self._gmm_sample_row.setVisible(len(self.datasets) > 1)
         if hasattr(self, "lbl_editing"):
             if show_strip and 0 <= self.active_idx < len(self.datasets):
                 self.lbl_editing.setText(
@@ -1124,38 +1249,54 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
                 self.lbl_editing.setText("Load another sample to compare.")
             else:
                 self.lbl_editing.setText("")
-        self._update_proc_active_label()
+
+    def _sample_picker_combos(self):
+        """Return the Setup and Analyze dropdowns that select the active sample.
+
+        ``cb_sample`` lives on Setup. ``cb_gmm_sample`` lives in the GMM
+        section on Analyze. They show the same labels and stay on the same
+        index.
+        """
+        combos = []
+        for name in ("cb_sample", "cb_gmm_sample"):
+            cb = getattr(self, name, None)
+            if cb is not None:
+                combos.append(cb)
+        return combos
 
     def _refresh_sample_combo(self):
-        """Rebuild the active-sample dropdown from loaded datasets.
+        """Rebuild both active-sample dropdowns from loaded datasets.
 
-        Clears and repopulates ``cb_sample`` with a display label per dataset
-        (blocking its signal so this does not itself trigger an activation),
-        restores the selection to ``active_idx``, then updates the multi-image
-        strip visibility. Called whenever the dataset list or a display
-        name/group changes.
+        Clears and repopulates Setup's ``cb_sample`` and Analyze's
+        ``cb_gmm_sample`` with a display label per dataset (blocking signals
+        so this does not itself trigger an activation), restores the
+        selection to ``active_idx``, then updates the multi-image strip
+        visibility. Called whenever the dataset list or a display name/group
+        changes.
         """
-        if not hasattr(self, "cb_sample"):
+        combos = self._sample_picker_combos()
+        if not combos:
             return
-        cb = self.cb_sample
-        cb.blockSignals(True)
-        cb.clear()
-        for i, d in enumerate(self.datasets):
-            cb.addItem(dataset_display_label(d, i))
-        if 0 <= self.active_idx < len(self.datasets):
-            cb.setCurrentIndex(self.active_idx)
-        cb.blockSignals(False)
+        for cb in combos:
+            cb.blockSignals(True)
+            cb.clear()
+            for i, d in enumerate(self.datasets):
+                cb.addItem(dataset_display_label(d, i))
+            if 0 <= self.active_idx < len(self.datasets):
+                cb.setCurrentIndex(self.active_idx)
+            cb.blockSignals(False)
         self._update_multi_strip()
 
     def _on_sample_combo_change(self, idx: int):
-        """Handle active-sample selection from the Setup-tab combo box.
+        """Handle active-sample selection from either sample combo box.
 
-        Connected to ``cb_sample.currentIndexChanged``; delegates to the shared
-        :meth:`_on_sample_picker_change` so combo-box and compare-table
-        selection use identical activation logic.
+        Connected to ``cb_sample`` (Setup) and ``cb_gmm_sample`` (Analyze).
+        Both lists are the same; this delegates to
+        :meth:`_on_sample_picker_change` so either combo and the compare
+        table use identical activation logic.
 
         Args:
-            idx: New selected row index in ``cb_sample``.
+            idx: New selected row index in the combo that changed.
         """
         self._on_sample_picker_change(idx)
 
@@ -1178,11 +1319,11 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._activate_dataset(idx)
 
     def _sync_sample_table_selection(self):
-        """Keep compare table row and sample combo aligned with active_idx.
+        """Keep the compare table and both sample dropdowns on ``active_idx``.
 
-        Sets ``_table_sel_lock`` and blocks both widgets' signals while
-        selecting/scrolling to the active row and setting the combo index, so
-        this programmatic sync does not re-trigger
+        Sets ``_table_sel_lock`` and blocks the table and both sample
+        dropdowns while selecting the active row and setting each combo
+        index, so this programmatic sync does not re-trigger
         :meth:`_on_sample_picker_change`. Called after any activation, dataset
         list change, or rename.
         """
@@ -1190,17 +1331,18 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             return
         self._table_sel_lock = True
         self.table_compare.blockSignals(True)
-        if hasattr(self, "cb_sample"):
-            self.cb_sample.blockSignals(True)
+        pickers = self._sample_picker_combos()
+        for cb in pickers:
+            cb.blockSignals(True)
         if 0 <= self.active_idx < self.table_compare.rowCount():
             self.table_compare.selectRow(self.active_idx)
             self.table_compare.scrollToItem(
                 self.table_compare.item(self.active_idx, 0),
                 QtWidgets.QAbstractItemView.ScrollHint.PositionAtCenter)
-        if hasattr(self, "cb_sample") and 0 <= self.active_idx < self.cb_sample.count():
-            self.cb_sample.setCurrentIndex(self.active_idx)
-        if hasattr(self, "cb_sample"):
-            self.cb_sample.blockSignals(False)
+        for cb in pickers:
+            if 0 <= self.active_idx < cb.count():
+                cb.setCurrentIndex(self.active_idx)
+            cb.blockSignals(False)
         self.table_compare.blockSignals(False)
         self._table_sel_lock = False
         self._update_multi_strip()
@@ -2133,10 +2275,10 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
     def calibrate_reference(self):
         """Decode reference and compute g/s (does not preprocess samples).
 
-        Connected to the "Recalibrate" button — an explicit way to force a
-        re-decode / refresh the reference preview outside the automatic
-        calibration that normally happens when a reference is picked or Apply
-        runs. If no reference is currently set, prompts with a file dialog
+        Connected to File → Calibrate and F6. Forces a re-decode and refreshes
+        the reference preview without preprocessing samples. Picking a reference
+        and Apply already compute g/s when they are missing. If no reference is
+        currently set, prompts with a file dialog
         first. Under manual calibration, just reapplies the typed g/s instead
         of decoding a file. Otherwise calls
         :meth:`_recompute_reference_calibration` and, on success, syncs the
@@ -2266,27 +2408,6 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             return name[: max_len - 1] + "…"
         return name
 
-    def _update_proc_active_label(self):
-        """Show the active sample filename beside the sample combo when solo.
-
-        The "Active sample" row on the Setup tab shows either the sample combo
-        (when 2+ samples are loaded in multi-image mode) or a plain filename
-        label (when there is 0 or 1 sample, so a dropdown would be
-        redundant). This keeps that label's text in sync; visibility of the
-        row itself is handled by :meth:`_update_multi_strip`.
-        """
-        if not hasattr(self, "lbl_proc_active"):
-            return
-        multi = hasattr(self, "chk_multi") and self.chk_multi.isChecked() and len(self.datasets) > 1
-        if multi:
-            self.lbl_proc_active.setText("")
-            return
-        if dataset_has_sample(self.data):
-            self.lbl_proc_active.setText(
-                self._compact_filename(dataset_short_label(self.data), "(no sample)"))
-        else:
-            self.lbl_proc_active.setText("(no sample)")
-
     def _update_panel_status(self):
         """Update the top panel status with active sample and calibration state.
 
@@ -2336,7 +2457,6 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         """
         d = self.data
         self.lbl_sample.setText(self._compact_filename(d.sample_path, "(no sample)"))
-        self._update_proc_active_label()
         self._update_panel_status()
         if self.chk_shared_ref.isChecked():
             ref = self.shared_ref_path
@@ -3224,7 +3344,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self._update_multi_strip()
             self._log(
                 "Multi-image mode — sample table on Multi-phasor tab; "
-                "edit filters on Setup, then Apply selected or Apply settings to all.")
+                "edit filters on Setup, then Apply selected or Apply all.")
         else:
             self._update_multi_strip()
             if hasattr(self, "panel_tabs"):
@@ -3346,37 +3466,12 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             if hasattr(self, "_gmm_fit"):
                 del self._gmm_fit
         self.cluster_stats = [dict(st) for st in (getattr(d, "cluster_stats", None) or [])]
+        self._seg_masks = None
         overlay = getattr(d, "last_overlay", None) if d is not None else None
         self.last_overlay = None if overlay is None else np.asarray(overlay).copy()
         self._fill_table()
         self._sync_segmentation_view(self.last_overlay is not None)
         self.refresh_image()
-
-    def apply_settings_to_all(self):
-        """Copy active sample's processing settings to all datasets and Apply all.
-
-        Requires at least two loaded samples (shows an info dialog and
-        returns otherwise). Saves the active sample's current UI settings,
-        snapshots them via ``capture_processing_from_ui``, and stamps that
-        snapshot onto every dataset's ``processing_settings`` before
-        preprocessing all of them via ``apply_processing(scope="all")``.
-        This lets the user tune filters on one sample and broadcast them to
-        the rest of the batch.
-        """
-        if len(self.datasets) <= 1:
-            QtWidgets.QMessageBox.information(
-                self, "Need multiple samples",
-                "Load at least two samples in multi-image mode first.")
-            return
-        self._save_proc_from_ui(self.data)
-        snap = capture_processing_from_ui(self)
-        for d in self.datasets:
-            d.processing_settings = dict(snap)
-        self._refresh_compare_list()
-        self._log(
-            f"Copied settings from {dataset_short_label(self.data, self.active_idx)} "
-            f"to all {len(self.datasets)} samples.")
-        self.apply_processing(scope="all")
 
     def remove_image(self):
         """Remove the active sample from the multi-image list.
@@ -3985,9 +4080,10 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         if masks is None:
             return
         intensity = self._segmentation_intensity()
-        overlay = pseudo_color(*[masks[k] for k in range(len(masks))],
-                               intensity=intensity, colors=np.array(colors))
-        self.last_overlay = np.clip(np.asarray(overlay), 0, 1)
+        self._seg_masks = np.asarray(masks, dtype=bool)
+        gains = cluster_gains(self.cluster_stats, len(masks))
+        self.last_overlay = compose_cluster_overlay(
+            intensity, self._seg_masks, colors, gains)
         if not self.chk_overlay.isChecked():
             self._sync_segmentation_view(True)
         title = f"Segmentation ({self.mode})"
@@ -4409,6 +4505,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         masks, colors = self._cursor_masks_colors()
         valid = self.data.valid_mask()
         total_valid = max(int(valid.sum()), 1)
+        kept_gain = [float(st.get("brightness", 1.0) or 1.0) for st in self.cluster_stats]
         self.cluster_stats = []
         for k, c in enumerate(cur):
             mk = masks[k]; n = int(mk.sum())
@@ -4420,7 +4517,8 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self.cluster_stats.append(dict(idx=k + 1, color=c["color"], label=c["label"],
                                            tp=tp, tm=tm, tn=tn,
                                            g=cg, s=cs, n=n,
-                                           area=100.0 * n / total_valid))
+                                           area=100.0 * n / total_valid,
+                                           brightness=kept_gain[k] if k < len(kept_gain) else 1.0))
         self._paint(masks, colors)
         self._fill_table()
         self._stash_segmentation_to_dataset(self.data)
@@ -4452,6 +4550,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         masks = np.stack([(labelmap == k) & valid for k in range(n_comp)])
         colors = [categorical_rgb(k) for k in range(n_comp)]
         total_valid = max(int(valid.sum()), 1)
+        kept_gain = [float(st.get("brightness", 1.0) or 1.0) for st in self.cluster_stats]
         self.cluster_stats = []
         for k in range(n_comp):
             cg, cs = float(cr[k]), float(ci[k])
@@ -4461,7 +4560,8 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self.cluster_stats.append(dict(idx=k + 1, color=colors[k], label=categorical_name(k),
                                            tp=tp, tm=tm, tn=tn,
                                            g=cg, s=cs, n=n,
-                                           area=100.0 * n / total_valid))
+                                           area=100.0 * n / total_valid,
+                                           brightness=kept_gain[k] if k < len(kept_gain) else 1.0))
         self._paint(masks, colors)
         self._fill_table()
         self._stash_segmentation_to_dataset(self.data)
@@ -4544,25 +4644,64 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
     def _paint(self, masks, colors):
         """Composite cluster masks into a pseudo-color overlay and display it.
 
-        Combines the per-cluster boolean masks with `_segmentation_intensity`
-        via `pseudo_color`, clips the result to [0, 1], stores it as
-        `self.last_overlay`, switches the view to "Segmentation" via
-        `_sync_segmentation_view`, and calls `refresh_image` to draw it.
-        Called by `_compute_cursor` and `_compute_gmm` after they finish
-        aggregating cluster statistics.
+        Paints each cluster with :func:`flim_phasors.cluster_view.compose_cluster_overlay`,
+        multiplying that cluster's pixels by its ``brightness`` stat (1 leaves
+        the overlay unchanged). Stores the masks so the Bright column can
+        repaint without refitting, then shows the segmentation view.
 
         Args:
-            masks: Boolean array of shape ``(n_clusters, H, W)`` selecting
-                the pixels belonging to each cluster.
+            masks: Boolean array of shape ``(n_clusters, H, W)``.
             colors: Sequence of RGB colors, one per cluster, matching
                 ``masks``.
         """
+        self._seg_masks = np.asarray(masks, dtype=bool)
+        self._recompose_overlay()
+
+    def _masks_for_current_clusters(self):
+        """Rebuild cluster masks from the current GMM fit or cursors."""
+        n = len(self.cluster_stats)
+        if n == 0 or self.data.real_cal is None:
+            return None
+        if self.mode == "gmm" and getattr(self, "_gmm_fit", None) is not None:
+            cr, ci, rm, _ri, _ang = self._gmm_fit
+            if len(cr) != n:
+                return None
+            valid = self.data.valid_mask()
+            labelmap = label_pixels_by_gmm(self.data.real_cal, self.data.imag_cal, cr, ci, rm)
+            return np.stack([(labelmap == k) & valid for k in range(n)])
+        masks, _colors = self._cursor_masks_colors()
+        if masks is None or len(masks) != n:
+            return None
+        return np.asarray(masks, dtype=bool)
+
+    def _recompose_overlay(self):
+        """Repaint ``last_overlay`` from stored masks and per-cluster brightness."""
+        from flim_phasors.cluster_view import compose_cluster_overlay
+
+        masks = getattr(self, "_seg_masks", None)
+        if masks is None or masks.shape[0] != len(self.cluster_stats):
+            masks = self._masks_for_current_clusters()
+            self._seg_masks = masks
+        if masks is None:
+            return
         intensity = self._segmentation_intensity()
-        overlay = pseudo_color(*[masks[k] for k in range(len(masks))],
-                               intensity=intensity, colors=np.array(colors))
-        self.last_overlay = np.clip(np.asarray(overlay), 0, 1)
+        if intensity is None or tuple(np.shape(intensity)) != tuple(masks.shape[1:]):
+            return
+        colors = [st["color"] for st in self.cluster_stats]
+        gains = [float(st.get("brightness", 1.0) or 1.0) for st in self.cluster_stats]
+        self.last_overlay = compose_cluster_overlay(intensity, masks, colors, gains)
         self._sync_segmentation_view(True)
         self.refresh_image()
+
+    def _on_cluster_brightness_changed(self, row: int, value: float):
+        """Apply one cluster's brightness multiplier and refresh the overlay."""
+        if self._filling_table:
+            return
+        if not (0 <= row < len(self.cluster_stats)):
+            return
+        self.cluster_stats[row]["brightness"] = float(value)
+        self._recompose_overlay()
+        self._stash_segmentation_to_dataset(self.data)
 
     def _on_image_view_changed(self):
         """Switch the image panel to the selected base view.
@@ -4671,9 +4810,9 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         the Brightness/Contrast sliders (normalized from their -100..100
         range to -1.0..1.0) applied, or one of the tau maps (phase,
         modulation, normal) via `image.show_map` with a robust 2nd-98th
-        percentile color range from `_robust_range`. Draws the scale bar
-        afterward when a map is shown. No-op if the selected tau source has
-        no data yet.
+        percentile color range from `_robust_range`. The scale bar is updated
+        on every call, including when the selected view has no array yet, so
+        unticking "Show scale bar" still removes a bar left by the previous view.
         """
         choice = (
             self.cb_image_view.currentText()
@@ -4694,7 +4833,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
                 self.image.show_intensity(
                     disp, log_scale=log_scale, auto_contrast=auto_c,
                     brightness=brightness, contrast=contrast, title=title)
-                self._draw_scale_bar()
+            self._draw_scale_bar()
             return
         tau_sources = {
             IMAGE_VIEW_ITEMS[2]: (self.data.tau_phi, "τφ phase (ns)"),
@@ -4703,10 +4842,12 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         }
         src = tau_sources.get(choice)
         if src is None:
+            self._draw_scale_bar()
             return
         tau_map, cbar_label = src
         disp = self._mask_like_phasor(tau_map)
         if disp is None:
+            self._draw_scale_bar()
             return
         vmin, vmax = self._robust_range(disp)
         self.image.show_map(disp, title=choice, cmap="turbo", label=cbar_label,
@@ -4714,36 +4855,34 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         self._draw_scale_bar()
 
     def _draw_scale_bar(self):
-        """Draw a scale bar on the image view if pixel size is known.
+        """Draw or remove the image scale bar.
 
-        No-op if the "Show scale bar" checkbox is unchecked. Otherwise reads
-        the pixel-size spin box, falling back to the dataset's stored
-        `pixel_size_um` if the spin box is zero/absent (auto-detected from
-        LIF/XLEF, PTU, or Imspector TIFF acquisition metadata when present).
-        Bar length comes from `sp_scalebar_um` (default 10 µm) and corner
-        placement from `cb_scalebar_loc` (default bottom left), both falling
-        back to their defaults if the widgets don't exist yet. Skips drawing
-        if no pixel size is available, no phasor data exists, or the
-        resulting bar would exceed 40% of the image width (avoids an overly
-        dominant bar on very high-magnification or very narrow images, e.g.
-        after shrinking a too-long manually entered bar length).
+        Unticking "Show scale bar", or a pixel size of 0, removes the bar
+        even when this view did not redraw the image. Otherwise the length
+        comes from `sp_scalebar_um` and the corner from `cb_scalebar_loc`.
+        A length that would fill the field is shortened before it is drawn.
         """
         show = not hasattr(self, "chk_show_scale_bar") or self.chk_show_scale_bar.isChecked()
-        if not show:
+        if hasattr(self, "sp_pixel_um"):
+            um = self.sp_pixel_um.value()
+        else:
+            um = float(getattr(self.data, "pixel_size_um", 0.0) or 0.0)
+        if not show or um <= 0 or self.data.real_cal is None:
+            self.image._clear_scale_bar()
+            self.image.draw_idle()
             return
-        um = self.sp_pixel_um.value() if hasattr(self, "sp_pixel_um") else 0.0
-        if um <= 0 and getattr(self.data, "pixel_size_um", 0) > 0:
-            um = self.data.pixel_size_um
-        if um > 0 and self.data.real_cal is not None:
-            h, w = self.data.real_cal.shape
-            bar_um = self.sp_scalebar_um.value() if hasattr(self, "sp_scalebar_um") else 10.0
-            loc = (
-                self.cb_scalebar_loc.currentText().lower()
-                if hasattr(self, "cb_scalebar_loc") else "bottom left"
-            )
-            bar_px = bar_um / um
-            if bar_px < w * 0.4:
-                self.image.draw_scale_bar(bar_px, label=f"{bar_um:g} µm", location=loc)
+        _h, w = self.data.real_cal.shape
+        requested = self.sp_scalebar_um.value() if hasattr(self, "sp_scalebar_um") else 10.0
+        bar_um = _fitted_scale_bar_um(w, um, requested)
+        if hasattr(self, "sp_scalebar_um") and abs(bar_um - requested) > 1e-6:
+            self.sp_scalebar_um.blockSignals(True)
+            self.sp_scalebar_um.setValue(bar_um)
+            self.sp_scalebar_um.blockSignals(False)
+        loc = (
+            self.cb_scalebar_loc.currentText().lower()
+            if hasattr(self, "cb_scalebar_loc") else "bottom left"
+        )
+        self.image.draw_scale_bar(bar_um / um, label=f"{bar_um:g} µm", location=loc)
 
     @staticmethod
     def _robust_range(arr):
@@ -4769,8 +4908,8 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
     def _fill_table(self):
         """Repopulate the results table from `self.cluster_stats`.
 
-        Rebuilds every row: index, color swatch, editable label, mean
-        (g, s), the three apparent lifetimes (formatted via
+        Rebuilds every row: index, color swatch, brightness multiplier, editable
+        label, mean (g, s), the three apparent lifetimes (formatted via
         `_fmt_table_ns`), pixel count, and percent area. Sets
         `_filling_table` around the rebuild so `_label_edited` (triggered by
         `setItem` on the editable label column) ignores these programmatic
@@ -4783,16 +4922,30 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
             self.table.setItem(r, 0, self._ro(str(st["idx"])))
             sw = QtWidgets.QTableWidgetItem(); sw.setBackground(QtGui.QColor.fromRgbF(*st["color"]))
             sw.setFlags(Qt.ItemFlag.ItemIsEnabled); self.table.setItem(r, 1, sw)
+            bright = QtWidgets.QDoubleSpinBox()
+            bright.setRange(0.25, 20.0)
+            bright.setSingleStep(0.25)
+            bright.setDecimals(2)
+            bright.setLocale(QtCore.QLocale.c())
+            bright.setMinimumWidth(72)
+            bright.setKeyboardTracking(False)
+            bright.setValue(float(st.get("brightness", 1.0) or 1.0))
+            bright.setToolTip(
+                "Multiply this cluster's painted pixels. 1 leaves it unchanged. "
+                "Higher values lift a dark cloud and keep its color until the pixels clip to white.")
+            bright.valueChanged.connect(
+                lambda value, row=r: self._on_cluster_brightness_changed(row, value))
+            self.table.setCellWidget(r, 2, bright)
             lab = QtWidgets.QTableWidgetItem(st["label"])
             lab.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsEditable | Qt.ItemFlag.ItemIsSelectable)
-            self.table.setItem(r, 2, lab)
-            self.table.setItem(r, 3, self._ro(f"{st['g']:.4f}"))
-            self.table.setItem(r, 4, self._ro(f"{st['s']:.4f}"))
-            self.table.setItem(r, 5, self._ro(self._fmt_table_ns(st["tp"])))
-            self.table.setItem(r, 6, self._ro(self._fmt_table_ns(st["tm"])))
-            self.table.setItem(r, 7, self._ro(self._fmt_table_ns(st["tn"])))
-            self.table.setItem(r, 8, self._ro(str(st["n"])))
-            self.table.setItem(r, 9, self._ro(f"{st['area']:.2f}"))
+            self.table.setItem(r, 3, lab)
+            self.table.setItem(r, 4, self._ro(f"{st['g']:.4f}"))
+            self.table.setItem(r, 5, self._ro(f"{st['s']:.4f}"))
+            self.table.setItem(r, 6, self._ro(self._fmt_table_ns(st["tp"])))
+            self.table.setItem(r, 7, self._ro(self._fmt_table_ns(st["tm"])))
+            self.table.setItem(r, 8, self._ro(self._fmt_table_ns(st["tn"])))
+            self.table.setItem(r, 9, self._ro(str(st["n"])))
+            self.table.setItem(r, 10, self._ro(f"{st['area']:.2f}"))
         self._filling_table = False
 
     def _label_edited(self, item):
@@ -4810,7 +4963,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         """
         if self._filling_table:
             return
-        if item.column() == 2:
+        if item.column() == 3:
             r = item.row()
             if 0 <= r < len(self.cluster_stats):
                 self.cluster_stats[r]["label"] = item.text()
@@ -4925,9 +5078,16 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         nf = len(result["files"])
         self._mark_clean()
         self._log(f"Exported {nf} file(s) for {n} sample(s) → {result['directory']}")
-        QtWidgets.QMessageBox.information(
-            self,
-            "Export complete",
-            f"Saved {nf} files for {n} sample(s) to:\n{result['directory']}",
-        )
+        saved = f"Saved {nf} files for {n} sample(s) to:\n{result['directory']}"
+        warns = [str(w) for w in (result.get("warnings") or []) if w]
+        for note in warns:
+            self._log(note.replace("\n", " "))
+        if warns:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Export complete",
+                saved + "\n\n" + "\n\n".join(warns),
+            )
+        else:
+            QtWidgets.QMessageBox.information(self, "Export complete", saved)
 

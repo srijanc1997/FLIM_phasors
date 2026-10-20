@@ -28,6 +28,7 @@ from flim_phasors.export_bundle import (
     write_excel_bundle,
     write_samples_summary,
     _session_excel_path,
+    _session_json_path,
 )
 from flim_phasors.io import is_supported_flim_path
 
@@ -53,6 +54,7 @@ _CONFIG_DEFAULTS = {
     "gmm_sigma": 2.0,
     "gmm_covariance": "full",
     "gmm_bic": False,
+    "separate_clusters": False,
 }
 
 
@@ -165,6 +167,7 @@ def _headless_win(datasets: list[PhasorData], cfg: dict, ref_cal):
         cluster_stats=list(getattr(active, "cluster_stats", None) or []),
         _gmm_fit=getattr(active, "gmm_fit", None),
         last_overlay=getattr(active, "last_overlay", None),
+        separate_clusters=bool(cfg.get("separate_clusters", False)),
         phasor=SimpleNamespace(cursors=[], fig=None),
         ref_calibration=cal,
         shared_ref_path=cfg.get("reference") or "",
@@ -249,6 +252,7 @@ def run_from_config(cfg: dict) -> int:
     sample_rows: list[dict] = []
     all_cluster_rows: list[dict] = []
     n_files_written = 0
+    last_export: dict = {}
 
     for i, sp in enumerate(paths):
         tag = f"[{i + 1}/{len(paths)}]"
@@ -287,6 +291,9 @@ def run_from_config(cfg: dict) -> int:
         print(f"{tag} Export          → samples/…")
         win = _headless_win([d], cfg, ref_cal)
         one = export_one_sample(win, out, d, i)
+        last_export = one
+        for note in one.get("warnings") or []:
+            print(f"{tag} WARNING         {note.replace(chr(10), ' ')}")
         sample_rows.append(one["sample_row"])
         all_cluster_rows.extend(one["cluster_rows"])
         n_files_written += len(one["written"])
@@ -306,7 +313,7 @@ def run_from_config(cfg: dict) -> int:
         gc.collect()
         print(f"{tag} Freed           sample memory")
 
-    # Lightweight session.json (paths/settings only; maps already on disk)
+    # Lightweight session file (paths/settings only; maps already on disk)
     session = {
         "app_version": __version__,
         "exported_utc": datetime.now(timezone.utc).isoformat(),
@@ -332,7 +339,24 @@ def run_from_config(cfg: dict) -> int:
         "gmm_covariance": str(cfg["gmm_covariance"]),
         "gmm_bic": bool(cfg["gmm_bic"]),
     }
-    (out / "session.json").write_text(json.dumps(session, indent=2), encoding="utf-8")
+    session_text = json.dumps(session, indent=2)
+    if len(paths) == 1 and last_export.get("folder"):
+        session_file = Path(last_export["folder"]) / f"{last_export['prefix']}_session.json"
+        root_copy = _session_json_path(out, Path(paths[0]).stem)
+        if root_copy.is_file():
+            try:
+                root_copy.unlink()
+            except OSError:
+                pass
+    else:
+        session_file = out / "session.json"
+        named = out / f"{Path(paths[0]).stem}_session.json"
+        if named.is_file():
+            try:
+                named.unlink()
+            except OSError:
+                pass
+    session_file.write_text(session_text, encoding="utf-8")
     print()
     print(f"Done — {len(paths)} sample(s), ~{n_files_written} sample files → {out}")
     print("  (samples_summary.csv / clusters.csv / analysis.xlsx updated after each sample)")

@@ -693,10 +693,11 @@ def apply_session_bundle_to_window(win, loaded: dict) -> None:
         win._fill_table()
 
     if hasattr(win, "chk_overlay"):
-        win.chk_overlay.blockSignals(True)
         overlay_on = bool(ui.get("overlay_checked")) and win.last_overlay is not None
-        win.chk_overlay.setChecked(overlay_on)
-        win.chk_overlay.blockSignals(False)
+        if hasattr(win, "_sync_segmentation_view"):
+            win._sync_segmentation_view(overlay_on)
+        else:
+            win.chk_overlay.setChecked(overlay_on)
     if hasattr(win, "refresh_image"):
         win.refresh_image()
     if hasattr(win, "_update_metadata_panel"):

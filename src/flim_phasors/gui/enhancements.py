@@ -25,7 +25,10 @@ from flim_phasors.calibration_io import load_calibration, save_calibration
 from flim_phasors.canvas.ref_preview import RefPreviewCanvas
 from flim_phasors.constants import FLIM_FILE_FILTER
 from flim_phasors.cursors_io import load_cursors, save_cursors
+from flim_phasors.busy import CancelledError
 from flim_phasors.io import is_supported_flim_path
+from flim_phasors.lif_io import is_lif_path, list_lif_phasor_series
+from flim_phasors.utils import dataset_has_sample
 from flim_phasors.memory_est import format_memory_line
 from flim_phasors.session_bundle_io import (
     BUNDLE_EXTENSION,
@@ -50,6 +53,7 @@ from flim_phasors.gui.theme import (
     is_dark_theme,
     log_style_for,
     normalize_theme_id,
+    palette_for,
     stylesheet_for,
     toolbar_colors_for,
     toolbar_style_for,
@@ -145,7 +149,7 @@ class EnhancementsMixin:
         self.proc_grid.addWidget(self.ref_preview, 12, 0, 1, 4)
 
         self.lbl_metadata = QtWidgets.QLabel("")
-        self.lbl_metadata.setStyleSheet(f"color: gray; {_small}")
+        self.lbl_metadata.setStyleSheet(f"color: gray; background: transparent; {_small}")
         self.lbl_metadata.setWordWrap(True)
         self.proc_grid.addWidget(self.lbl_metadata, 13, 0, 1, 4)
 
@@ -153,23 +157,24 @@ class EnhancementsMixin:
         self.sp_pixel_um.setRange(0, 100)
         self.sp_pixel_um.setDecimals(3)
         self.sp_pixel_um.setSuffix(" µm/px")
-        self.sp_pixel_um.setButtonSymbols(
-            QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.sp_pixel_um.setMinimumWidth(88)
+        self._spin_for_typing(self.sp_pixel_um, sample="100.000", min_width=88)
+        self.sp_pixel_um.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed)
         self.sp_pixel_um.setToolTip(
-            "Pixel size in µm — auto-filled from file metadata when available, "
-            "or enter manually (0 = off). Used for the image scale bar.")
+            "Pixel size in µm, filled from the file when the metadata has it. "
+            "Type a value if the file has none. 0 hides the scale bar.")
         self.sp_pixel_um.valueChanged.connect(self._on_pixel_size_changed)
         self.chk_show_scale_bar = QtWidgets.QCheckBox("Show scale bar")
         self.chk_show_scale_bar.setChecked(True)
         self.chk_show_scale_bar.setToolTip(
             "Draw a scale bar on the image when pixel size is known "
-            "(length/corner set below).")
+            "(length and corner set below).")
         self.chk_show_scale_bar.stateChanged.connect(self.refresh_image)
         row_px = QtWidgets.QHBoxLayout()
         row_px.addWidget(QtWidgets.QLabel("Pixel"))
         row_px.addWidget(self.sp_pixel_um)
         row_px.addWidget(self.chk_show_scale_bar)
+        row_px.addStretch(1)
         self.proc_grid.addLayout(row_px, 14, 0, 1, 4)
 
         self.sp_scalebar_um = QtWidgets.QDoubleSpinBox()
@@ -177,20 +182,23 @@ class EnhancementsMixin:
         self.sp_scalebar_um.setDecimals(1)
         self.sp_scalebar_um.setValue(10.0)
         self.sp_scalebar_um.setSuffix(" µm")
-        self.sp_scalebar_um.setButtonSymbols(
-            QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.sp_scalebar_um.setMinimumWidth(70)
-        self.sp_scalebar_um.setToolTip("Scale bar length.")
+        self._spin_for_typing(self.sp_scalebar_um, sample="50.0", min_width=56)
+        self.sp_scalebar_um.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.sp_scalebar_um.setToolTip(
+            "Scale bar length. A length that would fill the image is shortened "
+            "to a round value that still fits.")
         self.sp_scalebar_um.valueChanged.connect(self.refresh_image)
         self.cb_scalebar_loc = QtWidgets.QComboBox()
         self.cb_scalebar_loc.addItems(
             ["Bottom left", "Bottom right", "Top left", "Top right"])
-        self.cb_scalebar_loc.setToolTip("Scale bar corner.")
+        self.cb_scalebar_loc.setToolTip("Corner of the image where the scale bar is drawn.")
         self.cb_scalebar_loc.currentIndexChanged.connect(self.refresh_image)
+        self._combo_in_panel(self.cb_scalebar_loc, min_chars=11)
         row_scalebar = QtWidgets.QHBoxLayout()
         row_scalebar.addWidget(QtWidgets.QLabel("Scale bar"))
         row_scalebar.addWidget(self.sp_scalebar_um)
-        row_scalebar.addWidget(self.cb_scalebar_loc)
+        row_scalebar.addWidget(self.cb_scalebar_loc, 1)
         self.proc_grid.addLayout(row_scalebar, 15, 0, 1, 4)
 
         self.chk_log_display = QtWidgets.QCheckBox("Log photons")
@@ -203,15 +211,16 @@ class EnhancementsMixin:
         row_disp.addWidget(self.chk_auto_contrast)
         self.proc_grid.addLayout(row_disp, 16, 0, 1, 4)
 
-        _bc_label_width = 62
         lbl_bright = QtWidgets.QLabel("Brightness")
-        lbl_bright.setFixedWidth(_bc_label_width)
+        _bc_label_width = lbl_bright.fontMetrics().horizontalAdvance("Brightness") + 8
+        lbl_bright.setMinimumWidth(_bc_label_width)
         self.sl_brightness = QtWidgets.QSlider(Qt.Orientation.Horizontal)
         self.sl_brightness.setRange(-100, 100)
         self.sl_brightness.setValue(0)
-        self.sl_brightness.setToolTip("Shift the display window brighter/darker.")
+        self.sl_brightness.setToolTip("Right brightens the image, left darkens it.")
         self.lbl_brightness_val = QtWidgets.QLabel("0")
-        self.lbl_brightness_val.setFixedWidth(28)
+        self.lbl_brightness_val.setMinimumWidth(
+            self.lbl_brightness_val.fontMetrics().horizontalAdvance("-100") + 4)
         self.lbl_brightness_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.sl_brightness.valueChanged.connect(self._on_brightness_changed)
         row_bright = QtWidgets.QHBoxLayout()
@@ -221,13 +230,14 @@ class EnhancementsMixin:
         self.proc_grid.addLayout(row_bright, 17, 0, 1, 4)
 
         lbl_contrast = QtWidgets.QLabel("Contrast")
-        lbl_contrast.setFixedWidth(_bc_label_width)
+        lbl_contrast.setMinimumWidth(_bc_label_width)
         self.sl_contrast = QtWidgets.QSlider(Qt.Orientation.Horizontal)
         self.sl_contrast.setRange(-100, 100)
         self.sl_contrast.setValue(0)
-        self.sl_contrast.setToolTip("Narrow/widen the display window (more/less contrast).")
+        self.sl_contrast.setToolTip("Right increases contrast, left flattens it.")
         self.lbl_contrast_val = QtWidgets.QLabel("0")
-        self.lbl_contrast_val.setFixedWidth(28)
+        self.lbl_contrast_val.setMinimumWidth(
+            self.lbl_contrast_val.fontMetrics().horizontalAdvance("-100") + 4)
         self.lbl_contrast_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.sl_contrast.valueChanged.connect(self._on_contrast_changed)
         row_contrast = QtWidgets.QHBoxLayout()
@@ -246,7 +256,7 @@ class EnhancementsMixin:
 
         row_cur_io = QtWidgets.QHBoxLayout()
         btn_undo = QtWidgets.QPushButton("Undo")
-        btn_undo.setFixedWidth(48)
+        btn_undo.setMinimumWidth(btn_undo.fontMetrics().horizontalAdvance("Undo") + 20)
         btn_undo.clicked.connect(self.undo_cursor)
         btn_save_cur = QtWidgets.QPushButton("Save cursors…")
         btn_save_cur.clicked.connect(self.save_cursors_file)
@@ -710,7 +720,8 @@ class EnhancementsMixin:
             and str(self._calibration_settings_tuple()) != self._cal_settings_hash
         )
         color = "#b45309" if stale else "gray"
-        self.lbl_cal_display.setStyleSheet(f"color: {color}; font-size: 10px;")
+        self.lbl_cal_display.setStyleSheet(
+            f"color: {color}; background: transparent; font-size: 10px;")
 
     def _update_ref_preview(self):
         """Show/redraw the reference preview only in Manual ref phasor mode.
@@ -902,6 +913,67 @@ class EnhancementsMixin:
             f"{size_mb:.2f} MB) — no PTU/TIF required."
         )
 
+    def _decode_session_sample(self, row: dict):
+        """Decode one session sample row when its file is still on disk.
+
+        Returns the dataset and whether the histogram or LIF maps were read.
+        A missing file stays as a path stub so the name is still listed.
+        """
+        d = register_sample_from_session_row(row)
+        path = d.sample_path or ""
+        if not path or not os.path.isfile(path):
+            return d, False
+        channel = int(row.get("channel", 0) or 0)
+        frame = int(self.sp_frame.value()) if hasattr(self, "sp_frame") else -1
+        label = os.path.basename(path)
+        try:
+            if is_lif_path(path):
+                lif_key = (row.get("lif_image_key") or "").strip() or None
+                if lif_key is None:
+                    series = list_lif_phasor_series(path)
+                    if len(series) == 1:
+                        lif_key = series[0].image_key
+                    elif len(series) > 1:
+                        raise ValueError(
+                            f"{label} has several series and this session did not record which one."
+                        )
+                self._run_busy(
+                    f"Reading {label}…",
+                    lambda p=path, k=lif_key, ds=d, ch=channel: ds.load_lif_phasor(
+                        p, k, channel=ch),
+                )
+            else:
+                load_ch = channel if self.chk_fast_load.isChecked() else None
+                self._run_busy(
+                    f"Decoding {label}…",
+                    lambda p=path, ds=d, fr=frame, lc=load_ch: ds.load_sample(
+                        p, frame=fr, load_channel=lc),
+                )
+                if load_ch is None:
+                    d.channel = min(channel, max(0, int(d.n_channels) - 1))
+        except CancelledError:
+            return d, False
+        except Exception as e:
+            self._log(f"Load error ({label}): {e}")
+            QtWidgets.QMessageBox.critical(self, "Load error", f"{label}:\n{e}")
+            return d, False
+        d.display_name = (row.get("display_name") or "").strip()
+        d.group_name = (row.get("group") or "").strip()
+        if row.get("harmonic") is not None:
+            d.harmonic = int(row["harmonic"])
+        if row.get("frequency_MHz") is not None:
+            d.frequency = float(row["frequency_MHz"])
+        ref = row.get("reference_path") or ""
+        if ref:
+            d.ref_path = ref
+            raw_ch = row.get("reference_channel", "")
+            if raw_ch not in ("", None):
+                try:
+                    d.ref_channel = int(raw_ch)
+                except (TypeError, ValueError):
+                    pass
+        return d, dataset_has_sample(d)
+
     def _open_session_json(self, path: str):
         """Restore the sample list and settings from a lightweight, path-based session.
         Called by ``open_session`` when the chosen file is a plain JSON session
@@ -911,17 +983,11 @@ class EnhancementsMixin:
         reference files are missing on disk, warns the user via
         ``missing_paths_message`` and a dialog listing up to 8 missing paths
         (truncated with "…" if more), reminding them that a session bundle
-        would have avoided this dependency. Clears ``self.datasets`` and
-        rebuilds it by calling ``register_sample_from_session_row`` for each
-        saved sample row; if any datasets resulted, enables multi-image mode
-        (``self.chk_multi``) and restores the previously active sample index
-        (clamped to the valid range), making it ``self.data``. Applies saved
-        calibration via ``apply_calibration_from_session`` and, if present,
-        restores phasor cursors via ``restore_cursors_to_phasor``. Finishes by
-        calling ``_restore_ui_for_active`` and ``_refresh_image_combo`` to sync
-        the UI to the newly active dataset, remembers the directory as
-        ``"session_dir"``, and logs a reminder that samples still need to be
-        (re)loaded/decoded and Applied since raw data was not embedded.
+        would have avoided this dependency. Decodes each sample file that is
+        still on disk (so Apply can run), enables multi-image mode, and
+        restores the active sample index. Applies saved calibration and, if
+        present, phasor cursors, then shows an uncalibrated preview. Remembers
+        the directory as ``"session_dir"``.
         Args:
             path: Path to the JSON session file to load.
         """
@@ -940,24 +1006,59 @@ class EnhancementsMixin:
                 + ("\n…" if len(missing) > 8 else "")
                 + f"\n\nUse {BUNDLE_EXTENSION} (File → Save session…) to archive processed maps.",
             )
-        self.datasets.clear()
-        self.active_idx = -1
+        loaded = []
+        n_decoded = 0
         for row in session.get("samples", []):
-            d = register_sample_from_session_row(row)
-            self.datasets.append(d)
+            d, decoded = self._decode_session_sample(row)
+            loaded.append(d)
+            n_decoded += int(decoded)
+        self.datasets = loaded
+        self.active_idx = -1
         if self.datasets:
-            self.chk_multi.setChecked(True)
             self.active_idx = int(session.get("active_sample_index", 0))
             self.active_idx = max(0, min(self.active_idx, len(self.datasets) - 1))
             self.data = self.datasets[self.active_idx]
+            # Keep the sample list on, without adopting whatever was open before.
+            self.chk_multi.blockSignals(True)
+            self.chk_multi.setChecked(True)
+            self.chk_multi.blockSignals(False)
+            self._set_multi_detail_enabled(True)
         apply_calibration_from_session(self, session)
         if session.get("cursors"):
             restore_cursors_to_phasor(self, session["cursors"])
         self._restore_ui_for_active()
+        preview = [
+            d for d in self.datasets
+            if dataset_has_sample(d) and getattr(d, "load_source", "") != "lif_phasor"
+        ]
+        if preview:
+            try:
+                self._run_busy(
+                    "Uncalibrated preview…",
+                    lambda: self._process_uncalibrated_preview(preview),
+                )
+            except CancelledError:
+                pass
+            except Exception as e:
+                self._log(f"Preview error: {e}")
+                QtWidgets.QMessageBox.warning(self, "Preview", str(e))
         self._refresh_image_combo()
+        self._update_apply_buttons()
+        if hasattr(self, "_update_phasor_display"):
+            self._update_phasor_display()
+        self.refresh_image()
         self._settings.setValue("session_dir", os.path.dirname(path))
         self._mark_clean()
-        self._log(f"Session JSON loaded from {os.path.basename(path)} — load/decode samples and Apply.")
+        if n_decoded:
+            self._log(
+                f"Session JSON loaded from {os.path.basename(path)} — "
+                f"{n_decoded} sample(s) decoded. Click Apply for reference-corrected maps."
+            )
+        else:
+            self._log(
+                f"Session JSON loaded from {os.path.basename(path)} — "
+                "original files were not found. Load them, then Apply."
+            )
 
     def save_session(self):
         """Save all processed results and UI state to a portable session bundle.
@@ -1088,8 +1189,8 @@ class EnhancementsMixin:
     def _tag_primary_buttons(self):
         """Flag the key workflow buttons so the theme stylesheet accents them.
         Called once from ``_init_enhancements``, after ``_build_ui`` has
-        created the buttons named in ``PRIMARY_BUTTON_ATTRS`` (Calibrate,
-        Apply, Apply all, Export, Paint). For each attribute name in that
+        created the buttons named in ``PRIMARY_BUTTON_ATTRS`` (Apply,
+        Apply all, Export, Paint). For each attribute name in that
         tuple, if the corresponding button exists on ``self``, sets its
         ``"primary"`` Qt dynamic property to ``True``; the stylesheets in
         ``theme.py`` key off ``QPushButton[primary="true"]`` to render these
@@ -1149,6 +1250,11 @@ class EnhancementsMixin:
         self._dark_theme = is_dark_theme(theme)
         self._settings.setValue("ui_theme", theme)
         self._settings.setValue("dark_theme", self._dark_theme)
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            # Palette first: spin-box line edits read Base/Text from it even
+            # when the OS theme disagrees with the stylesheet.
+            app.setPalette(palette_for(theme))
         self.setStyleSheet(stylesheet_for(theme))
         self._apply_theme_widgets(theme)
         # Stylesheet swap does not re-evaluate dynamic [primary="true"] rules on existing buttons.
@@ -1189,6 +1295,46 @@ class EnhancementsMixin:
                 pal.setColor(QtGui.QPalette.ColorRole.ButtonText, tb_fg)
                 tb.setPalette(pal)
                 tb.setAutoFillBackground(True)
+        self._sync_editor_palettes()
+
+    def _sync_editor_palettes(self):
+        """Copy the theme palette onto spin boxes and line edits.
+
+        On Windows the line edit inside a spin box keeps the OS palette after
+        a stylesheet change, so the typed value can match the field color.
+        Pushing the application palette (and clearing the inner frame) makes
+        the text use the theme colors on every platform. Also forces dot
+        decimals and click-to-edit focus so scrolling the panel does not
+        change a value the user cannot see.
+        """
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+        pal = app.palette()
+        c_locale = QtCore.QLocale.c()
+        for sp in self.findChildren(QtWidgets.QAbstractSpinBox):
+            # StrongFocus: the mouse wheel scrolls the panel unless the field
+            # is clicked first. WheelFocus changes the value on hover, which
+            # is easy to miss when the number is hard to see.
+            sp.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            sp.setLocale(c_locale)
+            sp.setPalette(pal)
+            # Re-evaluate textEntry / button rules after a stylesheet swap.
+            style = sp.style()
+            style.unpolish(sp)
+            style.polish(sp)
+            le = sp.lineEdit()
+            if le is None:
+                continue
+            le.setFrame(False)
+            le.setAutoFillBackground(False)
+            le.setPalette(pal)
+        for edit in self.findChildren(QtWidgets.QLineEdit):
+            edit.setLocale(c_locale)
+            validator = edit.validator()
+            if validator is not None:
+                validator.setLocale(c_locale)
+            edit.setPalette(pal)
 
     def _push_cursor_undo(self):
         """Push a deep copy of current cursors onto the undo stack (max 30)."""

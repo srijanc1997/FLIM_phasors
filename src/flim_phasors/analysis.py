@@ -247,21 +247,21 @@ def apply_gmm_to_dataset(
             idx=k + 1, color=colors[k], label=categorical_name(k),
             tp=tp, tm=tm, tn=tn, g=cg, s=cs, n=nk,
             area=100.0 * nk / total_valid,
+            brightness=1.0,
         ))
     d.gmm_fit = fit
     d.cluster_stats = stats
     try:
-        from phasorpy.cursor import pseudo_color
+        from flim_phasors.cluster_view import compose_cluster_overlay
 
         intensity = getattr(d, "mean_thr", None)
         if intensity is None:
             intensity = getattr(d, "mean_raw", None)
-        overlay = pseudo_color(
-            *[masks[k] for k in range(n_comp)],
-            intensity=intensity,
-            colors=np.array(colors),
-        )
-        d.last_overlay = np.clip(np.asarray(overlay), 0, 1)
+        if intensity is None:
+            d.last_overlay = None
+        else:
+            d.last_overlay = compose_cluster_overlay(
+                intensity, masks, colors, [1.0] * n_comp)
     except Exception:
         d.last_overlay = None
     return fit, stats

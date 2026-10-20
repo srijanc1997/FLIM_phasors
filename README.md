@@ -22,13 +22,13 @@ If TIFF files lack laser metadata, set **frequency (MHz)** and **harmonic** unde
 - **Calibration** — reference phasor (maps only in RAM, not full histogram); manual g/s; save/load `calibration.json`; ref preview plot
 - **Calibrate** then **Apply** — pick reference file, calibrate g/s, then preprocess samples
 - **Filtering** — photon threshold; phasor and TCSPC spatial filters; pawFLIM optional
-- **Segmentation** — circular or elliptic phasor cursors (undo, save/load JSON); GMM via `phasor_cluster_gmm`
-- **Multi-sample** — **Multi-phasor** tab: sample table, groups, phasor overlay; **Setup** tab for filters; **Apply selected** / **Apply settings to all**
+- **Segmentation** — circular or elliptic phasor cursors (undo, save/load JSON); GMM via `phasor_cluster_gmm`. Each cluster has a **Bright** multiplier in the results table (1 = unchanged) that lifts a dark overlay without changing its color.
+- **Multi-sample** — **Multi-phasor** tab: sample table, groups, phasor overlay; **Setup** tab for filters; **Apply selected** / **Apply all**
 - **Image views** — photons (log scale, auto contrast), τ maps, scale bar (µm/px)
 - **Phasor ↔ image** — click phasor to highlight nearest pixel on the image
-- **Export all** — PNG/PDF/SVG phasor plot, per-sample maps, GMM masks, CSV, Excel, `session.json`
+- **Export all** — per-sample phasor plot, maps, combined segmentation, cluster masks, CSV, Excel, a session JSON, and one TIFF of the cluster color images. Several images share one `session.json` at the export root; one image keeps `<file>_session.json` beside its pictures. Optional **Save each cluster separately** also writes one color PNG and one phasor plot per cluster.
 - **Save session** — one `.flimsession` bundle (processed maps + calibration + cursors; no PTU/TIF data)
-- **Open session** — load `.flimsession` (standalone) or exported `session.json` (needs original files)
+- **Open session** — load `.flimsession` (standalone) or an exported `<file>_session.json` (needs original files)
 - **Batch CLI** — `flim-phasor-batch` for folder in → folder out
 - **Cancel** long decode/processing jobs from the progress dialog
 
@@ -78,8 +78,8 @@ flim-phasor-batch path/to/samples/ -o path/to/output -r reference.ptu --harmonic
 3. **Reference…** — choose the calibration file (decoded on **Calibrate**, not on load).
 4. **Calibrate** — compute reference g/s (check preview).
 5. **Calibration** — frequency, harmonic, filters, **Frame** (if the stack has time).
-6. **Apply** — preprocess on the **Setup** tab. With several images, use the **Multi-phasor** tab to pick samples, then **Apply selected** or **Apply settings to all**.
-7. **Analyze** tab — segment with cursors or GMM (**Paint**), then **Export all…** or **File → Save session…** (`.flimsession` archive).
+6. **Apply** — preprocess on the **Setup** tab. With several images, use the **Multi-phasor** tab to pick samples, then **Apply selected** or **Apply all**.
+7. **Analyze** tab — segment with cursors or GMM (**Paint**). If a cluster looks too dark, raise its **Bright** value (1 is unchanged; higher multiplies that cluster's painted pixels). Then **Export all…** or **File → Save session…** (`.flimsession` archive). Check **Save each cluster separately** only when you also want one PNG and one phasor plot per cluster.
 
 ### Keyboard shortcuts
 
@@ -113,21 +113,26 @@ See **Help → Keyboard shortcuts…** in the app for the full list.
 ```
 export_folder/
   README_export.txt
-  phasor_plot.png
-  phasor_plot.pdf
-  phasor_plot.svg
-  segmentation_active.png    # if Paint was run on active sample
   samples_summary.csv
-  clusters.csv                 # active sample clusters (after Paint)
-  analysis_results.xlsx        # if openpyxl installed
-  session.json                 # settings, paths, cursor positions, phasorpy version
+  clusters.csv
+  analysis.xlsx
+  session.json                   # one shared file when several images are exported
   samples/
-    01_myfile__groupA/
-      photons.png
-      tau_phi_ns.png
-      gmm_mask_01.png          # if GMM was fit on active sample
-      ...
+    01_myfile/
+      <file>_phasor.png
+      <file>_phasor_gmm.png          # when a GMM fit exists
+      <file>_segmentation.png        # combined overlay, including Bright
+      <file>_mask_01.png             # binary mask per cluster
+      <file>_photons.png
+      <file>_tau_*_ns.png
+      <file>_maps.npz
+      <file>_cluster_01.png          # optional: that cloud only
+      <file>_phasor_cluster_01.png   # optional: phasor plot of that color's image pixels
+      <file>_colors.tif              # one TIFF, one page per cluster color
+      <file>_session.json            # only when this export is a single image
 ```
+
+Photons, lifetime maps, and the segmentation picture are still saved as their own PNGs. `<file>_colors.tif` is written whenever clusters exist: one page for each GMM (or cursor) color, the same picture as that color on the image. Turn on **Save each cluster separately** (Analyze tab) or set `separate_clusters=true` in a headless config for the per-cluster PNG and its phasor plot.
 
 ## Session bundle (`.flimsession`)
 

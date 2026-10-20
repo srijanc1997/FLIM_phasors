@@ -25,20 +25,27 @@ venv/
 env/
 .env
 
-# Editors / IDEs
+# Editors / IDEs / local assistant state
 .idea/
 .vscode/
 .cursor/
+.claude/
 .githooks/
 
-# FLIM data files (don't commit large raw datasets)
+# FLIM data files (don't commit large raw datasets or saved sessions)
 *.ptu
 *.tif
 *.tiff
+*.lif
+*.xlef
+*.xlif
+*.lof
+*.flimsession
 
 # OS cruft
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # Local-only docs
 CODEBASE.md
