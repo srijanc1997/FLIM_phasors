@@ -1312,6 +1312,7 @@ class EnhancementsMixin:
             return
         pal = app.palette()
         c_locale = QtCore.QLocale.c()
+        from flim_phasors.gui.main_window import ensure_spin_line_edit_fills_field
         for sp in self.findChildren(QtWidgets.QAbstractSpinBox):
             # StrongFocus: the mouse wheel scrolls the panel unless the field
             # is clicked first. WheelFocus changes the value on hover, which
@@ -1329,6 +1330,8 @@ class EnhancementsMixin:
             le.setFrame(False)
             le.setAutoFillBackground(False)
             le.setPalette(pal)
+            if sp.buttonSymbols() == QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons:
+                ensure_spin_line_edit_fills_field(sp)
         for edit in self.findChildren(QtWidgets.QLineEdit):
             edit.setLocale(c_locale)
             validator = edit.validator()

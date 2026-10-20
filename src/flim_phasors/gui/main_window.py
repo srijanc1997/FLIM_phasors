@@ -93,6 +93,50 @@ def _fitted_scale_bar_um(width_px: int, um_per_px: float, requested: float) -> f
     return float(max(snapped, field * 0.05))
 
 
+class _SpinFieldFilter(QtCore.QObject):
+    """Give a buttonless spin box's line edit the whole field on every resize.
+
+    Some platform styles, and the offscreen plugin used in CI, leave that
+    inner editor at 1 px after a stylesheet hides the arrows. The number is
+    then stored but not visible. Putting the editor in the contents rectangle
+    keeps the typed value on screen.
+    """
+
+    def eventFilter(self, obj, event):
+        if event.type() in (
+            QtCore.QEvent.Type.Resize,
+            QtCore.QEvent.Type.Show,
+            QtCore.QEvent.Type.StyleChange,
+        ):
+            # The spin box lays its line edit out while handling the event.
+            # Fill afterwards, or that layout puts the editor back to 1 px.
+            QtCore.QTimer.singleShot(0, lambda sp=obj: fill_spin_line_edit(sp))
+        return False
+
+
+def fill_spin_line_edit(sp) -> None:
+    """Stretch a buttonless spin box's line edit across the field."""
+    if sp.buttonSymbols() != QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons:
+        return
+    editor = sp.lineEdit()
+    if editor is None:
+        return
+    rect = sp.contentsRect()
+    if rect.width() <= 1 or rect.height() <= 1:
+        return
+    if editor.geometry() != rect:
+        editor.setGeometry(rect)
+
+
+def ensure_spin_line_edit_fills_field(sp) -> None:
+    """Install the resize filter once and fill the field if it already has a size."""
+    if getattr(sp, "_spin_field_filter", None) is None:
+        filt = _SpinFieldFilter(sp)
+        sp._spin_field_filter = filt
+        sp.installEventFilter(filt)
+    fill_spin_line_edit(sp)
+
+
 class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
     """Primary FLIM phasor analysis window: load, calibrate, segment, and export.
 
@@ -1006,6 +1050,7 @@ class MainWindow(EnhancementsMixin, QtWidgets.QMainWindow):
         if editor is not None:
             editor.setFrame(False)
             editor.setAutoFillBackground(False)
+        ensure_spin_line_edit_fills_field(sp)
 
     def _fit_control(self, widget, text: str, *, pad: int = 20, expanding: bool = False):
         """Give a field or button enough width for ``text`` in the current font.

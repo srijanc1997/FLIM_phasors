@@ -128,7 +128,7 @@ def save_phasor_plot(
                 faint = (float(rgb[0]), float(rgb[1]), float(rgb[2]), 0.25)
                 solid = (float(rgb[0]), float(rgb[1]), float(rgb[2]), 1.0)
                 cmap = LinearSegmentedColormap.from_list("cluster", [faint, solid])
-                cmap.set_bad((1, 1, 1, 0))
+                cmap = cmap.with_extremes(bad=(1, 1, 1, 0))
             ax.pcolormesh(
                 xedges, yedges, counts.T, cmap=cmap, shading="auto", rasterized=True)
         if mask is not None:

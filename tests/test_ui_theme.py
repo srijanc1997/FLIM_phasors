@@ -39,6 +39,13 @@ def test_theme_palette_text_contrasts_with_the_field():
         assert "QSplitter::handle" in sheet
 
 
+def _line_edit_keeps_the_field(box, fraction: float):
+    """The typed value must own the spin box, not a 1 px leftover gutter."""
+    editor = box.lineEdit()
+    assert editor is not None
+    assert editor.width() >= int(box.width() * fraction)
+
+
 def test_text_entry_spinbox_keeps_the_value_visible():
     app = _app()
     app.setPalette(palette_for(THEME_PHASOR_LAB))
@@ -50,7 +57,10 @@ def test_text_entry_spinbox_keeps_the_value_visible():
     box.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
     box.setProperty("textEntry", True)
     box.setLocale(QtCore.QLocale.c())
+    from flim_phasors.gui.main_window import ensure_spin_line_edit_fills_field
+
     box.setStyleSheet(stylesheet_for(THEME_PHASOR_LAB))
+    ensure_spin_line_edit_fills_field(box)
     box.setMinimumWidth(160)
     box.resize(180, 32)
     box.show()
@@ -63,9 +73,10 @@ def test_text_entry_spinbox_keeps_the_value_visible():
     editor = box.lineEdit()
     assert editor is not None
     assert "80.000" in editor.text()
-    assert editor.width() >= int(box.width() * 0.75)
+    _line_edit_keeps_the_field(box, 0.75)
 
     image = box.grab().toImage()
+    assert not image.isNull() and image.width() > 1 and image.height() > 1
     colors = {image.pixel(x, y) for y in range(image.height()) for x in range(image.width())}
     paints = [QtGui.QColor.fromRgba(pixel) for pixel in colors]
     # Digits must contrast with the field. A same-color value leaves one shade.
@@ -83,7 +94,7 @@ def test_main_window_processing_fields_are_editable():
     freq = win.sp_freq
     assert freq.property("textEntry") is True
     assert "80.000" in freq.lineEdit().text()
-    assert freq.lineEdit().width() >= int(freq.width() * 0.7)
+    _line_edit_keeps_the_field(freq, 0.7)
     assert win.cb_filter.currentText() == "median"
     assert win.cb_filter.minimumWidth() > 40
     assert 400 <= win.panel_wrap.minimumWidth() <= 520
